@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -39,12 +40,13 @@ type FileReq struct {
 
 // FileState tracks one file of a push.
 type FileState struct {
-	RelPath string    `json:"rel_path"`
-	Size    int64     `json:"size"`
-	MTime   time.Time `json:"mtime"`
-	Done    int64     `json:"done"`
-	Final   string    `json:"-"`
-	Part    string    `json:"-"`
+	RelPath string       `json:"rel_path"`
+	Size    int64        `json:"size"`
+	MTime   time.Time    `json:"mtime"`
+	Done    int64        `json:"done"`
+	live    atomic.Int64 // bytes of this file received so far, updated while streaming
+	Final   string       `json:"-"`
+	Part    string       `json:"-"`
 }
 
 // Push is one accepted batch of files.
@@ -56,6 +58,103 @@ type Push struct {
 	Total     int64
 	Files     map[string]*FileState // key: rel path as offered
 	CreatedAt time.Time
+
+	cancelled atomic.Bool
+}
+
+// ErrCancelled is returned to the sender once the receiving person has
+// cancelled an accepted push.
+var ErrCancelled = errors.New("cancelled by the receiver")
+
+// cancelReader fails reads as soon as the push is cancelled, so a transfer in
+// flight stops within one buffer rather than at the end of the request.
+type cancelReader struct {
+	p  *Push
+	st *FileState
+	r  io.Reader
+}
+
+func (c cancelReader) Read(b []byte) (int, error) {
+	if c.p.cancelled.Load() {
+		return 0, ErrCancelled
+	}
+	n, err := c.r.Read(b)
+	if c.st != nil {
+		c.st.live.Add(int64(n))
+	}
+	return n, err
+}
+
+// IncomingView is what the UI shows for a push being received.
+type IncomingView struct {
+	ID         string    `json:"id"`
+	PeerFP     string    `json:"peer_fp"`
+	Mode       string    `json:"mode"`
+	Total      int64     `json:"total"`
+	Done       int64     `json:"done"`
+	FilesTotal int       `json:"files_total"`
+	FilesDone  int       `json:"files_done"`
+	Current    string    `json:"current,omitempty"`
+	StartedAt  time.Time `json:"started_at"`
+}
+
+// Incoming lists the pushes being received, oldest first.
+func (m *Manager) Incoming() []IncomingView {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]IncomingView, 0, len(m.pushes))
+	for _, p := range m.pushes {
+		v := IncomingView{ID: p.ID, PeerFP: p.PeerFP, Mode: p.Mode, Total: p.Total, FilesTotal: len(p.Files), StartedAt: p.CreatedAt}
+		for _, f := range p.Files {
+			d := f.Done
+			if l := f.live.Load(); l > d {
+				d = l
+			}
+			if d > f.Size {
+				d = f.Size
+			}
+			v.Done += d
+			if f.Done >= f.Size {
+				v.FilesDone++
+			} else if d > 0 && v.Current == "" {
+				v.Current = f.RelPath
+			}
+		}
+		out = append(out, v)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.Before(out[j].StartedAt) })
+	return out
+}
+
+// Cancel stops an accepted push. Files already received stay; partial files
+// are removed. The sender's next request fails with ErrCancelled.
+func (m *Manager) Cancel(id string) bool {
+	m.mu.Lock()
+	p, ok := m.pushes[id]
+	if ok {
+		delete(m.pushes, id)
+		p.cancelled.Store(true)
+		m.gone[id] = struct{}{}
+	}
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	for _, f := range p.Files {
+		if f.Done < f.Size || f.Size == 0 {
+			_ = os.Remove(f.Part)
+		}
+	}
+	m.onChange()
+	return true
+}
+
+// WasCancelled reports whether a push was cancelled by the receiving person.
+func (m *Manager) WasCancelled(id string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.gone[id]
+	return ok
 }
 
 // Manager owns pushes for one process.
@@ -65,6 +164,7 @@ type Manager struct {
 
 	mu     sync.Mutex
 	pushes map[string]*Push
+	gone   map[string]struct{} // cancelled push ids
 }
 
 // FreeSpace reports the bytes available to the current user on the volume
@@ -75,7 +175,7 @@ func New(dir string, onChange func()) *Manager {
 	if onChange == nil {
 		onChange = func() {}
 	}
-	return &Manager{dir: dir, onChange: onChange, pushes: map[string]*Push{}}
+	return &Manager{dir: dir, onChange: onChange, pushes: map[string]*Push{}, gone: map[string]struct{}{}}
 }
 
 func (m *Manager) Dir() string { return m.dir }
@@ -152,6 +252,7 @@ func (m *Manager) Offer(peerFP, mode string, files []FileReq, maxBytes int64) (*
 				done = 0
 			}
 			st.Done = done
+			st.live.Store(done)
 		}
 		p.Files[rel] = st
 		p.Total += f.Size
@@ -196,6 +297,7 @@ func (m *Manager) WriteChunk(id, peerFP, rel string, offset int64, r io.Reader) 
 	if err := os.MkdirAll(filepath.Dir(st.Part), 0o700); err != nil {
 		return 0, err
 	}
+	st.live.Store(offset)
 	f, err := os.OpenFile(st.Part, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return 0, err
@@ -204,8 +306,12 @@ func (m *Manager) WriteChunk(id, peerFP, rel string, offset int64, r io.Reader) 
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return 0, err
 	}
-	n, err := io.CopyBuffer(f, io.LimitReader(r, st.Size-offset), make([]byte, 256*1024))
+	n, err := io.CopyBuffer(f, cancelReader{p, st, io.LimitReader(r, st.Size-offset)}, make([]byte, 256*1024))
 	if err != nil {
+		if p.cancelled.Load() { // a cancelled push leaves no partial file behind
+			f.Close()
+			_ = os.Remove(st.Part)
+		}
 		return n, err
 	}
 	if st.Size >= syncMin {
@@ -237,13 +343,14 @@ func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileSt
 	if err := os.MkdirAll(filepath.Dir(st.Part), 0o700); err != nil {
 		return nil, err
 	}
+	st.live.Store(0)
 	f, err := os.OpenFile(st.Part, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	h := sha256.New()
 	// Read one byte more than announced so an oversized body is noticed.
-	n, err := io.CopyBuffer(io.MultiWriter(f, h), io.LimitReader(r, st.Size+1), make([]byte, 64*1024))
+	n, err := io.CopyBuffer(io.MultiWriter(f, h), cancelReader{p, st, io.LimitReader(r, st.Size+1)}, make([]byte, 64*1024))
 	if err == nil && st.Size >= syncMin {
 		err = f.Sync()
 	}

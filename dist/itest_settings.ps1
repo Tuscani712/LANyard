@@ -46,6 +46,10 @@ try {
   }
   Write-Host "update OK (theme=dark, speed=mbps, bw=5)"
 
+  $t = Invoke-RestMethod -Method Put -Uri "$($ua.Origin)/api/settings" -WebSession $ua.Session -Headers $h -Body (@{ minimize_to_tray = $true } | ConvertTo-Json)
+  if (-not $t.minimize_to_tray -or -not $t.tray_supported) { throw "minimize_to_tray did not stick: $($t | ConvertTo-Json -Compress)" }
+  Write-Host "minimize to tray OK"
+
   $self = Invoke-RestMethod -Uri "$($ua.Origin)/api/self" -WebSession $ua.Session
   if ($self.device_label -ne "alice-pc") { throw "self label = $($self.device_label)" }
   Write-Host "self label OK"

@@ -211,6 +211,9 @@ func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			code := http.StatusBadRequest
 			switch {
+			case errors.Is(err, inbox.ErrCancelled) || s.inbox.WasCancelled(r.PathValue("id")):
+				code = http.StatusGone
+				err = inbox.ErrCancelled
 			case strings.Contains(err.Error(), "no such"):
 				code = http.StatusNotFound
 			case strings.Contains(err.Error(), "mismatch"):
@@ -225,7 +228,9 @@ func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
 	n, err := s.inbox.WriteChunk(r.PathValue("id"), PeerID(r.Context()), rel, offset, r.Body)
 	if err != nil {
 		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "no such") {
+		if errors.Is(err, inbox.ErrCancelled) || s.inbox.WasCancelled(r.PathValue("id")) {
+			code, err = http.StatusGone, inbox.ErrCancelled
+		} else if strings.Contains(err.Error(), "no such") {
 			code = http.StatusNotFound
 		}
 		http.Error(w, err.Error(), code)
@@ -257,6 +262,10 @@ func (s *Server) handlePushComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	st, err := s.inbox.Complete(id, fp, req.RelPath, req.SHA256)
 	if err != nil {
+		if s.inbox.WasCancelled(id) {
+			http.Error(w, inbox.ErrCancelled.Error(), http.StatusGone)
+			return
+		}
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}

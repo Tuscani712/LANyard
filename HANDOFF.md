@@ -2,10 +2,10 @@
 
 > **Protocol:** Claude Code and opencode take turns. Whoever finishes a turn **overwrites this whole file** with the current state (keep it short and accurate), and sets "Last updated by" and "Next agent". Read `p2p_file_transfer_specification_v2.md` for the design; this file is only the current state.
 
-- **Last updated by:** opencode, 2026-10-05
-- **Next agent:** Claude Code
-- **Milestone just finished:** application icon (binary/desktop + window) and a Windows **system-tray** icon.
-- **Next:** hardening/release, per the list at the bottom. (All of M1–M6 plus hardening passes 1–2 are done.)
+- **Last updated by:** Claude Code, 2026-10-05
+- **Next agent:** opencode
+- **Milestone just finished:** two-machine test feedback: notifications, native file dialogs, receiver-side cancel, Shared with me, minimize to tray.
+- **Next:** re-test on two machines; remaining items in the lists at the bottom.
 
 ## Environment
 - Go 1.27.0 (default install in Program Files\Go\bin; `build.ps1` finds it even if it is not on PATH. For plain `go` in a non-interactive shell: `$env:Path += ";$env:ProgramFiles\Go\bin"`).
@@ -25,7 +25,15 @@ icons/          icon.png (source, 1133x985), icon.ico (16–256 px)
 build.ps1  README.md  dist/lwlib.ps1  dist/itest*.ps1 (twelve scripts)
 ```
 
-### This turn: icon and tray
+### This turn: two-machine feedback (Claude Code)
+- **Notifications, not takeovers:** an incoming pair/connect request and an incoming-files approval are now sticky toasts (bottom right, `stickyToast` in `app.js`); clicking one opens the accept screen / approvals modal ("Decide later" closes it). Nothing opens by itself.
+- **Native dialogs:** `POST /api/fs/pick {kind: folder|files, title, start}` shows the real Windows IFileOpenDialog (`internal/uiserver/pick_windows.go`, raw COM, no cgo); other OSes return 501 and the UI falls back to typing. Download uses the saved/default folder (first time it asks via the dialog); "Download to..." always asks; Settings folders have Browse; Push files.../Push folder... use the dialog.
+- **Receiver can cancel an accepted push:** `inbox.Incoming()/Cancel()`, `GET /api/incoming`, `POST /api/incoming/{id}/cancel`, SSE event `incoming`, rows with Cancel on the Transfers page. The sender gets 410 "cancelled by the receiver"; partial files are removed. Incoming progress is live (`FileState.live`). Test: `TestReceiverCancelsAnAcceptedPush`.
+- **Shared with me:** sidebar entry listing every paired/connected device's shares (Open / Download); the device page explains when you must pair first.
+- **Minimize to system tray (Windows):** setting `minimize_to_tray` (Settings page). The tray now runs in native mode too; minimize and close hide the window when the setting is on; tray click/Open restores it; a second launch also finds a hidden window.
+- Not verified here: the tray hide/restore by hand (needs the native window), two physical machines.
+
+### Earlier turn: icon and tray
 - **Binary / desktop icon:** `icons/icon.png` was made into a square multi-size `icons/icon.ico` and compiled into the Windows binaries with `rsrc` as `cmd/lanyard/rsrc_windows_amd64.syso`. Explorer, the desktop and the taskbar show it (verified: `ExtractAssociatedIcon` returns 32x32 for both Windows exes). The mac/linux builds ignore the `.syso` and are unchanged.
 - **Window:** the same image is the browser favicon (`<link rel="icon">`), the `apple-touch-icon`, and a small header logo (`web/icon.png`, 192px, served at `/icon.png`).
 - **System tray (Windows):** `cmd/lanyard/tray_windows.go` creates a hidden window and a `Shell_NotifyIcon` icon using only `golang.org/x/sys/windows` (no cgo; `runtime.LockOSThread` + a Win32 message loop). Left-click opens the UI in the browser; right-click offers **Open LANyard** / **Quit**. The icon is loaded from `<data-dir>\icon.ico` (the embedded `.ico` is written there at startup), so it does not depend on the resource id. `--no-tray` disables it. Non-Windows `startTray` is a no-op.

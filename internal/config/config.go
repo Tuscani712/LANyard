@@ -37,6 +37,9 @@ type Settings struct {
 	Mounts []MountPref `json:"mounts,omitempty"`
 	// StartOnLogin starts LANyard when the user signs in (spec §11).
 	StartOnLogin bool `json:"start_on_login,omitempty"`
+	// MinimizeToTray hides the window to the system tray when it is minimized
+	// or closed, instead of using the taskbar / quitting (Windows).
+	MinimizeToTray bool `json:"minimize_to_tray,omitempty"`
 
 	// Shares is owned by internal/shares and kept as an opaque blob so this
 	// package never needs to import it (avoids an import cycle).

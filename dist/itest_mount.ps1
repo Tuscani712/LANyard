@@ -117,7 +117,8 @@ try {
   Write-Host "sharer unpaired us: mount read now fails ($($r1.Status))"
 
   # B unpairs A: the mount disappears.
-  $null = Post $ub.Session $ub.Origin "/api/trust/$aFP/unpair" @{}
+  # Unpairing is mutual now, so B may already be unpaired; that is fine.
+  try { $null = Post $ub.Session $ub.Origin "/api/trust/$aFP/unpair" @{} } catch { if ("$_" -notmatch "not paired") { throw } }
   Start-Sleep -Milliseconds 500
   $left = Invoke-RestMethod -Uri "$($ub.Origin)/api/mounts" -WebSession $ub.Session
   if (@($left).Count -ne 0) { throw "mount still listed after unpairing" }

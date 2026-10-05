@@ -12,3 +12,6 @@ func runNativeUI(nativeUIOptions) error {
 
 // focusNativeWindow is Windows-only; elsewhere there is no native window.
 func focusNativeWindow(int) bool { return false }
+
+// showNativeWindow is Windows-only.
+func showNativeWindow() bool { return false }

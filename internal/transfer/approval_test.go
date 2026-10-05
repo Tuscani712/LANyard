@@ -31,6 +31,7 @@ type pushRig struct {
 	client         *peerapi.Client
 	host           string
 	port           int
+	inbox          *inbox.Manager
 }
 
 func newPushRig(t *testing.T) *pushRig {
@@ -53,7 +54,8 @@ func newPushRig(t *testing.T) *pushRig {
 	inboxDir := t.TempDir()
 	approvals := approval.New(nil)
 	srv := peerapi.NewServer(recvID, func() discovery.Hello { return discovery.Hello{} }, shMgr, trR, trR, quiet)
-	srv.SetInbox(inbox.New(inboxDir, nil))
+	inboxMgr := inbox.New(inboxDir, nil)
+	srv.SetInbox(inboxMgr)
 	srv.SetApprovals(approvals)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -70,7 +72,7 @@ func newPushRig(t *testing.T) *pushRig {
 	mgr := New(cfgS, client, quiet, 3, nil)
 	mgr.backoffBase, mgr.backoffMax = 10*time.Millisecond, 40*time.Millisecond
 	rig := &pushRig{recvID: recvID, sendID: sendID, trR: trR, trS: trS, approvals: approvals,
-		inboxDir: inboxDir, mgr: mgr, client: client, host: "127.0.0.1", port: ln.Addr().(*net.TCPAddr).Port}
+		inbox: inboxMgr, inboxDir: inboxDir, mgr: mgr, client: client, host: "127.0.0.1", port: ln.Addr().(*net.TCPAddr).Port}
 	mgr.SetOnDone(func(ji JobInfo) {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -322,5 +324,45 @@ func TestMixedPush(t *testing.T) {
 		if got[name] != h {
 			t.Errorf("%s differs in the Inbox", name)
 		}
+	}
+}
+
+// The receiving person can stop a push they already accepted: the sender is told
+// why, partial files are removed, and files that finished stay.
+func TestReceiverCancelsAnAcceptedPush(t *testing.T) {
+	r := newPushRig(t)
+	r.trR.Pair(trust.Entry{
+		DeviceID: "sender-dev", Name: "Sender PC", Fingerprint: r.sendID.DeviceID, Mode: trust.ModePair,
+		Permissions: trust.Permissions{Browse: true, Push: true},
+	})
+	r.mgr.SetBandwidthLimit(2) // 2 MB/s so the transfer is still running when we cancel
+	v := r.push(t, writeTemp(t, "big.bin", randBytes(91, 24<<20)))
+	waitFor(t, "the push to show as incoming with progress", 15*time.Second, func() bool {
+		in := r.inbox.Incoming()
+		return len(in) == 1 && in[0].Done > 0
+	})
+	id := r.inbox.Incoming()[0].ID
+	if !r.inbox.Cancel(id) {
+		t.Fatal("cancel reported that the push was not running")
+	}
+	got := waitState(t, r.mgr, v.ID, StateFailed, 15*time.Second)
+	if !strings.Contains(got.Error, "cancelled by the receiver") {
+		t.Errorf("sender should be told the receiver cancelled, got %q", got.Error)
+	}
+	if n := len(r.inbox.Incoming()); n != 0 {
+		t.Errorf("%d pushes still listed after cancel", n)
+	}
+	waitFor(t, "partial files to be removed", 5*time.Second, func() bool {
+		left := false
+		_ = filepath.WalkDir(r.inboxDir, func(p string, d os.DirEntry, err error) error {
+			if err == nil && !d.IsDir() {
+				left = true
+			}
+			return nil
+		})
+		return !left
+	})
+	if r.inbox.Cancel(id) {
+		t.Error("cancelling twice must report nothing to cancel")
 	}
 }

@@ -215,3 +215,14 @@ input::placeholder { color: var(--muted-2); }
   .search { width: 180px; }
   .view-head h1 { font-size: 22px; }
 }
+
+/* ---- notifications that wait for a click ---- */
+.toast.sticky { position: relative; cursor: pointer; min-width: 260px; max-width: 340px; padding-right: 34px; }
+.toast.sticky:hover { border-color: var(--accent); }
+.toast-title { font-weight: 600; }
+.toast-detail { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.toast-x { position: absolute; top: 4px; right: 6px; background: none; border: 0; color: var(--muted); font-size: 18px; cursor: pointer; line-height: 1; }
+.toast-x:hover { color: var(--text); }
+.dest-path { font-family: ui-monospace, Consolas, monospace; font-size: 12px; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.browse-wrap { display: flex; gap: 8px; flex: 1; min-width: 0; }
+.browse-wrap input { flex: 1; min-width: 0; }

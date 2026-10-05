@@ -24,6 +24,7 @@ import (
 	"lanyard/internal/approval"
 	"lanyard/internal/config"
 	"lanyard/internal/discovery"
+	"lanyard/internal/inbox"
 	"lanyard/internal/mount"
 	"lanyard/internal/peerapi"
 	"lanyard/internal/shares"
@@ -63,6 +64,8 @@ type Deps struct {
 
 	// Incoming transfers waiting for a person to accept them.
 	Approvals *approval.Manager
+	// Inbox holds pushes being received (shown with a Cancel button).
+	Inbox *inbox.Manager
 	// Mounts serves paired devices as drives (spec §11.2).
 	Mounts *mount.Manager
 
@@ -151,6 +154,9 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/peers/add", s.auth(s.handleAdd))
 	mux.HandleFunc("GET /api/fs/roots", s.auth(s.handleFSRoots))
 	mux.HandleFunc("GET /api/fs/list", s.auth(s.handleFSList))
+	mux.HandleFunc("POST /api/fs/pick", s.auth(s.handleFSPick))
+	mux.HandleFunc("GET /api/incoming", s.auth(s.handleIncoming))
+	mux.HandleFunc("POST /api/incoming/{id}/cancel", s.auth(s.handleIncomingCancel))
 	mux.HandleFunc("GET /api/shares", s.auth(s.handleShares))
 	mux.HandleFunc("POST /api/shares", s.auth(s.handleShareAdd))
 	mux.HandleFunc("POST /api/shares/stop-all", s.auth(s.handleShareStopAll))
@@ -330,6 +336,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			if ab, err := json.Marshal(s.d.Approvals.Pending()); err == nil {
 				fmt.Fprintf(w, "event: approvals\ndata: %s\n\n", ab)
 			}
+		}
+		if ib, err := json.Marshal(s.incoming()); err == nil {
+			fmt.Fprintf(w, "event: incoming\ndata: %s\n\n", ib)
 		}
 		if s.d.Transfers != nil {
 			if tb, err := json.Marshal(s.d.Transfers.List()); err == nil {

@@ -25,6 +25,7 @@ var (
 	procEnumWindows              = user32.NewProc("EnumWindows")
 	procGetWindowThreadProcessID = user32.NewProc("GetWindowThreadProcessId")
 	procIsWindowVisible          = user32.NewProc("IsWindowVisible")
+	procGetWindowTextW           = user32.NewProc("GetWindowTextW")
 	procDwmSetWindowAttribute    = dwmapi.NewProc("DwmSetWindowAttribute")
 )
 
@@ -37,6 +38,8 @@ const (
 	wmNCLButtonDown = 0x00A1
 	htCaption       = 2
 	swMinimize      = 6
+	swHide          = 0
+	swShow          = 5
 	swMaximize      = 3
 	swRestore       = 9
 	dwmwaDarkMode   = 20
@@ -48,6 +51,17 @@ const gwlStyle = ^uintptr(15)
 // nativeShow brings the window back to the foreground (used if a tray icon is
 // present). Kept as a package global so the tray can reference it.
 var nativeShow func()
+
+// showNativeWindow restores the window (even if hidden in the tray) and brings
+// it to the front. It reports false when there is no native window.
+func showNativeWindow() bool {
+	f := nativeShow
+	if f == nil {
+		return false
+	}
+	f()
+	return true
+}
 
 // runNativeUI opens the UI in an embedded WebView2 window (Edge, no browser
 // chrome) and blocks until the window closes. It returns an error if the
@@ -76,7 +90,11 @@ func runNativeUI(opts nativeUIOptions) error {
 	_ = w.Bind("lanWin", func(action string) string {
 		switch action {
 		case "min":
-			procShowWindow.Call(uintptr(hwnd), swMinimize)
+			if minimizeToTray.Load() && currentTray != nil {
+				procShowWindow.Call(uintptr(hwnd), swHide)
+			} else {
+				procShowWindow.Call(uintptr(hwnd), swMinimize)
+			}
 		case "max":
 			if maximized(hwnd) {
 				procShowWindow.Call(uintptr(hwnd), swRestore)
@@ -84,7 +102,11 @@ func runNativeUI(opts nativeUIOptions) error {
 				procShowWindow.Call(uintptr(hwnd), swMaximize)
 			}
 		case "close":
-			procPostMessageW.Call(uintptr(hwnd), wmClose, 0, 0)
+			if minimizeToTray.Load() && currentTray != nil {
+				procShowWindow.Call(uintptr(hwnd), swHide)
+			} else {
+				procPostMessageW.Call(uintptr(hwnd), wmClose, 0, 0)
+			}
 		}
 		if maximized(hwnd) {
 			return "max"
@@ -97,7 +119,11 @@ func runNativeUI(opts nativeUIOptions) error {
 	})
 
 	nativeShow = func() {
-		w.Dispatch(func() { procShowWindow.Call(uintptr(hwnd), swRestore) })
+		w.Dispatch(func() {
+			procShowWindow.Call(uintptr(hwnd), swShow)
+			procShowWindow.Call(uintptr(hwnd), swRestore)
+			procSetForegroundWindow.Call(uintptr(hwnd))
+		})
 	}
 
 	w.Navigate(opts.URL)
@@ -131,7 +157,7 @@ func focusNativeWindow(pid int) bool {
 	if pid <= 0 {
 		return false
 	}
-	var found uintptr
+	var found, hidden uintptr
 	cb := syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
 		var wp uint32
 		procGetWindowThreadProcessID.Call(hwnd, uintptr(unsafe.Pointer(&wp)))
@@ -140,13 +166,23 @@ func focusNativeWindow(pid int) bool {
 				found = hwnd
 				return 0 // stop enumerating
 			}
+			// A window hidden in the system tray is still "the" window.
+			var buf [64]uint16
+			n, _, _ := procGetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
+			if windows.UTF16ToString(buf[:n]) == "LANyard File Transfer" {
+				hidden = hwnd
+			}
 		}
 		return 1
 	})
 	procEnumWindows.Call(cb, 0)
 	if found == 0 {
+		found = hidden
+	}
+	if found == 0 {
 		return false
 	}
+	procShowWindow.Call(found, swShow)
 	procShowWindow.Call(found, swRestore)
 	procSetForegroundWindow.Call(found)
 	return true

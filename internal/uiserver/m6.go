@@ -3,6 +3,7 @@ package uiserver
 import (
 	"encoding/json"
 	"net/http"
+	"runtime"
 	"strings"
 	"unicode"
 
@@ -23,6 +24,8 @@ type settingsView struct {
 	PeerPort              int           `json:"peer_port"`
 	BandwidthLimitMBps    int           `json:"bandwidth_limit_mbps"`
 	StartOnLogin          bool          `json:"start_on_login"`
+	MinimizeToTray        bool          `json:"minimize_to_tray"`
+	TraySupported         bool          `json:"tray_supported"`
 	Paired                []trust.Entry `json:"paired"`
 }
 
@@ -41,6 +44,8 @@ func (s *Server) settingsView() settingsView {
 		PeerPort: st.PeerPort, BandwidthLimitMBps: st.BandwidthLimitMBps,
 	}
 	v.StartOnLogin = st.StartOnLogin
+	v.MinimizeToTray = st.MinimizeToTray
+	v.TraySupported = runtime.GOOS == "windows"
 	if s.d.StartOnLoginEnabled != nil {
 		v.StartOnLogin = s.d.StartOnLoginEnabled() // what the OS really has
 	}
@@ -74,6 +79,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		PeerPort              *int    `json:"peer_port"`
 		BandwidthLimitMBps    *int    `json:"bandwidth_limit_mbps"`
 		StartOnLogin          *bool   `json:"start_on_login"`
+		MinimizeToTray        *bool   `json:"minimize_to_tray"`
 		ConfirmDeviceID       bool    `json:"confirm_device_id"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
@@ -145,6 +151,9 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		next.BandwidthLimitMBps = *req.BandwidthLimitMBps
 	}
 
+	if req.MinimizeToTray != nil {
+		next.MinimizeToTray = *req.MinimizeToTray
+	}
 	if req.StartOnLogin != nil {
 		if s.d.SetStartOnLogin == nil {
 			http.Error(w, "start on login is not available here", http.StatusNotImplemented)

@@ -3,6 +3,7 @@
 // attacker-controlled, so they are only ever inserted with textContent.
 
 const $ = (id) => document.getElementById(id);
+let incomingList = []; // pushes this device is receiving
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -180,7 +181,7 @@ function renderNav() {
     item.innerHTML = I[n.icon];
     item.appendChild(el("span", null, n.label));
     if (n.id === "transfers") {
-      const live = transfersList.filter((t) => t.state !== "Done").length;
+      const live = transfersList.filter((t) => t.state !== "Done").length + incomingList.length;
       if (live) item.appendChild(el("span", "nav-badge", String(live)));
     }
     if (n.id === "paired" && S.actionable) {
@@ -207,6 +208,52 @@ function toast(msg, kind) {
   $("toasts").appendChild(t);
   setTimeout(() => { t.style.opacity = "0"; t.style.transition = "opacity .3s"; setTimeout(() => t.remove(), 350); }, 4200);
 }
+// A notification that stays in the bottom-right corner until it is clicked,
+// dismissed, or no longer relevant. Clicking it runs onClick.
+const stickyToasts = new Map();
+function stickyToast(key, title, detail, onClick) {
+  if (stickyToasts.has(key)) return;
+  const t = el("div", "toast sticky");
+  t.tabIndex = 0;
+  t.appendChild(el("div", "toast-title", title));
+  if (detail) t.appendChild(el("div", "toast-detail", detail));
+  const x = el("button", "toast-x", "\u00d7"); x.title = "Dismiss"; x.setAttribute("aria-label", "Dismiss");
+  x.addEventListener("click", (e) => { e.stopPropagation(); dropSticky(key, true); });
+  t.appendChild(x);
+  const go = () => { dropSticky(key, true); onClick(); };
+  t.addEventListener("click", go);
+  t.addEventListener("keydown", (e) => { if (e.key === "Enter") go(); });
+  $("toasts").appendChild(t);
+  stickyToasts.set(key, { el: t, dismissed: false });
+  playBeep();
+}
+function dropSticky(key, keep) {
+  const e = stickyToasts.get(key);
+  if (!e) return;
+  e.el.remove();
+  if (keep) stickyToasts.set(key, { el: e.el, dismissed: true }); else stickyToasts.delete(key);
+}
+// Remove sticky toasts whose key starts with prefix and is not in the live set.
+function pruneSticky(prefix, live) {
+  for (const k of [...stickyToasts.keys()]) if (k.startsWith(prefix) && !live.has(k)) dropSticky(k, false);
+}
+
+// ---------- native file / folder dialog ----------
+// Opens the operating system's own Explorer-style dialog (via the app) and
+// returns the chosen paths, or [] if cancelled. Falls back to typing a path
+// where the system has no native dialog.
+async function pickPaths(kind, title, start) {
+  try {
+    const r = await fetch("/api/fs/pick", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, title, start: start || "" }) });
+    if (r.ok) return (await r.json()).paths || [];
+    if (r.status !== 501) { toast((await r.text()).trim(), "err"); return []; }
+  } catch (e) { /* fall through to typing */ }
+  const typed = prompt(kind === "folder" ? "Folder path:" : "File or folder path:", start || "");
+  return typed && typed.trim() ? [typed.trim()] : [];
+}
+async function pickFolder(title, start) { const a = await pickPaths("folder", title, start); return a[0] || ""; }
+const savedDest = () => { try { return localStorage.getItem("lanyard.dest") || ""; } catch (e) { return ""; } };
+const currentDest = () => savedDest() || settings.default_download_folder || "";
 
 // ---------- context menu ----------
 function closeMenus() { clear($("ctx-root")); }
@@ -279,6 +326,11 @@ function renderExSide() {
   }
 
   box.appendChild(el("div", "tree-sep"));
+  const sh = el("div", "tree-item" + (p.kind === "shared" ? " active" : ""));
+  sh.innerHTML = I.share;
+  sh.appendChild(el("span", "ti-label", "Shared with me"));
+  sh.addEventListener("click", () => navigate({ kind: "shared" }));
+  box.appendChild(sh);
   box.appendChild(el("div", "tree-label", "Devices"));
   const list = peers.filter((x) => x.verified);
   if (!list.length) box.appendChild(el("div", "tree-label", "No devices nearby"));
@@ -301,7 +353,7 @@ function renderToolbar() {
   vm.innerHTML = S.mode === "grid" ? I.list : I.grid;
   renderCrumbs();
 }
-function canGoUp(p) { return p.kind === "folder" || p.kind === "remote" || p.kind === "device" ? true : false; }
+function canGoUp(p) { return p.kind === "folder" || p.kind === "remote" || p.kind === "device" || p.kind === "shared" ? true : false; }
 function renderCrumbs() {
   const c = $("crumbs");
   clear(c);
@@ -327,6 +379,10 @@ function renderCrumbs() {
       if (i > 0) c.appendChild(el("span", "crumb-sep", "/"));
       c.appendChild(crumb(part, i === 0 ? I.folder : null, isLast ? null : () => navigate({ kind: "folder", path: target })));
     });
+  } else if (p.kind === "shared") {
+    c.appendChild(crumb("This PC", smallDeviceIcon("windows", 16), () => navigate({ kind: "home" })));
+    c.appendChild(el("span", "crumb-sep", "/"));
+    c.appendChild(crumb("Shared with me", I.share, null));
   } else if (p.kind === "device") {
     c.appendChild(crumb("This PC", smallDeviceIcon("windows", 16), () => navigate({ kind: "home" })));
     c.appendChild(el("span", "crumb-sep", "/"));
@@ -357,6 +413,7 @@ function renderBody() {
   if (p.kind === "home") return renderHome(body);
   if (p.kind === "folder") return renderFolder(body, p);
   if (p.kind === "device") return renderDevice(body, p);
+  if (p.kind === "shared") return renderShared(body);
   if (p.kind === "remote") return renderRemote(body, p);
 }
 
@@ -445,10 +502,12 @@ function renderDevice(body, p) {
   const actions = el("div", "actions");
   if (paired) {
     actions.appendChild(btn("Push files\u2026", () => pushTo(p.device, peer.name)));
+    actions.appendChild(btn("Push folder\u2026", () => pushTo(p.device, peer.name, true), "ghost"));
     actions.appendChild(btn("Mount as drive", () => mountDevice(p.device, peer.name), "ghost"));
     actions.appendChild(btn("Unpair", () => unpair(p.device, paired), "ghost"));
   } else if (session) {
     actions.appendChild(btn("Push files\u2026", () => pushTo(p.device, peer.name)));
+    actions.appendChild(btn("Push folder\u2026", () => pushTo(p.device, peer.name, true), "ghost"));
     actions.appendChild(btn("Disconnect", () => sessionAction(session.id, "close"), "ghost"));
   } else {
     actions.appendChild(btn("Connect", () => startPair(p.device, peer.name, "connect")));
@@ -467,7 +526,7 @@ function renderDevice(body, p) {
     .then((list) => {
       if (place().kind !== "device" || place().device !== p.device) return;
       clear(listBox);
-      if (!list.length) { listBox.appendChild(el("div", "empty", "This device is not sharing anything you can see.")); return; }
+      if (!list.length) { listBox.appendChild(el("div", "empty", paired || session ? "This device is not sharing anything with you right now." : "Pair with or connect to this device to see what it shares.")); return; }
       for (const s of list) {
         const row = el("div", "row");
         const m = el("div", "grow");
@@ -481,6 +540,7 @@ function renderDevice(body, p) {
         const acts = el("div", "actions");
         if (s.kind === "folder") acts.appendChild(btn("Open", () => navigate({ kind: "remote", device: p.device, name: peer.name, share: s.share_id, shareLabel: s.label, path: "" })));
         acts.appendChild(btn("Download", () => downloadDialog(p.device, peer.name, s.share_id, s.label, [""]), "ghost"));
+        acts.appendChild(btn("Download to\u2026", () => downloadDialog(p.device, peer.name, s.share_id, s.label, [""], true), "ghost"));
         row.appendChild(acts);
         listBox.appendChild(row);
       }
@@ -488,15 +548,55 @@ function renderDevice(body, p) {
     .catch((err) => { clear(listBox); listBox.appendChild(el("div", "empty", String(err))); });
 }
 
+// -- everything other devices share with this one --
+function renderShared(body) {
+  body.appendChild(el("div", "section-title", "Shared with me"));
+  const box = el("div", "stack");
+  body.appendChild(box);
+  const list = peers.filter((x) => x.verified && (pairedEntry(x.device_id) || activeSession(x.device_id)));
+  if (!list.length) {
+    box.appendChild(el("div", "empty", "Pair with or connect to a device to see what it shares with you. Open a device from the list on the left to start."));
+    return;
+  }
+  for (const peer of list) {
+    const sec = el("div", "stack");
+    sec.appendChild(el("div", "meta", peer.name || "(unnamed)"));
+    const rows = el("div", "stack"); rows.appendChild(el("div", "empty", "Loading\u2026"));
+    sec.appendChild(rows); box.appendChild(sec);
+    fetch(`/api/remote/shares?device=${encodeURIComponent(peer.device_id)}`)
+      .then((r) => r.ok ? r.json() : r.text().then((t) => Promise.reject(t.trim())))
+      .then((shs) => {
+        if (place().kind !== "shared") return;
+        clear(rows);
+        if (!shs.length) { rows.appendChild(el("div", "empty", "Nothing shared with you right now.")); return; }
+        for (const sh of shs) {
+          const row = el("div", "row"); const m = el("div", "grow");
+          m.appendChild(el("div", "name", sh.label));
+          m.appendChild(el("div", "meta", [sh.kind, sh.size ? fmtBytes(sh.size) : ""].filter(Boolean).join(" \u00b7 ")));
+          row.appendChild(m);
+          const acts = el("div", "actions");
+          if (sh.kind === "folder") acts.appendChild(btn("Open", () => navigate({ kind: "remote", device: peer.device_id, name: peer.name, share: sh.share_id, shareLabel: sh.label, path: "" })));
+          acts.appendChild(btn("Download", () => downloadDialog(peer.device_id, peer.name, sh.share_id, sh.label, [""]), "ghost"));
+          row.appendChild(acts); rows.appendChild(row);
+        }
+      })
+      .catch((err) => { clear(rows); rows.appendChild(el("div", "msg err", "Could not list this device's shares: " + err)); });
+  }
+}
+
 // -- remote share browser --
 function renderRemote(body, p) {
   const bar = el("div", "form-row");
-  const dest = el("input");
-  dest.placeholder = "Download to folder";
-  dest.value = localStorage.getItem("lanyard.dest") || settings.default_download_folder || "";
-  dest.style.flex = "1"; dest.style.minWidth = "260px";
-  const dlHere = btn("Download this folder", () => downloadRemote(p, [p.path], dest.value));
-  bar.appendChild(dest); bar.appendChild(dlHere);
+  bar.appendChild(el("span", "muted", "Save to:"));
+  const destLabel = el("span", "dest-path", currentDest() || "not chosen yet");
+  destLabel.title = "Where downloads are saved";
+  bar.appendChild(destLabel);
+  bar.appendChild(btn("Change\u2026", async () => {
+    const d = await pickFolder("Choose where to save downloads", currentDest());
+    if (d) { try { localStorage.setItem("lanyard.dest", d); } catch (e) { } destLabel.textContent = d; }
+  }, "ghost"));
+  const dlHere = btn("Download this folder", () => downloadRemote(p, [p.path || ""]));
+  bar.appendChild(dlHere);
   body.appendChild(bar);
 
   const list = el("div", S.mode === "grid" ? "file-grid" : "file-list");
@@ -521,7 +621,8 @@ function renderRemote(body, p) {
           ev.preventDefault();
           const items = [];
           if (e.is_dir) items.push({ label: "Open", icon: "folder", onClick: () => navigate({ ...p, path: e.path }) });
-          items.push({ label: "Download", icon: "download", onClick: () => downloadRemote(p, [e.path], dest.value) });
+          items.push({ label: "Download", icon: "download", onClick: () => downloadRemote(p, [e.path]) });
+          items.push({ label: "Download to\u2026", icon: "download", onClick: () => downloadRemote(p, [e.path], true) });
           showMenu(ev.clientX, ev.clientY, items);
         });
         list.appendChild(item);
@@ -530,32 +631,23 @@ function renderRemote(body, p) {
     .catch((err) => { list.replaceChildren(el("div", "empty", String(err))); });
 }
 
-function downloadRemote(p, paths, dest) {
-  if (!dest) { toast("Choose a destination folder first.", "err"); return; }
-  localStorage.setItem("lanyard.dest", dest);
-  fetch("/api/transfers", {
+// Starts a download. It goes to the saved (or default) folder; the first time,
+// or with askWhere, the system folder dialog opens so nothing has to be typed.
+async function downloadRemote(p, paths, askWhere) {
+  let dest = currentDest();
+  if (askWhere === true || !dest) {
+    dest = await pickFolder("Choose where to save the download", dest);
+    if (!dest) return;
+  }
+  try { localStorage.setItem("lanyard.dest", dest); } catch (e) { }
+  const r = await fetch("/api/transfers", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ device: p.device, share_id: p.share, share_label: p.shareLabel, peer_name: p.name, paths, dest }),
-  }).then((r) => { if (r.ok) { toast("Download started.", "ok"); showView("transfers"); } else r.text().then((t) => toast(t.trim(), "err")); });
-}
-function downloadDialog(device, name, share, label, paths) {
-  const dlg = el("div", "overlay");
-  const modal = el("div", "modal");
-  const h = el("div", "modal-head"); h.appendChild(el("h2", null, "Download " + (label || "share")));
-  const close = el("button", "btn ghost", "Cancel"); h.appendChild(close);
-  modal.appendChild(h);
-  const inp = el("input"); inp.style.width = "100%";
-  inp.value = localStorage.getItem("lanyard.dest") || settings.default_download_folder || "";
-  inp.placeholder = "Destination folder";
-  modal.appendChild(inp);
-  const go = btn("Download", () => {
-    dlg.remove();
-    downloadRemote({ device, name, share, shareLabel: label }, paths, inp.value.trim());
   });
-  const acts = el("div", "actions"); acts.style.marginTop = "14px"; acts.appendChild(go); modal.appendChild(acts);
-  close.addEventListener("click", () => dlg.remove());
-  dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.remove(); });
-  dlg.appendChild(modal); document.body.appendChild(dlg); inp.focus();
+  if (r.ok) { toast("Downloading to " + dest, "ok"); showView("transfers"); } else toast((await r.text()).trim(), "err");
+}
+function downloadDialog(device, name, share, label, paths, askWhere) {
+  return downloadRemote({ device, name, share, shareLabel: label }, paths, askWhere);
 }
 
 // ---------- sharing ----------
@@ -732,7 +824,26 @@ function renderTransfersPage() {
   const anyDone = transfersList.some((t) => t.state === "Done");
   $("clear-finished").hidden = !anyDone;
   const stack = el("div", "stack");
-  if (!transfersList.length) stack.appendChild(el("div", "empty", "No transfers."));
+  if (!transfersList.length && !incomingList.length) stack.appendChild(el("div", "empty", "No transfers."));
+  for (const inc of incomingList) {
+    const row = el("div", "row col");
+    const top = el("div", "row"); top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
+    top.appendChild(el("div", "grow name", "\u2193 Receiving from " + (inc.peer_name || prettyId(inc.peer_fp) || "a device")));
+    top.appendChild(el("span", "badge", "Receiving"));
+    row.appendChild(top);
+    const pct = inc.total ? Math.min(100, (inc.done / inc.total) * 100) : 0;
+    const bar = el("div", "bar"); const fill = el("div", "fill"); fill.style.width = pct.toFixed(1) + "%"; bar.appendChild(fill); row.appendChild(bar);
+    row.appendChild(el("div", "meta", `${pct.toFixed(0)}% \u00b7 ${fmtBytes(inc.done)} / ${fmtBytes(inc.total)} \u00b7 ${inc.files_done} of ${inc.files_total} file${inc.files_total === 1 ? "" : "s"} \u00b7 saved to your Inbox`));
+    if (inc.current) row.appendChild(el("div", "meta", inc.current));
+    const acts = el("div", "actions");
+    acts.appendChild(btn("Cancel", async () => {
+      if (!confirm("Stop receiving these files? Files already received stay in your Inbox.")) return;
+      const r = await fetch(`/api/incoming/${encodeURIComponent(inc.id)}/cancel`, { method: "POST" });
+      if (!r.ok) toast((await r.text()).trim(), "err"); else toast("Transfer cancelled.", "info");
+    }, "ghost"));
+    row.appendChild(acts);
+    stack.appendChild(row);
+  }
   for (const t of transfersList) {
     const row = el("div", "row col");
     const files = t.files || [];
@@ -811,6 +922,7 @@ function renderSettings(s) {
   const startup = checkInput(s.start_on_login, "set-startup");
   const dl = textInput(s.default_download_folder, "set-dl");
   const inbox = textInput(s.inbox_folder, "set-inbox"); inbox.placeholder = "default: <data dir>/Inbox";
+  const tray = checkInput(s.minimize_to_tray, "set-tray");
   const bw = numberInput(s.bandwidth_limit_mbps || 0, "set-bw");
   const port = numberInput(s.peer_port || 47800, "set-port");
 
@@ -821,8 +933,9 @@ function renderSettings(s) {
   box.appendChild(settingsField("Speed unit", speed));
   box.appendChild(settingsField("Sound when a transfer finishes", sound));
   box.appendChild(settingsField("Start LANyard when I sign in", startup));
-  box.appendChild(settingsField("Default download folder", dl));
-  box.appendChild(settingsField("Inbox folder (pushes)", inbox));
+  if (s.tray_supported) box.appendChild(settingsField("Minimize to system tray (closing or minimizing hides the window; use the tray icon to reopen or quit)", tray));
+  box.appendChild(settingsField("Default download folder", withBrowse(dl, "Choose the default download folder")));
+  box.appendChild(settingsField("Inbox folder (pushes)", withBrowse(inbox, "Choose the Inbox folder")));
   box.appendChild(settingsField("Bandwidth limit (MB/s, 0 = unlimited)", bw));
   box.appendChild(settingsField("Peer port (restart to apply)", port));
   const msg = el("div", "msg err", ""); msg.hidden = true; msg.id = "set-msg"; box.appendChild(msg);
@@ -869,6 +982,12 @@ function renderSettings(s) {
     }
   }
 }
+function withBrowse(input, title) {
+  const w = el("div", "browse-wrap");
+  w.appendChild(input);
+  w.appendChild(btn("Browse\u2026", async () => { const d = await pickFolder(title, input.value); if (d) input.value = d; }, "ghost"));
+  return w;
+}
 function settingsField(label, input) { const row = el("div", "set-row"); row.appendChild(el("label", "set-label", label)); row.appendChild(input); return row; }
 function selectEl(options, value, id) {
   const sel = document.createElement("select"); sel.id = id;
@@ -890,6 +1009,7 @@ async function saveSettings() {
     speed_unit: $("set-speed").value,
     sound_on_complete: $("set-sound").checked,
     start_on_login: $("set-startup").checked,
+    ...($("set-tray") ? { minimize_to_tray: $("set-tray").checked } : {}),
     default_download_folder: $("set-dl").value.trim(),
     inbox_folder: $("set-inbox").value.trim(),
     bandwidth_limit_mbps: parseInt($("set-bw").value || "0", 10) || 0,
@@ -1055,9 +1175,6 @@ setInterval(pollSessions, 1500);
 
 function onSessionTransition(s, before) {
   const who = whoOf(s);
-  if (s.incoming && s.status === "pending" && before === undefined) {
-    toast(who + " wants to " + (s.mode === "pair" ? "pair" : "connect") + ".", "info");
-  }
   if (!s.incoming && s.status === "accepted" && before === "pending") {
     toast(who + " accepted \u2014 confirm the code to finish.", "ok");
   }
@@ -1087,11 +1204,16 @@ function handleSessions(list) {
   renderNav();
   if (S.view === "paired") renderPairedPage();
   if (S.view === "devices") renderExSide();
-  // Surface a new incoming request without waiting for the user to go looking.
-  if (!pairView) {
-    const incoming = list.filter((s) => s.incoming && s.status === "pending" && !autoOpened.has(s.id) && !dismissed.has(s.id));
-    if (incoming.length) { const s = incoming[incoming.length - 1]; autoOpened.add(s.id); openSession(s.id); }
+  // A new incoming request is a small notification (bottom right); clicking it
+  // opens the accept screen. It never takes over the window by itself.
+  const live = new Set();
+  for (const s of list) {
+    if (!(s.incoming && s.status === "pending")) continue;
+    const key = "sess:" + s.id; live.add(key);
+    if (dismissed.has(s.id)) continue;
+    stickyToast(key, whoOf(s) + " wants to " + (s.mode === "pair" ? "pair" : "connect"), "Click to review and accept or reject", () => openSession(s.id));
   }
+  pruneSticky("sess:", live);
 }
 
 // ---------- misc actions ----------
@@ -1105,11 +1227,12 @@ async function unpair(fp, entry) {
   if (!confirm(`Unpair ${name}? Active connections from this device will be rejected immediately.`)) return;
   await fetch(`/api/trust/${encodeURIComponent(fp)}/unpair`, { method: "POST" });
 }
-async function pushTo(deviceId, name) {
-  const path = prompt(`Path of a file or folder to push to ${name || "the device"}'s Inbox:`);
-  if (!path) return;
-  const r = await fetch("/api/push", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: deviceId, paths: [path] }) });
-  if (!r.ok) toast((await r.text()).trim(), "err"); else toast("Pushed to Inbox.", "ok");
+async function pushTo(deviceId, name, folder) {
+  const paths = await pickPaths(folder ? "folder" : "files", `Choose ${folder ? "a folder" : "files"} to send to ${name || "the device"}`, "");
+  if (!paths.length) return;
+  const r = await fetch("/api/push", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: deviceId, paths }) });
+  if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
+  toast("Sending to " + (name || "the device") + "\u2026", "ok"); showView("transfers");
 }
 async function mountDevice(deviceId, name) {
   let drive = "";
@@ -1133,12 +1256,25 @@ function playBeep() {
 }
 
 // ---------- approvals ----------
+let approvalsOpen = false;
 function renderApprovals(list) {
   approvalsList = list;
   const box = $("approvals"), modal = $("approvals-modal");
-  box.hidden = list.length === 0;
   document.title = (list.length ? `(${list.length}) ` : "") + "LANyard File Transfer";
+  const live = new Set();
+  for (const a of list) {
+    const key = "appr:" + a.id; live.add(key);
+    const files = a.count === 1 ? "1 file" : `${a.count} files`;
+    stickyToast(key, `${a.peer_name || "A device"} wants to send you ${files}`, `${fmtBytes(a.total)} \u00b7 click to review`, () => { approvalsOpen = true; renderApprovals(approvalsList); });
+  }
+  pruneSticky("appr:", live);
+  if (!list.length) approvalsOpen = false;
+  box.hidden = !approvalsOpen;
   clear(modal);
+  if (!approvalsOpen) return;
+  const head = el("div", "modal-head"); head.appendChild(el("h2", null, "Incoming files"));
+  head.appendChild(btn("Decide later", () => { approvalsOpen = false; renderApprovals(approvalsList); }, "ghost"));
+  modal.appendChild(head);
   for (const a of list) {
     const card = el("div", "row col");
     const files = a.count === 1 ? "1 file" : `${a.count} files`;
@@ -1172,6 +1308,12 @@ function renderTransfers(list) {
   if (S.view === "transfers") renderTransfersPage();
 }
 function renderSessions(list) { handleSessions(list); }
+function renderIncoming(list) {
+  const had = incomingList.length;
+  incomingList = list;
+  if (S.view === "transfers") renderTransfersPage();
+  if (list.length !== had) renderNav();
+}
 function connectEvents() {
   const es = new EventSource("/api/events");
   es.addEventListener("peers", (ev) => renderPeers(JSON.parse(ev.data)));
@@ -1180,6 +1322,7 @@ function connectEvents() {
   es.addEventListener("trust", (ev) => renderTrust(JSON.parse(ev.data)));
   es.addEventListener("approvals", (ev) => renderApprovals(JSON.parse(ev.data)));
   es.addEventListener("sessions", (ev) => renderSessions(JSON.parse(ev.data)));
+  es.addEventListener("incoming", (ev) => renderIncoming(JSON.parse(ev.data)));
   es.onerror = () => { };
 }
 

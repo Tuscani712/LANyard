@@ -1,6 +1,7 @@
 package uiserver
 
 import (
+	"encoding/json"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -147,4 +148,32 @@ func (s *Server) handleFSList(w http.ResponseWriter, r *http.Request) {
 		"parent":  parent,
 		"entries": entries,
 	})
+}
+
+// handleFSPick opens the operating system's own file/folder dialog on this
+// computer and returns what the person chose. kind is "folder" or "files".
+// An empty list means the dialog was cancelled.
+func (s *Server) handleFSPick(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Kind  string `json:"kind"`
+		Title string `json:"title"`
+		Start string `json:"start"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.Kind != "folder" && req.Kind != "files" {
+		http.Error(w, "kind must be folder or files", http.StatusBadRequest)
+		return
+	}
+	paths, err := pickPaths(req.Kind, req.Title, strings.TrimSpace(req.Start))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotImplemented)
+		return
+	}
+	if paths == nil {
+		paths = []string{}
+	}
+	writeJSON(w, map[string]any{"paths": paths})
 }

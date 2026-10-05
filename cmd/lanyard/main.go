@@ -328,6 +328,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		Client:    client,
 		Trust:     trustStore,
 		Approvals: approvals,
+		Inbox:     inboxMgr,
 		Mounts:    mountMgr,
 		SelfFP:    id.DeviceID,
 		Cfg:       cfg,
@@ -335,6 +336,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 			inboxMgr.SetDir(inboxDir(dataDir, s.InboxFolder))
 			trMgr.SetBandwidthLimit(s.BandwidthLimitMBps)
 			disc.SetIdentity(s.DeviceName, s.DeviceIDLabel) // re-announce without a restart
+			minimizeToTray.Store(s.MinimizeToTray)
 		},
 		SetStartOnLogin:     func(enable bool) error { return setStartOnLogin(dataDir, enable) },
 		StartOnLoginEnabled: autostart.Enabled,
@@ -358,15 +360,22 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	// --web, or nothing at all with --no-browser (headless).
 	native := nativeMode
 
-	// System tray: click to open the window, right-click to quit. Skipped when
-	// the native window is the interface (it has its own taskbar entry).
+	// System tray: click to open (or restore) the window, right-click to quit.
+	// With the "minimize to system tray" setting the native window hides here
+	// instead of using the taskbar.
+	minimizeToTray.Store(st.MinimizeToTray)
 	stopTray := func() {}
-	if !noTray && !native {
+	if !noTray {
 		stopTray = startTray(trayOptions{
 			IconPath: filepath.Join(dataDir, "icon.ico"),
-			OnOpen:   func() { openBrowser(ui.URL()) },
-			OnQuit:   stop,
-			Log:      log,
+			OnOpen: func() {
+				if native && showNativeWindow() {
+					return
+				}
+				openBrowser(ui.URL())
+			},
+			OnQuit: stop,
+			Log:    log,
 		})
 	}
 	defer stopTray()
