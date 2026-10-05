@@ -406,10 +406,36 @@ func (s *Store) Accept(id string, granted Permissions) (*Session, error) {
 	sess.UpdatedAt = time.Now()
 	snap := *sess
 	s.mu.Unlock()
+	// The trust entry is created only when the initiator confirms the SAS
+	// (see ActivateRemote), so a cancelled or unconfirmed pairing leaves no
+	// entry on either side.
+	s.onChange()
+	return &snap, nil
+}
+
+// ActivateRemote is called on the responder when the initiator confirms the
+// SAS. It activates the session and, for a pairing, records the trust entry
+// with the permissions we granted. Deferring the entry to this point keeps a
+// cancelled/unconfirmed pairing from leaving a phantom paired device.
+func (s *Store) ActivateRemote(id string) (*Session, error) {
+	s.mu.Lock()
+	sess, ok := s.sessions[id]
+	if !ok || !sess.Incoming {
+		s.mu.Unlock()
+		return nil, errors.New("no such session")
+	}
+	if sess.Status == StatusPending {
+		s.mu.Unlock()
+		return nil, errors.New("the request was not accepted")
+	}
+	sess.Status = StatusActive
+	sess.UpdatedAt = time.Now()
+	snap := *sess
+	s.mu.Unlock()
 	if sess.Mode == ModePair {
 		s.Pair(Entry{
 			DeviceID: sess.PeerDevice, Name: sess.PeerName, Fingerprint: sess.PeerFP,
-			Mode: ModePair, Permissions: granted,
+			Mode: ModePair, Permissions: sess.Granted,
 		})
 	}
 	s.onChange()
@@ -632,8 +658,28 @@ func (s *Store) sweepLocked(now time.Time) bool {
 				delete(s.sessions, id)
 				changed = true
 			}
-		case StatusAccepted, StatusActive:
-			if sess.Mode == ModeConnect && now.Sub(sess.UpdatedAt) > SessionInactivity {
+		case StatusAccepted:
+			// A handshake accepted but never confirmed must not linger.
+			if now.Sub(sess.UpdatedAt) > PairingTTL {
+				delete(s.sessions, id)
+				changed = true
+			}
+		case StatusActive:
+			switch sess.Mode {
+			case ModeConnect:
+				if now.Sub(sess.UpdatedAt) > SessionInactivity {
+					delete(s.sessions, id)
+					changed = true
+				}
+			case ModePair:
+				// The trust entry outlives the handshake; drop the session itself.
+				if now.Sub(sess.UpdatedAt) > PairingTTL {
+					delete(s.sessions, id)
+					changed = true
+				}
+			}
+		case StatusRejected, StatusClosed, StatusExpired:
+			if now.Sub(sess.UpdatedAt) > 5*time.Minute {
 				delete(s.sessions, id)
 				changed = true
 			}

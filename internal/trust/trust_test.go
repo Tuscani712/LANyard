@@ -29,9 +29,17 @@ func TestPairFlow(t *testing.T) {
 	if _, err := st.Accept(in.ID, Permissions{Browse: true, Push: true}); err != nil {
 		t.Fatalf("Accept: %v", err)
 	}
+	// Accepting must not pair yet: the entry appears only when the initiator
+	// confirms the SAS (ActivateRemote), so a cancelled pairing leaves nothing.
+	if _, ok := st.Entry("peer-fp"); ok {
+		t.Fatal("accept must not create a paired entry before confirmation")
+	}
+	if _, err := st.ActivateRemote(in.ID); err != nil {
+		t.Fatalf("ActivateRemote: %v", err)
+	}
 	e, ok := st.Entry("peer-fp")
 	if !ok || !e.Permissions.Push {
-		t.Fatalf("accept should store a paired entry with push, got %+v ok=%v", e, ok)
+		t.Fatalf("confirmation should store a paired entry with push, got %+v ok=%v", e, ok)
 	}
 
 	// Initiator side: create, learn the remote id/nonce, confirm.

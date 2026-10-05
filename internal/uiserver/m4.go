@@ -225,6 +225,12 @@ func (s *Server) handleSessionConfirm(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such session", http.StatusNotFound)
 		return
 	}
+	// Do not confirm the peer until we know it accepted; otherwise the peer
+	// activates while our own session is still pending.
+	if sess.Status == trust.StatusPending {
+		http.Error(w, "the other device has not accepted yet", http.StatusConflict)
+		return
+	}
 	p, ok := s.peerByID(sess.PeerFP)
 	if !ok {
 		http.Error(w, "device is not visible", http.StatusBadGateway)

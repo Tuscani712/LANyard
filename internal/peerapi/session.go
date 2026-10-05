@@ -125,7 +125,10 @@ func (s *Server) handleSessionConfirm(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the other device has not accepted yet", http.StatusConflict)
 		return
 	}
-	s.trust.SetStatus(sess.ID, trust.StatusActive, "")
+	if _, err := s.trust.ActivateRemote(sess.ID); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
 	writeJSON(w, map[string]string{"status": trust.StatusActive})
 }
 

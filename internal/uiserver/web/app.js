@@ -183,6 +183,9 @@ function renderNav() {
       const live = transfersList.filter((t) => t.state !== "Done").length;
       if (live) item.appendChild(el("span", "nav-badge", String(live)));
     }
+    if (n.id === "paired" && S.actionable) {
+      item.appendChild(el("span", "nav-badge alert", String(S.actionable)));
+    }
     item.addEventListener("click", () => showView(n.id));
     nav.appendChild(item);
   }
@@ -909,7 +912,13 @@ async function cancelAllShares() {
 }
 
 // ---------- pairing / sessions ----------
-let pairView = null, pairPerms = { browse: true, push: false }, pairKeep = false, pairTimer = null;
+let pairView = null, pairPerms = { browse: true, push: false }, pairKeep = false;
+const sessionMemo = {};        // id -> last status seen (drives transition toasts)
+const autoOpened = new Set();  // incoming ids we auto-surfaced once
+const dismissed = new Set();   // ids the user closed/rejected (do not auto-reopen)
+
+function whoOf(s) { return s.peer_name || prettyId(s.peer_fp) || s.peer_device || "device"; }
+
 function startPair(deviceId, name, mode) {
   pairPerms = { browse: true, push: false }; pairKeep = false;
   if (mode === "pair") { pairView = { setup: true, mode, peer_fp: deviceId, peer_name: name }; $("pair").hidden = false; renderPair(); return; }
@@ -918,56 +927,65 @@ function startPair(deviceId, name, mode) {
 async function sendPairRequest(deviceId, name, mode) {
   const r = await fetch("/api/sessions/request", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: deviceId, mode, permissions: pairPerms, keep_connected: pairKeep }) });
   if (!r.ok) { pairView = { setup: true, mode, peer_fp: deviceId, peer_name: name, error: (await r.text()).trim() }; $("pair").hidden = false; renderPair(); return; }
-  pairView = await r.json(); $("pair").hidden = false; startPairTimer(); renderPair();
+  pairView = await r.json();
+  $("pair").hidden = false; renderPair();
+  toast((mode === "pair" ? "Pairing" : "Connect") + " request sent to " + (name || "the device") + ".", "info");
+  pollSessions();
 }
-function openSession(id) { pairView = sessions.find((s) => s.id === id) || null; if (!pairView) return; pairKeep = !!pairView.keep_connected; $("pair").hidden = false; startPairTimer(); renderPair(); }
-function startPairTimer() {
-  if (pairTimer) clearInterval(pairTimer);
-  pairTimer = setInterval(async () => {
-    if (!pairView || pairView.setup) return;
-    if (!pairView.incoming && pairView.status !== "active") {
-      try { const r = await fetch(`/api/sessions/${pairView.id}/refresh`, { method: "POST" }); if (r.ok) { pairView = await r.json(); renderPair(); return; } } catch (e) { }
-    }
-    const fresh = sessions.find((s) => s.id === pairView.id);
-    if (fresh) { pairView = fresh; renderPair(); }
-  }, 1500);
+function openSession(id) {
+  const s = sessions.find((x) => x.id === id);
+  if (!s) return;
+  pairView = s; pairKeep = !!s.keep_connected;
+  dismissed.delete(id); autoOpened.add(id);
+  $("pair").hidden = false; renderPair();
 }
-function closePair() { if (pairTimer) { clearInterval(pairTimer); pairTimer = null; } pairView = null; $("pair").hidden = true; }
+function closePair() { pairView = null; $("pair").hidden = true; }
 function sasText(sas) { return sas && sas.length === 6 ? `${sas.slice(0, 3)} ${sas.slice(3)}` : (sas || ""); }
+
 function renderPair() {
   const body = $("pair-body"); clear(body);
   if (!pairView) return;
   const v = pairView;
-  const who = v.peer_name || prettyId(v.peer_fp) || "device";
+  const who = whoOf(v);
   $("pair-title").textContent = (v.mode === "pair" ? "Pair with " : "Connect to ") + who;
   if (v.setup) {
     body.appendChild(el("p", "muted", "Choose what " + who + " may do on this device."));
     body.appendChild(permToggle("browse", "Let them browse and pull my shares", pairPerms.browse));
     body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push));
     if (v.error) body.appendChild(el("div", "msg err", v.error));
-    body.appendChild(el("div", "actions", "")).appendChild(btn("Start pairing", () => sendPairRequest(v.peer_fp, who, v.mode)));
+    body.appendChild(el("div", "actions", "")).appendChild(btn("Send request", () => sendPairRequest(v.peer_fp, who, v.mode)));
     return;
   }
   const sasBox = el("div", "sasbox");
-  sasBox.appendChild(el("div", "muted", "Does the other device show this code?"));
+  sasBox.appendChild(el("div", "muted", "Both devices must show the same code:"));
   sasBox.appendChild(el("div", "sas", sasText(v.sas)));
   body.appendChild(sasBox);
   const status = el("p", "muted", ""); body.appendChild(status);
   const actions = el("div", "actions");
+  const action = v.mode === "pair" ? "pair" : "connect";
+
   if (v.incoming && v.status === "pending") {
-    status.textContent = "A device wants to " + (v.mode === "pair" ? "pair" : "connect") + ". Confirm the code matches before accepting.";
+    status.textContent = who + " wants to " + action + ". Confirm the code matches before accepting.";
     if (v.mode === "pair") { body.appendChild(permToggle("browse", "Let them browse and pull my shares", pairPerms.browse)); body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push)); }
     actions.appendChild(btn("Accept", () => acceptSession(v.id)));
     actions.appendChild(btn("Reject", () => sessionAction(v.id, "reject"), "ghost"));
-  } else if (!v.incoming && (v.status === "pending" || v.status === "accepted")) {
-    status.textContent = v.status === "pending" ? "Waiting for the other device to accept\u2026" : "They accepted. Check the code, then confirm.";
-    actions.appendChild(btn("The codes match \u2014 connect", () => confirmSession(v.id)));
+  } else if (v.incoming && v.status === "accepted") {
+    status.textContent = "Accepted. Waiting for " + who + " to confirm the code\u2026";
+    actions.appendChild(btn("Cancel", () => sessionAction(v.id, "close"), "ghost"));
+  } else if (!v.incoming && v.status === "pending") {
+    status.textContent = "Waiting for " + who + " to accept\u2026";
+    actions.appendChild(btn("Cancel", () => sessionAction(v.id, "close"), "ghost"));
+  } else if (!v.incoming && v.status === "accepted") {
+    status.textContent = who + " accepted. Check the code, then confirm.";
+    actions.appendChild(btn("The codes match \u2014 " + action, () => confirmSession(v.id)));
     actions.appendChild(btn("Cancel", () => sessionAction(v.id, "close"), "ghost"));
   } else if (v.status === "active") {
-    status.textContent = "Connected.";
+    status.textContent = v.mode === "pair" ? "Paired. The device is in View Paired Machines." : "Connected.";
+    if (v.incoming && v.mode === "connect") body.appendChild(offersUI(v));
     actions.appendChild(btn("Close session", () => sessionAction(v.id, "close"), "ghost"));
   } else {
-    status.textContent = "Session " + v.status + (v.error ? ": " + v.error : "") + ".";
+    const reason = v.status === "rejected" ? "declined" : v.status === "expired" ? "not answered in time" : "ended";
+    status.textContent = "The request was " + reason + (v.error ? ": " + v.error : "") + ".";
     actions.appendChild(btn("Close", closePair, "ghost"));
   }
   body.appendChild(actions);
@@ -978,17 +996,103 @@ function permToggle(key, label, checked) {
   cb.addEventListener("change", () => { pairPerms[key] = cb.checked; });
   w.appendChild(cb); w.appendChild(el("span", null, label)); return w;
 }
+function offersUI(v) {
+  const box = el("div", "offers");
+  box.appendChild(el("div", "muted", "Offer shares into this session:"));
+  const chosen = new Set(v.offers || []);
+  if (!sharesList.length) box.appendChild(el("div", "muted", "You have no shares yet."));
+  for (const s of sharesList) {
+    const w = el("label", "toggle");
+    const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = chosen.has(s.share_id);
+    cb.addEventListener("change", () => { cb.checked ? chosen.add(s.share_id) : chosen.delete(s.share_id); });
+    w.appendChild(cb); w.appendChild(el("span", null, s.label || s.path));
+    box.appendChild(w);
+  }
+  box.appendChild(btn("Offer selected", () => offerShares(v.id, [...chosen])));
+  return box;
+}
+async function offerShares(id, ids) {
+  const r = await fetch(`/api/sessions/${id}/offers`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ share_ids: ids }) });
+  if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
+  pairView = await r.json(); renderPair();
+  toast("Offered " + ids.length + " share(s) to the session.", "ok");
+}
 async function acceptSession(id) {
   const r = await fetch(`/api/sessions/${id}/accept`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ permissions: pairPerms, keep_connected: pairKeep }) });
   if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
   pairView = await r.json(); renderPair();
+  toast("Accepted. Waiting for the other device to confirm the code.", "info");
+  pollSessions();
 }
 async function confirmSession(id) {
   const r = await fetch(`/api/sessions/${id}/confirm`, { method: "POST" });
-  if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
+  if (!r.ok) { toast((await r.text()).trim(), "err"); pollSessions(); return; }
   pairView = await r.json(); renderPair();
+  pollSessions();
 }
-async function sessionAction(id, action) { await fetch(`/api/sessions/${id}/${action}`, { method: "POST" }); if (action === "close" || action === "reject") closePair(); }
+async function sessionAction(id, action) {
+  await fetch(`/api/sessions/${id}/${action}`, { method: "POST" });
+  if (action === "close" || action === "reject") { dismissed.add(id); closePair(); }
+  toast(action === "reject" ? "Request rejected." : "Request cancelled.", "info");
+  pollSessions();
+}
+
+// Sessions can change on the other device (accept, confirm, reject, close).
+// The responder does not push to us, so poll our outgoing handshakes, then
+// refetch our local list and react to any transition with a notification.
+let pollBusy = false;
+async function pollSessions() {
+  if (pollBusy || document.hidden) return;
+  pollBusy = true;
+  try {
+    const outs = sessions.filter((s) => !s.incoming && (s.status === "pending" || s.status === "accepted"));
+    for (const s of outs) { try { await fetch(`/api/sessions/${s.id}/refresh`, { method: "POST" }); } catch (e) { /* offline */ } }
+    const list = await (await fetch("/api/sessions")).json();
+    handleSessions(list);
+  } catch (e) { /* transient */ } finally { pollBusy = false; }
+}
+setInterval(pollSessions, 1500);
+
+function onSessionTransition(s, before) {
+  const who = whoOf(s);
+  if (s.incoming && s.status === "pending" && before === undefined) {
+    toast(who + " wants to " + (s.mode === "pair" ? "pair" : "connect") + ".", "info");
+  }
+  if (!s.incoming && s.status === "accepted" && before === "pending") {
+    toast(who + " accepted \u2014 confirm the code to finish.", "ok");
+  }
+  if (s.status === "active" && before !== "active") {
+    toast(s.mode === "pair" ? "Paired with " + who + "." : "Connected to " + who + ".", "ok");
+    if (pairView && pairView.id === s.id) closePair();
+  }
+  if (!s.incoming && (s.status === "rejected" || s.status === "closed" || s.status === "expired") && before !== s.status) {
+    const t = s.status === "rejected" ? "declined the request" : s.status === "expired" ? "did not respond" : "ended the session";
+    toast(who + " " + t + ".", s.status === "rejected" ? "err" : "info");
+    if (pairView && pairView.id === s.id) closePair();
+  }
+}
+function handleSessions(list) {
+  sessions = list;
+  for (const s of list) {
+    const before = sessionMemo[s.id];
+    if (before !== s.status) { onSessionTransition(s, before); sessionMemo[s.id] = s.status; }
+  }
+  for (const id of Object.keys(sessionMemo)) if (!list.some((s) => s.id === id)) delete sessionMemo[id];
+  if (pairView && !pairView.setup) {
+    const fresh = list.find((s) => s.id === pairView.id);
+    if (fresh) { pairView = fresh; renderPair(); } else { closePair(); }
+  }
+  S.actionable = list.filter((s) => (s.incoming && s.status === "pending") || (!s.incoming && s.status === "accepted")).length;
+  document.title = (S.actionable ? `(${S.actionable}) ` : "") + "LANyard File Transfer";
+  renderNav();
+  if (S.view === "paired") renderPairedPage();
+  if (S.view === "devices") renderExSide();
+  // Surface a new incoming request without waiting for the user to go looking.
+  if (!pairView) {
+    const incoming = list.filter((s) => s.incoming && s.status === "pending" && !autoOpened.has(s.id) && !dismissed.has(s.id));
+    if (incoming.length) { const s = incoming[incoming.length - 1]; autoOpened.add(s.id); openSession(s.id); }
+  }
+}
 
 // ---------- misc actions ----------
 async function addPeer(addr) {
@@ -1067,12 +1171,7 @@ function renderTransfers(list) {
   renderNav();
   if (S.view === "transfers") renderTransfersPage();
 }
-function renderSessions(list) {
-  sessions = list;
-  if (pairView && !pairView.setup) { const fresh = list.find((s) => s.id === pairView.id); if (fresh) { pairView = fresh; renderPair(); } }
-  if (S.view === "paired") renderPairedPage();
-  if (S.view === "devices") renderExSide();
-}
+function renderSessions(list) { handleSessions(list); }
 function connectEvents() {
   const es = new EventSource("/api/events");
   es.addEventListener("peers", (ev) => renderPeers(JSON.parse(ev.data)));
