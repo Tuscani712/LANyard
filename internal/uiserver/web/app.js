@@ -146,6 +146,22 @@ function smallDeviceIcon(os, size) {
 
 // ---------- state ----------
 let settings = { speed_unit: "mbs", sound_on_complete: false, theme: "dark", default_download_folder: "" };
+// Online means the device answered a recent check (discovery probes every few
+// seconds). A paired device that stops answering stays listed as Offline.
+const seenAt = (() => { try { return JSON.parse(localStorage.getItem("lanyard.seen") || "{}"); } catch (e) { return {}; } })();
+const wasOnline = new Map();
+let peersLoaded = false;
+const isOnline = (fp) => peers.some((p) => p.verified && p.device_id === fp);
+function lastSeenText(fp) { const t = seenAt[fp]; return t ? "last seen " + fmtWhen(new Date(t).toISOString()) : "not seen yet"; }
+// Everything worth listing: devices found now, plus paired devices that are away.
+function knownDevices() {
+  const out = peers.filter((p) => p.verified).map((p) => ({ device_id: p.device_id, name: p.name, os: p.os, online: true }));
+  for (const e of trustList) {
+    const fp = e.cert_fingerprint || e.device_id;
+    if (!out.some((d) => d.device_id === fp)) out.push({ device_id: fp, name: e.name, os: "", online: false });
+  }
+  return out;
+}
 let peers = [], trustList = [], sessions = [], sharesList = [], transfersList = [], approvalsList = [], mountsList = [];
 const S = {
   view: "devices",
@@ -332,13 +348,15 @@ function renderExSide() {
   sh.addEventListener("click", () => navigate({ kind: "shared" }));
   box.appendChild(sh);
   box.appendChild(el("div", "tree-label", "Devices"));
-  const list = peers.filter((x) => x.verified);
+  const list = knownDevices();
   if (!list.length) box.appendChild(el("div", "tree-label", "No devices nearby"));
   for (const peer of list) {
     const isDev = (p.kind === "device" || p.kind === "remote") && p.device === peer.device_id;
     const it = el("div", "tree-item" + (isDev ? " active" : ""));
     it.innerHTML = smallDeviceIcon(peer.os);
     it.appendChild(el("span", "ti-label", peer.name || "(unnamed)"));
+    const dot = el("span", "dot sm" + (peer.online ? "" : " off")); dot.title = peer.online ? "Online" : "Offline";
+    it.appendChild(dot);
     it.addEventListener("click", () => navigate({ kind: "device", device: peer.device_id, name: peer.name }));
     it.addEventListener("contextmenu", (e) => { e.preventDefault(); showMenu(e.clientX, e.clientY, peerMenu(peer)); });
     box.appendChild(it);
@@ -419,10 +437,11 @@ function renderBody() {
 
 // -- home: device cards --
 function renderHome(body) {
-  const list = peers.filter((p) => p.verified && (!S.search || (p.name || "").toLowerCase().includes(S.search) || (p.os || "").toLowerCase().includes(S.search)));
+  const all = knownDevices();
+  const list = all.filter((p) => !S.search || (p.name || "").toLowerCase().includes(S.search) || (p.os || "").toLowerCase().includes(S.search));
   if (!list.length) {
     const wrap = el("div", "empty");
-    wrap.appendChild(el("div", null, peers.some((p) => p.verified) ? "No devices match your search." : "Looking for other devices running LANyard on this network\u2026"));
+    wrap.appendChild(el("div", null, all.length ? "No devices match your search." : "Looking for other devices running LANyard on this network\u2026"));
     const row = el("div", "form-row"); row.style.justifyContent = "center"; row.style.marginTop = "14px";
     const inp = el("input"); inp.placeholder = "Add by address (192.168.1.20:47800)"; inp.style.minWidth = "260px";
     const b = el("button", "btn", "Add");
@@ -436,15 +455,16 @@ function renderHome(body) {
   const grid = el("div", "cards");
   for (const p of list) {
     const k = devKind(p.os);
-    const card = el("div", "device-card");
+    const card = el("div", "device-card" + (p.online ? "" : " offline"));
     card.tabIndex = 0;
     const art = el("div", "dc-art"); art.innerHTML = deviceArt(k); card.appendChild(art);
     card.appendChild(el("div", "dc-name", devKindName(k)));
     card.appendChild(el("div", "dc-sub", p.name || "(unnamed)"));
-    const st = el("div", "status");
-    st.appendChild(el("span", "dot"));
-    st.appendChild(el("span", null, "Online"));
+    const st = el("div", "status" + (p.online ? "" : " off"));
+    st.appendChild(el("span", "dot" + (p.online ? "" : " off")));
+    st.appendChild(el("span", null, p.online ? "Online" : "Offline"));
     card.appendChild(st);
+    if (!p.online) card.appendChild(el("div", "dc-sub", lastSeenText(p.device_id)));
     card.addEventListener("click", () => navigate({ kind: "device", device: p.device_id, name: p.name }));
     card.addEventListener("contextmenu", (e) => { e.preventDefault(); showMenu(e.clientX, e.clientY, peerMenu(p)); });
     grid.appendChild(card);
@@ -491,10 +511,11 @@ function renderDevice(body, p) {
   const peer = peers.find((x) => x.device_id === p.device) || { name: p.name, os: "", device_id: p.device };
   const paired = pairedEntry(p.device);
   const session = activeSession(p.device);
+  const online = isOnline(p.device);
   const head = el("div", "row");
   const main = el("div", "grow");
   main.appendChild(el("div", "name", peer.name || "(unnamed)"));
-  const bits = [devKindName(devKind(peer.os)), paired ? "Paired" : session ? "Connected" : "Not paired"];
+  const bits = [online ? "Online" : "Offline \u2014 " + lastSeenText(p.device), devKindName(devKind(peer.os)), paired ? "Paired" : session ? "Connected" : "Not paired"];
   if (peer.os) bits.push(peer.os);
   main.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
   main.appendChild(el("div", "meta", "ID " + prettyId(p.device)));
@@ -513,6 +534,7 @@ function renderDevice(body, p) {
     actions.appendChild(btn("Connect", () => startPair(p.device, peer.name, "connect")));
     actions.appendChild(btn("Pair", () => startPair(p.device, peer.name, "pair")));
   }
+  if (!online) for (const b of actions.querySelectorAll("button")) if (b.textContent !== "Unpair" && b.textContent !== "Disconnect") { b.disabled = true; b.title = "This device is offline"; }
   head.appendChild(actions);
   body.appendChild(head);
 
@@ -521,6 +543,7 @@ function renderDevice(body, p) {
   listBox.appendChild(el("div", "empty", "Loading shares\u2026"));
   body.appendChild(listBox);
 
+  if (!online) { clear(listBox); listBox.appendChild(el("div", "empty", "This device is offline. Its shares will appear here when it is back.")); return; }
   fetch(`/api/remote/shares?device=${encodeURIComponent(p.device)}`)
     .then((r) => r.ok ? r.json() : r.text().then((t) => Promise.reject(t.trim())))
     .then((list) => {
@@ -711,7 +734,7 @@ function peerMenu(p) {
   const session = activeSession(p.device_id);
   const items = [{ label: "Open", icon: "monitor", onClick: () => navigate({ kind: "device", device: p.device_id, name: p.name }) }];
   if (paired || session) {
-    items.push({ label: "Push files\u2026", icon: "push", onClick: () => pushTo(p.device_id, p.name) });
+    if (isOnline(p.device_id)) items.push({ label: "Push files\u2026", icon: "push", onClick: () => pushTo(p.device_id, p.name) });
     if (paired) items.push({ label: "Unpair", icon: "x", onClick: () => unpair(p.device_id, paired) });
     else items.push({ label: "Disconnect", icon: "x", onClick: () => sessionAction(session.id, "close") });
   } else {
@@ -728,7 +751,9 @@ function copyText(t) {
 function renderPairedPage() {
   const box = $("paired-body");
   clear(box);
-  const active = sessions.filter((s) => s.status === "pending" || s.status === "accepted" || s.status === "active");
+  // A finished pairing lives in "Paired devices" below; only requests still in
+  // progress and open Connect sessions are listed here.
+  const active = sessions.filter((s) => s.status === "pending" || s.status === "accepted" || (s.status === "active" && s.mode !== "pair"));
   if (active.length) {
     box.appendChild(el("div", "section-title", "Requests & sessions"));
     const stack = el("div", "stack");
@@ -742,9 +767,13 @@ function renderPairedPage() {
       m.appendChild(el("div", "meta", st));
       row.appendChild(m);
       const acts = el("div", "actions");
-      acts.appendChild(btn("Review", () => openSession(s.id)));
-      if (s.incoming && s.status === "pending") acts.appendChild(btn("Accept", () => acceptSession(s.id), "ghost"));
-      if (!s.incoming && (s.status === "accepted" || s.status === "active")) acts.appendChild(btn("Confirm code", () => confirmSession(s.id), "ghost"));
+      if (s.status === "active") {
+        acts.appendChild(btn("Disconnect", () => sessionAction(s.id, "close"), "ghost"));
+      } else {
+        acts.appendChild(btn("Review", () => openSession(s.id)));
+        if (s.incoming && s.status === "pending") acts.appendChild(btn("Accept", () => acceptSession(s.id), "ghost"));
+        if (!s.incoming && s.status === "accepted") acts.appendChild(btn("Confirm code", () => confirmSession(s.id), "ghost"));
+      }
       row.appendChild(acts);
       stack.appendChild(row);
     }
@@ -763,9 +792,15 @@ function renderPairedPage() {
     if (p.push_max_bytes) bits.push(`max ${Math.round(p.push_max_bytes / 1048576)} MB`);
     m.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
     m.appendChild(el("div", "meta", "ID " + prettyId(e.cert_fingerprint || e.device_id)));
+    const fpE = e.cert_fingerprint || e.device_id, onE = isOnline(fpE);
+    const stE = el("div", "status" + (onE ? "" : " off")); stE.appendChild(el("span", "dot" + (onE ? "" : " off")));
+    stE.appendChild(el("span", null, onE ? "Online" : "Offline \u2014 " + lastSeenText(fpE)));
+    m.appendChild(stE);
     row.appendChild(m);
     const acts = el("div", "actions");
-    acts.appendChild(btn("Push files\u2026", () => pushTo(e.cert_fingerprint || e.device_id, e.name), "ghost"));
+    const pushBtn = btn("Push files\u2026", () => pushTo(fpE, e.name), "ghost");
+    if (!onE) { pushBtn.disabled = true; pushBtn.title = "This device is offline"; }
+    acts.appendChild(pushBtn);
     acts.appendChild(btn("Unpair", () => unpair(e.cert_fingerprint || e.device_id, e), "ghost"));
     row.appendChild(acts);
     stack.appendChild(row);
@@ -1295,9 +1330,23 @@ async function decideApproval(id, action) { const r = await fetch(`/api/approval
 // ---------- events ----------
 function renderPeers(list) {
   peers = list;
+  const now = Date.now();
+  for (const p of list) if (p.verified && p.device_id) seenAt[p.device_id] = now;
+  try { localStorage.setItem("lanyard.seen", JSON.stringify(seenAt)); } catch (e) { }
+  checkPresence();
   if (S.view === "devices") renderExplorer();
+  if (S.view === "paired") renderPairedPage();
 }
-function renderTrust(list) { trustList = list; if (S.view === "paired") renderPairedPage(); if (S.view === "devices") renderExSide(); }
+function checkPresence() {
+  for (const e of trustList) {
+    const fp = e.cert_fingerprint || e.device_id;
+    const on = isOnline(fp), before = wasOnline.get(fp);
+    if (peersLoaded && before !== undefined && before !== on) toast((e.name || "A paired device") + (on ? " is online." : " went offline."), on ? "ok" : "info");
+    wasOnline.set(fp, on);
+  }
+  peersLoaded = true;
+}
+function renderTrust(list) { trustList = list; checkPresence(); if (S.view === "paired") renderPairedPage(); if (S.view === "devices") renderExSide(); }
 function renderShares(list) { sharesList = list; if (S.view === "shares") renderSharesPage(); }
 function renderTransfers(list) {
   const doneIds = new Set(list.filter((t) => t.state === "Done").map((t) => t.id));

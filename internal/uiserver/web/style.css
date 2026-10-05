@@ -226,3 +226,8 @@ input::placeholder { color: var(--muted-2); }
 .dest-path { font-family: ui-monospace, Consolas, monospace; font-size: 12px; max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .browse-wrap { display: flex; gap: 8px; flex: 1; min-width: 0; }
 .browse-wrap input { flex: 1; min-width: 0; }
+
+/* ---- online / offline ---- */
+.device-card.offline .dc-art, .device-card.offline .dc-name, .device-card.offline .dc-sub:not(:last-child) { opacity: .5; }
+.dot.sm { width: 7px; height: 7px; margin-left: auto; flex: 0 0 auto; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }

@@ -411,7 +411,18 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	}
 
 	log.Info("shutting down")
-	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// The window is closed (or Quit was chosen): the program must end. Stop the
+	// background work, take the tray icon away, and exit even if a graceful
+	// stop hangs on an open connection or a discovery probe.
+	stop()
+	stopTray()
+	go func() {
+		time.Sleep(4 * time.Second)
+		log.Warn("graceful shutdown timed out; exiting")
+		_ = os.Remove(runPath)
+		os.Exit(0)
+	}()
+	sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	_ = ui.Shutdown(sctx)
 	_ = peerSrv.Shutdown(sctx)

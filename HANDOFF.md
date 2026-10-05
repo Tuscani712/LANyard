@@ -25,6 +25,12 @@ icons/          icon.png (source, 1133x985), icon.ico (16–256 px)
 build.ps1  README.md  dist/lwlib.ps1  dist/itest*.ps1 (twelve scripts)
 ```
 
+### Follow-up fixes (Claude Code)
+- **Stale "Review"/"Confirm code" after pairing:** the Paired page listed finished pairings (status `active`) under "Requests & sessions". Now only pending/accepted requests and open Connect sessions are listed; Confirm code shows only while `accepted`.
+- **Online/offline:** devices show real status. Discovery probes every 5 s (was 15 s) and drops a device after 2 misses (~10 s). The UI keeps paired devices listed when away (greyed, "Offline - last seen ..." from localStorage `lanyard.seen`), disables Push/Mount for them, explains on the device page, and toasts "X is online / went offline" for paired devices.
+- **Exit:** closing the window (X) with "minimize to tray" off now cancels the app context, removes the tray icon and force-exits after 4 s if a graceful stop hangs (`main.go`). Verified by script: window close -> process gone in under 2 s, run.json removed. With "minimize to tray" ON the X hides the window by design; quit from the tray menu.
+- Push files / Push folder use the Windows file dialog (see below); if it still asks for a typed path the running build is old or the dialog errored (it only falls back to typing on non-Windows).
+
 ### This turn: two-machine feedback (Claude Code)
 - **Notifications, not takeovers:** an incoming pair/connect request and an incoming-files approval are now sticky toasts (bottom right, `stickyToast` in `app.js`); clicking one opens the accept screen / approvals modal ("Decide later" closes it). Nothing opens by itself.
 - **Native dialogs:** `POST /api/fs/pick {kind: folder|files, title, start}` shows the real Windows IFileOpenDialog (`internal/uiserver/pick_windows.go`, raw COM, no cgo); other OSes return 501 and the UI falls back to typing. Download uses the saved/default folder (first time it asks via the dialog); "Download to..." always asks; Settings folders have Browse; Push files.../Push folder... use the dialog.

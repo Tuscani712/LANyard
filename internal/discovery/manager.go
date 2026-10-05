@@ -179,7 +179,7 @@ func (m *Manager) AddManual(ctx context.Context, host string, port int) (*Peer, 
 // livenessLoop probes known peers and drops ones that stop answering. It is
 // source-agnostic, so it works even though mDNS re-announces infrequently.
 func (m *Manager) livenessLoop(ctx context.Context) {
-	t := time.NewTicker(15 * time.Second)
+	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
 	for {
 		select {
