@@ -51,7 +51,8 @@ func main() {
 	}
 	var (
 		dataDir   = flag.String("data-dir", "", "data directory (default: per-user config dir)")
-		noBrowser = flag.Bool("no-browser", false, "do not open the UI in a browser")
+		noBrowser = flag.Bool("no-browser", false, "run headless (no window, no browser)")
+		webUI     = flag.Bool("web", false, "use the browser UI instead of the native window (Windows)")
 		noTray    = flag.Bool("no-tray", false, "do not show a system tray icon (Windows)")
 		name      = flag.String("name", "", "override device name (saved)")
 		uiPort    = flag.Int("ui-port", 0, "preferred UI port (default 47810)")
@@ -64,13 +65,13 @@ func main() {
 	}
 	log := newLogger(logDir)
 
-	if err := run(log, *dataDir, *noBrowser, *noTray, *name, *uiPort, *peerPort); err != nil {
+	if err := run(log, *dataDir, *noBrowser, *webUI, *noTray, *name, *uiPort, *peerPort); err != nil {
 		log.Error("fatal", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(log *slog.Logger, dataDir string, noBrowser, noTray bool, name string, uiPortFlag, peerPortFlag int) error {
+func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name string, uiPortFlag, peerPortFlag int) error {
 	if dataDir == "" {
 		d, err := config.DefaultDir()
 		if err != nil {
@@ -332,10 +333,14 @@ func run(log *slog.Logger, dataDir string, noBrowser, noTray bool, name string, 
 		}
 	}()
 
-	// System tray: click to open the window again, right-click to quit. On
-	// platforms without an implementation this is a no-op.
+	// Interface: a native window on Windows by default, the browser UI with
+	// --web, or nothing at all with --no-browser (headless).
+	native := runtime.GOOS == "windows" && !noBrowser && !webUI
+
+	// System tray: click to open the window, right-click to quit. Skipped when
+	// the native window is the interface (it has its own taskbar entry).
 	stopTray := func() {}
-	if !noTray {
+	if !noTray && !native {
 		stopTray = startTray(trayOptions{
 			IconPath: filepath.Join(dataDir, "icon.ico"),
 			OnOpen:   func() { openBrowser(ui.URL()) },
@@ -353,11 +358,25 @@ func run(log *slog.Logger, dataDir string, noBrowser, noTray bool, name string, 
 
 	fmt.Printf("\nLANyard File Transfer %s\n  Device : %s\n  ID     : %s\n  Peers  : port %d\n  UI     : %s\n\n",
 		version, st.DeviceName, identity.Pretty(id.DeviceID), peerSrv.Port(), ui.URL())
-	if !noBrowser {
+
+	switch {
+	case native:
+		err := runNativeUI(nativeUIOptions{
+			Base: fmt.Sprintf("http://127.0.0.1:%d", ui.Port()), Token: ui.Token(),
+			Title: "LANyard File Transfer", OnQuit: stop, Done: ctx.Done(), Log: log,
+		})
+		if err != nil {
+			log.Error("native window unavailable; using the browser UI", "err", err)
+			openBrowser(ui.URL())
+			<-ctx.Done()
+		}
+	case !noBrowser:
 		openBrowser(ui.URL())
+		<-ctx.Done()
+	default:
+		<-ctx.Done()
 	}
 
-	<-ctx.Done()
 	log.Info("shutting down")
 	sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

@@ -45,12 +45,13 @@ func (s *Server) handleShareAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Path       string `json:"path"`
-		Label      string `json:"label"`
-		Lifetime   string `json:"lifetime"`
-		Seconds    int    `json:"seconds"`
-		Visibility string `json:"visibility"`
-		Confirm    bool   `json:"confirm"`
+		Path           string   `json:"path"`
+		Label          string   `json:"label"`
+		Lifetime       string   `json:"lifetime"`
+		Seconds        int      `json:"seconds"`
+		Visibility     string   `json:"visibility"`
+		AllowedDevices []string `json:"allowed_devices"`
+		Confirm        bool     `json:"confirm"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -68,7 +69,7 @@ func (s *Server) handleShareAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sh, err := s.d.Shares.Add(req.Path, shares.AddOptions{
-		Label: req.Label, Visibility: req.Visibility,
+		Label: req.Label, Visibility: req.Visibility, AllowedDevices: req.AllowedDevices,
 		LifetimeType: req.Lifetime, DurationSec: req.Seconds,
 	})
 	if err != nil {

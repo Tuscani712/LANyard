@@ -391,6 +391,7 @@ func (s *Share) closeRoot() {
 type AddOptions struct {
 	Label          string
 	Visibility     string
+	AllowedDevices []string
 	LifetimeType   string
 	DurationSec    int
 	IncludeHidden  bool
@@ -403,12 +404,13 @@ func (m *Manager) Add(p string, opt AddOptions) (*Share, error) {
 		return nil, errors.New("a path is required")
 	}
 	s := &Share{
-		ShareID:    "s_" + randHex(6),
-		Path:       p,
-		Label:      strings.TrimSpace(opt.Label),
-		Visibility: opt.Visibility,
-		CreatedAt:  m.now(),
-		Options:    Options{IncludeHidden: opt.IncludeHidden, FollowSymlinks: opt.FollowSymlinks},
+		ShareID:        "s_" + randHex(6),
+		Path:           p,
+		Label:          strings.TrimSpace(opt.Label),
+		Visibility:     opt.Visibility,
+		AllowedDevices: append([]string(nil), opt.AllowedDevices...),
+		CreatedAt:      m.now(),
+		Options:        Options{IncludeHidden: opt.IncludeHidden, FollowSymlinks: opt.FollowSymlinks},
 	}
 	if s.Visibility == "" {
 		s.Visibility = "paired"
