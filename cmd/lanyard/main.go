@@ -34,9 +34,11 @@ import (
 const version = "0.5.0-rc1"
 
 type runInfo struct {
-	PID   int    `json:"pid"`
-	UIURL string `json:"ui_url"`
-	Base  string `json:"base"`
+	PID     int    `json:"pid"`
+	UIURL   string `json:"ui_url"`
+	Base    string `json:"base"`
+	UI      string `json:"ui,omitempty"`
+	Version string `json:"version,omitempty"`
 }
 
 func main() {
@@ -85,8 +87,27 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	}
 	runPath := filepath.Join(dataDir, "run.json")
 
-	// Single instance per data dir: if one is already serving, just show its UI.
+	// Which interface this launch will use; recorded in run.json so a second
+	// launch can find/focus an existing window instead of opening a browser.
+	nativeMode := runtime.GOOS == "windows" && !noBrowser && !webUI
+	uiMode := "headless"
+	if nativeMode {
+		uiMode = "native"
+	} else if !noBrowser {
+		uiMode = "web"
+	}
+
+	// Single instance per data dir: if one is already serving, surface it
+	// instead of starting a second copy.
 	if ri := readRunInfo(runPath); ri != nil && alreadyRunning(ri) {
+		if ri.Version != "" && ri.Version != version {
+			log.Warn("a different LANyard version is already running; quit it to use this build",
+				"running", ri.Version, "this", version)
+		}
+		if ri.UI == "native" && focusNativeWindow(ri.PID) {
+			log.Info("LANyard is already running; focused its window", "pid", ri.PID)
+			return nil
+		}
 		log.Info("LANyard is already running; opening its window")
 		if !noBrowser {
 			openBrowser(ri.UIURL)
@@ -335,7 +356,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 
 	// Interface: a native window on Windows by default, the browser UI with
 	// --web, or nothing at all with --no-browser (headless).
-	native := runtime.GOOS == "windows" && !noBrowser && !webUI
+	native := nativeMode
 
 	// System tray: click to open the window, right-click to quit. Skipped when
 	// the native window is the interface (it has its own taskbar entry).
@@ -350,7 +371,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	}
 	defer stopTray()
 
-	ri := runInfo{PID: os.Getpid(), UIURL: ui.URL(), Base: fmt.Sprintf("http://127.0.0.1:%d", ui.Port())}
+	ri := runInfo{PID: os.Getpid(), UIURL: ui.URL(), Base: fmt.Sprintf("http://127.0.0.1:%d", ui.Port()), UI: uiMode, Version: version}
 	if b, err := json.Marshal(ri); err == nil {
 		_ = config.WriteFileAtomic(runPath, b, 0o600)
 	}

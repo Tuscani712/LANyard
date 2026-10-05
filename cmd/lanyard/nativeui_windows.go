@@ -4,6 +4,7 @@ package main
 
 import (
 	"errors"
+	"syscall"
 	"unsafe"
 
 	webview2 "github.com/jchv/go-webview2"
@@ -13,15 +14,18 @@ import (
 // user32 is declared in tray_windows.go; here we add the few extra calls and
 // dwmapi entry points needed to turn the WebView2 host into a frameless shell.
 var (
-	dwmapi                    = windows.NewLazySystemDLL("dwmapi.dll")
-	procGetWindowLongPtrW     = user32.NewProc("GetWindowLongPtrW")
-	procSetWindowLongPtrW     = user32.NewProc("SetWindowLongPtrW")
-	procSetWindowPos          = user32.NewProc("SetWindowPos")
-	procReleaseCapture        = user32.NewProc("ReleaseCapture")
-	procSendMessageW          = user32.NewProc("SendMessageW")
-	procShowWindow            = user32.NewProc("ShowWindow")
-	procIsZoomed              = user32.NewProc("IsZoomed")
-	procDwmSetWindowAttribute = dwmapi.NewProc("DwmSetWindowAttribute")
+	dwmapi                       = windows.NewLazySystemDLL("dwmapi.dll")
+	procGetWindowLongPtrW        = user32.NewProc("GetWindowLongPtrW")
+	procSetWindowLongPtrW        = user32.NewProc("SetWindowLongPtrW")
+	procSetWindowPos             = user32.NewProc("SetWindowPos")
+	procReleaseCapture           = user32.NewProc("ReleaseCapture")
+	procSendMessageW             = user32.NewProc("SendMessageW")
+	procShowWindow               = user32.NewProc("ShowWindow")
+	procIsZoomed                 = user32.NewProc("IsZoomed")
+	procEnumWindows              = user32.NewProc("EnumWindows")
+	procGetWindowThreadProcessID = user32.NewProc("GetWindowThreadProcessId")
+	procIsWindowVisible          = user32.NewProc("IsWindowVisible")
+	procDwmSetWindowAttribute    = dwmapi.NewProc("DwmSetWindowAttribute")
 )
 
 const (
@@ -118,6 +122,34 @@ func runNativeUI(opts nativeUIOptions) error {
 func maximized(hwnd windows.HWND) bool {
 	r, _, _ := procIsZoomed.Call(uintptr(hwnd))
 	return r != 0
+}
+
+// focusNativeWindow brings an already-running instance's window to the front.
+// It matches by process id (from run.json) so it never picks up an unrelated
+// window, and restores the window if it was minimized.
+func focusNativeWindow(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	var found uintptr
+	cb := syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+		var wp uint32
+		procGetWindowThreadProcessID.Call(hwnd, uintptr(unsafe.Pointer(&wp)))
+		if int(wp) == pid {
+			if vis, _, _ := procIsWindowVisible.Call(hwnd); vis != 0 {
+				found = hwnd
+				return 0 // stop enumerating
+			}
+		}
+		return 1
+	})
+	procEnumWindows.Call(cb, 0)
+	if found == 0 {
+		return false
+	}
+	procShowWindow.Call(found, swRestore)
+	procSetForegroundWindow.Call(found)
+	return true
 }
 
 // applyShellFrame removes the system caption so the page can draw its own title
