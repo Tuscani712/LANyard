@@ -11,6 +11,8 @@ function el(tag, cls, text) {
   return e;
 }
 
+function clear(node) { node.replaceChildren(); }
+
 function fmtBytes(n) {
   if (!n && n !== 0) return "";
   const u = ["B", "KB", "MB", "GB", "TB"];
@@ -18,22 +20,17 @@ function fmtBytes(n) {
   while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
   return `${v.toFixed(i ? 2 : 0)} ${u[i]}`;
 }
-
-let settings = { speed_unit: "mbs", sound_on_complete: false, theme: "system", default_download_folder: "" };
-
 function fmtSpeed(mbps) {
   if (!mbps || mbps <= 0) return "--";
   if (settings.speed_unit === "mbps") return `${(mbps * 8).toFixed(1)} Mbps`;
   return `${mbps.toFixed(1)} MB/s`;
 }
-
 function fmtETA(sec) {
   if (!sec || sec <= 0) return "--";
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
   const p = (n) => String(n).padStart(2, "0");
   return h ? `${h}:${p(m)}:${p(s)}` : `${p(m)}:${p(s)}`;
 }
-
 function fmtCountdown(iso) {
   if (!iso) return "";
   const ms = new Date(iso).getTime() - Date.now();
@@ -43,400 +40,704 @@ function fmtCountdown(iso) {
   if (m) return `${m}m ${s % 60}s left`;
   return `${s}s left`;
 }
-
-let peers = [];
-let trustList = [];
-let sessions = [];
-let remote = { device: "", name: "", share: "", shareLabel: "", path: "", selected: new Set() };
-
-// --- peers ---
-function pairedEntry(deviceId) {
-  return trustList.find((e) => e.cert_fingerprint === deviceId) || null;
+function fmtWhen(iso) {
+  if (!iso || String(iso).startsWith("0001")) return "";
+  return new Date(iso).toLocaleString();
 }
-
-function activeSession(deviceId) {
-  return sessions.find((s) =>
-    s.peer_fp === deviceId && (s.status === "active" || s.status === "accepted")) || null;
-}
-
-function renderPeers(list) {
-  peers = list;
-  const box = $("peers");
-  box.replaceChildren();
-  $("empty").hidden = list.length > 0;
-  for (const p of list) {
-    const card = el("div", "card");
-    card.appendChild(el("div", "name", p.name || "(unnamed)"));
-    card.appendChild(el("div", "meta", `${p.os || "unknown OS"} · ${(p.addrs || [])[0] || ""}:${p.port}`));
-    const paired = pairedEntry(p.device_id);
-    const session = activeSession(p.device_id);
-    const state = paired ? "Paired" : session ? "Connected" : "Unpaired";
-    const badges = el("div", "badges");
-    badges.appendChild(el("span", "badge " + (p.verified ? "ok" : "warn"), p.verified ? "Verified" : "Verifying…"));
-    badges.appendChild(el("span", "badge " + (paired ? "ok" : session ? "ok" : ""), state));
-    badges.appendChild(el("span", "badge", p.source));
-    card.appendChild(badges);
-    if (p.verified) {
-      card.appendChild(el("div", "fp", (p.device_label ? p.device_label + " · " : "") + "ID " + prettyId(p.device_id)));
-      const actions = el("div", "actions");
-      if (paired) {
-        actions.appendChild(btn("Browse", () => openRemote(p.device_id, p.name)));
-        actions.appendChild(btn("Push", () => pushTo(p.device_id, p.name)));
-        actions.appendChild(btn("Mount as drive", () => mountDevice(p.device_id, p.name), "ghost"));
-        actions.appendChild(btn("Unpair", () => unpair(p.device_id, paired), "ghost"));
-      } else if (session) {
-        actions.appendChild(btn("Browse", () => openRemote(p.device_id, p.name)));
-        actions.appendChild(btn("Push", () => pushTo(p.device_id, p.name)));
-        actions.appendChild(btn("Disconnect", () => sessionAction(session.id, "close"), "ghost"));
-      } else {
-        actions.appendChild(btn("Connect", () => startPair(p.device_id, p.name, "connect")));
-        actions.appendChild(btn("Pair", () => startPair(p.device_id, p.name, "pair")));
-      }
-      card.appendChild(actions);
-    }
-    box.appendChild(card);
-  }
-  renderSessions(sessions);
-}
-
-function btn(label, fn, cls) {
-  const b = el("button", cls || null, label);
-  b.addEventListener("click", fn);
-  return b;
-}
-
 function prettyId(id) {
   if (!id) return "";
-  return id.slice(0, 16).toUpperCase().match(/.{4}/g).join(" ");
+  const m = id.slice(0, 16).toUpperCase().match(/.{4}/g);
+  return m ? m.join(" ") : id.toUpperCase();
 }
 
-// --- paired devices ---
-function renderTrust(list) {
-  trustList = list;
-  const box = $("trust");
-  box.replaceChildren();
-  $("trust-empty").hidden = list.length > 0;
-  for (const e of list) {
-    const row = el("div", "row");
-    const main = el("div", "grow");
-    main.appendChild(el("div", "name", e.name || e.device_id || "device"));
-    const perms = e.permissions || {};
-    const bits = [];
-    bits.push(perms.browse ? "can browse" : "no browse");
-    bits.push(perms.push ? "can push" : "no push");
-    main.appendChild(el("div", "meta", bits.join(" · ")));
-    main.appendChild(el("div", "fp", "ID " + prettyId(e.cert_fingerprint)));
-    row.appendChild(main);
-    row.appendChild(btn("Unpair", () => unpair(e.cert_fingerprint, e), "ghost"));
-    box.appendChild(row);
-  }
-  renderPeers(peers);
-}
+// ---------- icons ----------
+const svg = (inner, size) =>
+  `<svg viewBox="0 0 24 24" width="${size || 20}" height="${size || 20}" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">${inner}</svg>`;
 
-async function unpair(fp, entry) {
-  const name = (entry && entry.name) || prettyId(fp);
-  if (!confirm(`Unpair ${name}? Active connections from this device will be rejected immediately.`)) return;
-  await fetch(`/api/trust/${encodeURIComponent(fp)}/unpair`, { method: "POST" });
-}
-
-async function pushTo(deviceId, name) {
-  const path = prompt(`Path of a file or folder to push to ${name || "the device"}'s Inbox:`);
-  if (!path) return;
-  const r = await fetch("/api/push", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ device: deviceId, paths: [path] }),
-  });
-  if (!r.ok) alert((await r.text()).trim());
-}
-
-// --- sessions & requests ---
-function renderSessions(list) {
-  sessions = list;
-  const box = $("requests");
-  const active = list.filter((s) => s.status === "pending" || s.status === "accepted" || s.status === "active");
-  $("requests-section").hidden = active.length === 0;
-  box.replaceChildren();
-  for (const s of active) {
-    const row = el("div", "row");
-    const main = el("div", "grow");
-    const who = s.peer_name || prettyId(s.peer_fp) || s.peer_device || "device";
-    main.appendChild(el("div", "name", `${s.mode === "pair" ? "Pairing" : "Connect"} · ${who}`));
-    const statusText = s.status === "pending"
-      ? (s.incoming ? "wants to connect — review the code" : "waiting for the other device to accept")
-      : s.status === "accepted" ? (s.incoming ? "accepted — waiting for them to confirm the code" : "they accepted — confirm the code")
-        : "connected";
-    main.appendChild(el("div", "meta", statusText));
-    row.appendChild(main);
-    const actions = el("div", "actions");
-    actions.appendChild(btn("Review", () => openSession(s.id)));
-    if (s.incoming && s.status === "pending") actions.appendChild(btn("Accept", () => acceptSession(s.id, s.mode), "ghost"));
-    if (!s.incoming && (s.status === "accepted" || s.status === "active")) actions.appendChild(btn("Confirm code", () => confirmSession(s.id), "ghost"));
-    row.appendChild(actions);
-    box.appendChild(row);
-  }
-}
-
-// --- pairing / connect modal ---
-let pairView = null;          // current session view or a setup form
-let pairPerms = { browse: true, push: false };
-let pairKeep = false;
-let pairTimer = null;
-
-function startPair(deviceId, name, mode) {
-  pairPerms = { browse: true, push: false };
-  pairKeep = false;
-  if (mode === "pair") {
-    pairView = { setup: true, mode, peer_fp: deviceId, peer_name: name };
-    $("pair").hidden = false;
-    renderPair();
-    return;
-  }
-  sendPairRequest(deviceId, name, mode);
-}
-
-async function sendPairRequest(deviceId, name, mode) {
-  const body = {
-    device: deviceId, mode,
-    permissions: pairPerms, keep_connected: pairKeep,
-  };
-  const r = await fetch("/api/sessions/request", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-  });
-  if (!r.ok) { pairView = { setup: true, mode, peer_fp: deviceId, peer_name: name, error: (await r.text()).trim() }; renderPair(); return; }
-  pairView = await r.json();
-  $("pair").hidden = false;
-  startPairTimer();
-  renderPair();
-}
-
-function openSession(id) {
-  pairView = sessions.find((s) => s.id === id) || null;
-  if (!pairView) return;
-  pairKeep = !!pairView.keep_connected;
-  $("pair").hidden = false;
-  startPairTimer();
-  renderPair();
-}
-
-function startPairTimer() {
-  if (pairTimer) clearInterval(pairTimer);
-  pairTimer = setInterval(async () => {
-    if (!pairView || pairView.setup) return;
-    if (!pairView.incoming && pairView.status !== "active") {
-      try {
-        const r = await fetch(`/api/sessions/${pairView.id}/refresh`, { method: "POST" });
-        if (r.ok) { pairView = await r.json(); renderPair(); return; }
-      } catch (e) { /* fall through to the local list */ }
-    }
-    const fresh = sessions.find((s) => s.id === pairView.id);
-    if (fresh) { pairView = fresh; renderPair(); }
-  }, 1500);
-}
-
-function closePair() {
-  if (pairTimer) { clearInterval(pairTimer); pairTimer = null; }
-  pairView = null;
-  $("pair").hidden = true;
-}
-
-function sasText(sas) {
-  return sas && sas.length === 6 ? `${sas.slice(0, 3)} ${sas.slice(3)}` : (sas || "");
-}
-
-function renderPair() {
-  const body = $("pair-body");
-  body.replaceChildren();
-  if (!pairView) return;
-  const v = pairView;
-  const who = v.peer_name || prettyId(v.peer_fp) || "device";
-  $("pair-title").textContent = (v.mode === "pair" ? "Pair with " : "Connect to ") + who;
-
-  if (v.setup) {
-    body.appendChild(el("p", "muted", "Choose what " + who + " may do on this device. You can change it later by unpairing."));
-    body.appendChild(permToggle("browse", "Let them browse and pull my shares", pairPerms.browse));
-    body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push));
-    if (v.error) body.appendChild(el("div", "msg err", v.error));
-    const start = btn("Start pairing", () => sendPairRequest(v.peer_fp, who, v.mode));
-    body.appendChild(el("div", "actions", "")).appendChild(start);
-    return;
-  }
-
-  const sasBox = el("div", "sasbox");
-  sasBox.appendChild(el("div", "muted", "Does the other device show this code?"));
-  sasBox.appendChild(el("div", "sas", sasText(v.sas)));
-  body.appendChild(sasBox);
-
-  const status = el("p", "muted", "");
-  body.appendChild(status);
-
-  const actions = el("div", "actions");
-
-  if (v.incoming && v.status === "pending") {
-    status.textContent = "A device wants to " + (v.mode === "pair" ? "pair" : "connect") + ". Confirm the code matches before accepting.";
-    if (v.mode === "pair") {
-      body.appendChild(permToggle("browse", "Let them browse and pull my shares", pairPerms.browse));
-      body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push));
-    }
-    actions.appendChild(btn("Accept", () => acceptSession(v.id, v.mode)));
-    actions.appendChild(btn("Reject", () => sessionAction(v.id, "reject"), "ghost"));
-  } else if (!v.incoming && (v.status === "pending" || v.status === "accepted")) {
-    status.textContent = v.status === "pending"
-      ? "Waiting for the other device to accept…"
-      : "They accepted. Check the code, then confirm.";
-    actions.appendChild(btn("The codes match — connect", () => confirmSession(v.id)));
-    actions.appendChild(btn("Cancel", () => sessionAction(v.id, "close"), "ghost"));
-  } else if (v.status === "active") {
-    status.textContent = "Connected. " + (v.incoming ? "You can offer shares for them to download." : "You can browse what they offered.");
-    if (v.incoming && v.mode === "connect") body.appendChild(offersUI(v));
-    actions.appendChild(btn("Close session", () => sessionAction(v.id, "close"), "ghost"));
-  } else {
-    status.textContent = "Session " + v.status + (v.error ? ": " + v.error : "") + ".";
-    actions.appendChild(btn("Close", closePair, "ghost"));
-  }
-  body.appendChild(actions);
-}
-
-function permToggle(key, label, checked) {
-  const wrap = el("label", "toggle");
-  const cb = document.createElement("input");
-  cb.type = "checkbox";
-  cb.checked = !!checked;
-  cb.addEventListener("change", () => { pairPerms[key] = cb.checked; });
-  wrap.appendChild(cb);
-  wrap.appendChild(el("span", null, label));
-  return wrap;
-}
-
-async function acceptSession(id, mode) {
-  const r = await fetch(`/api/sessions/${id}/accept`, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ permissions: pairPerms, keep_connected: pairKeep }),
-  });
-  if (!r.ok) { alert((await r.text()).trim()); return; }
-  pairView = await r.json();
-  renderPair();
-}
-
-async function confirmSession(id) {
-  const r = await fetch(`/api/sessions/${id}/confirm`, { method: "POST" });
-  if (!r.ok) { alert((await r.text()).trim()); return; }
-  pairView = await r.json();
-  renderPair();
-}
-
-async function sessionAction(id, action) {
-  await fetch(`/api/sessions/${id}/${action}`, { method: "POST" });
-  if (action === "close" || action === "reject") closePair();
-}
-
-function offersUI(v) {
-  const box = el("div", "offers");
-  box.appendChild(el("div", "muted", "Offer shares into this session:"));
-  const chosen = new Set(v.offers || []);
-  const list = window.__shares || [];
-  if (!list.length) box.appendChild(el("div", "muted", "You have no shares yet."));
-  for (const s of list) {
-    const wrap = el("label", "toggle");
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = chosen.has(s.share_id);
-    cb.addEventListener("change", () => { cb.checked ? chosen.add(s.share_id) : chosen.delete(s.share_id); });
-    wrap.appendChild(cb);
-    wrap.appendChild(el("span", null, s.label || s.path));
-    box.appendChild(wrap);
-  }
-  box.appendChild(btn("Offer selected", () => offerShares(v.id, [...chosen])));
-  return box;
-}
-
-async function offerShares(id, ids) {
-  const r = await fetch(`/api/sessions/${id}/offers`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ share_ids: ids }),
-  });
-  if (!r.ok) { alert((await r.text()).trim()); return; }
-  pairView = await r.json();
-  renderPair();
-}
-
-// --- local shares ---
-const END_TEXT = {
-  expired: "Expired",
-  completed: "Downloaded (one-time)",
-  stopped: "Stopped",
+const I = {
+  home: svg('<path d="M4 11.2l8-6.4 8 6.4"/><path d="M6.2 10v9.5h11.6V10"/>'),
+  monitor: svg('<rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9 20h6M12 16.5V20"/>'),
+  laptop: svg('<rect x="4" y="5" width="16" height="10.5" rx="1.6"/><path d="M2.5 18.5h19"/>'),
+  phone: svg('<rect x="7" y="3" width="10" height="18" rx="2.2"/><path d="M11 18.2h2"/>'),
+  link: svg('<path d="M10.2 13.8a3.6 3.6 0 0 1 0-5.1l1.3-1.3a3.6 3.6 0 0 1 5.1 5.1l-1 1"/><path d="M13.8 10.2a3.6 3.6 0 0 1 0 5.1l-1.3 1.3a3.6 3.6 0 0 1-5.1-5.1l1-1"/>'),
+  gear: svg('<circle cx="12" cy="12" r="3.1"/><path d="M12 2.6v2.2M12 19.2v2.2M4.4 12H2.2M21.8 12h-2.2M6.3 6.3l1.5 1.5M16.2 16.2l1.5 1.5M17.7 6.3l-1.5 1.5M7.8 16.2l-1.5 1.5"/>'),
+  share: svg('<circle cx="6" cy="12" r="2.4"/><circle cx="17.5" cy="6" r="2.4"/><circle cx="17.5" cy="18" r="2.4"/><path d="M8.1 10.9l7.3-3.8M8.1 13.1l7.3 3.8"/>'),
+  transfers: svg('<path d="M8 4v15M8 4L4.5 7.5M8 4l3.5 3.5M16 20V5M16 20l-3.5-3.5M16 20l3.5-3.5"/>'),
+  search: svg('<circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/>'),
+  refresh: svg('<path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4"/>'),
+  back: svg('<path d="M15 5l-7 7 7 7"/>'),
+  fwd: svg('<path d="M9 5l7 7-7 7"/>'),
+  up: svg('<path d="M12 19V6M6 12l6-6 6 6"/>'),
+  grid: svg('<rect x="3.5" y="3.5" width="7" height="7" rx="1.4"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.4"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.4"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.4"/>'),
+  list: svg('<path d="M4 6h16M4 12h16M4 18h16"/>'),
+  folder: svg('<path d="M3 6.6A1.6 1.6 0 0 1 4.6 5h4.1l1.6 1.9h9.1A1.6 1.6 0 0 1 21 8.5v8.9A1.6 1.6 0 0 1 19.4 19H4.6A1.6 1.6 0 0 1 3 17.4z"/>'),
+  file: svg('<path d="M6 3.5h7l5 5v12H6z"/><path d="M13 3.5V9h5"/>'),
+  download: svg('<path d="M12 3.5v11M8 11l4 4 4-4"/><path d="M4.5 16.5v3.5h15v-3.5"/>'),
+  push: svg('<path d="M12 20.5v-11M8 13l4-4 4 4"/><path d="M4.5 7.5V4h15v3.5"/>'),
+  open: svg('<path d="M14 4h6v6"/><path d="M20 4l-8.5 8.5"/><path d="M18 14v5.5H4.5V6H10"/>'),
+  copy: svg('<rect x="8.5" y="8.5" width="11" height="11" rx="1.8"/><path d="M5.5 15.5h-1V4.5h11v1"/>'),
+  stop: svg('<rect x="6" y="6" width="12" height="12" rx="2"/>'),
+  pause: svg('<path d="M9 5v14M15 5v14"/>'),
+  play: svg('<path d="M7 5l12 7-12 7z"/>'),
+  x: svg('<path d="M6 6l12 12M18 6L6 18"/>'),
+  mount: svg('<rect x="3" y="5" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 8.5h.01M7 16.5h.01"/>'),
+  plus: svg('<path d="M12 5v14M5 12h14"/>'),
+  dot: svg('<circle cx="12" cy="12" r="4" fill="currentColor" stroke="none"/>'),
 };
 
+// colored quick-folder icons
+const QUICK_COLOR = { desktop: "#3b82f6", documents: "#64748b", downloads: "#22c55e", pictures: "#38bdf8", music: "#ef4444", videos: "#a855f7", folder: "#f59e0b" };
+function quickGlyph(kind) {
+  switch (kind) {
+    case "desktop": return '<rect x="8" y="9.6" width="8" height="5" rx=".8" fill="#fff"/><path d="M11 16h2" stroke="#fff" stroke-width="1"/>';
+    case "documents": return '<path d="M9 10h6M9 12.2h6M9 14.4h4" stroke="#fff" stroke-width="1.1"/>';
+    case "downloads": return '<path d="M12 9v5M9.8 12l2.2 2.2L14.2 12" stroke="#fff" stroke-width="1.3" fill="none"/>';
+    case "pictures": return '<circle cx="10" cy="11" r="1.2" fill="#fff"/><path d="M8 15l2.6-2.6L13 15" stroke="#fff" stroke-width="1.2" fill="none"/>';
+    case "music": return '<path d="M14 9.5v4.2a1.5 1.5 0 1 1-1-1.4V10l-4 .9v3.8a1.5 1.5 0 1 1-1-1.4V9.2z" fill="#fff"/>';
+    case "videos": return '<path d="M10.4 10l4 2-4 2z" fill="#fff"/>';
+    default: return "";
+  }
+}
+function quickIcon(kind, size) {
+  const c = QUICK_COLOR[kind] || QUICK_COLOR.folder;
+  return `<svg viewBox="0 0 24 24" width="${size || 20}" height="${size || 20}">
+    <path d="M3 6.6A1.6 1.6 0 0 1 4.6 5h4.1l1.6 1.9h9.1A1.6 1.6 0 0 1 21 8.5v8.9A1.6 1.6 0 0 1 19.4 19H4.6A1.6 1.6 0 0 1 3 17.4z" fill="${c}"/>
+    ${quickGlyph(kind)}</svg>`;
+}
+
+// large device artwork
+function deviceArt(kind) {
+  const defs = `<defs><linearGradient id="lzscr" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#6aa8ff"/><stop offset="1" stop-color="#1d4ed8"/></linearGradient></defs>`;
+  if (kind === "phone") {
+    return `<svg viewBox="0 0 130 120" width="104" height="112">${defs}
+      <rect x="49" y="8" width="32" height="104" rx="7" fill="#2a3242"/>
+      <rect x="52" y="14" width="26" height="90" rx="4" fill="url(#lzscr)"/>
+      <rect x="58" y="10.5" width="14" height="2" rx="1" fill="#1a2029"/></svg>`;
+  }
+  if (kind === "laptop") {
+    return `<svg viewBox="0 0 150 120" width="150" height="120">${defs}
+      <path d="M33 78h84l7 20a4 4 0 0 1-3.8 5H29.8A4 4 0 0 1 26 98z" fill="#39424f"/>
+      <rect x="40" y="24" width="70" height="52" rx="4" fill="#2a3242"/>
+      <rect x="44.5" y="28.5" width="61" height="43" rx="2" fill="url(#lzscr)"/></svg>`;
+  }
+  return `<svg viewBox="0 0 160 120" width="154" height="120">${defs}
+    <rect x="18" y="20" width="100" height="66" rx="6" fill="#2a3242"/>
+    <rect x="24" y="26" width="88" height="54" rx="3" fill="url(#lzscr)"/>
+    <rect x="70" y="86" width="16" height="14" fill="#39424f"/>
+    <rect x="50" y="100" width="56" height="6" rx="3" fill="#39424f"/>
+    <rect x="122" y="52" width="26" height="44" rx="4" fill="#2a3242"/>
+    <rect x="126" y="57" width="18" height="30" rx="2" fill="#3b4b66"/></svg>`;
+}
+
+function devKind(os) {
+  os = (os || "").toLowerCase();
+  if (os.includes("android") || os.includes("ios")) return "phone";
+  if (os.includes("mac") || os.includes("darwin") || os.includes("linux")) return "laptop";
+  return "desktop";
+}
+function devKindName(k) { return k === "phone" ? "Phone" : k === "laptop" ? "Laptop" : "Desktop"; }
+function devIconFor(os, size) { return I[devKind(os)] ? svg(I[devKind(os)].replace(/<\/?svg[^>]*>/g, ""), size) : I.monitor; }
+function smallDeviceIcon(os, size) {
+  const k = devKind(os);
+  const inner = { desktop: '<rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9 20h6M12 16.5V20"/>', laptop: '<rect x="4" y="5" width="16" height="10.5" rx="1.6"/><path d="M2.5 18.5h19"/>', phone: '<rect x="7" y="3" width="10" height="18" rx="2.2"/>' }[k];
+  return svg(inner, size || 20);
+}
+
+// ---------- state ----------
+let settings = { speed_unit: "mbs", sound_on_complete: false, theme: "dark", default_download_folder: "" };
+let peers = [], trustList = [], sessions = [], sharesList = [], transfersList = [], approvalsList = [], mountsList = [];
+const S = {
+  view: "devices",
+  search: "",
+  mode: "grid",
+  ex: {
+    roots: null,
+    hist: [{ kind: "home" }],
+    hi: 0,
+    hover: null,
+  },
+};
+const place = () => S.ex.hist[S.ex.hi];
+function navigate(p) { S.ex.hist.splice(S.ex.hi + 1); S.ex.hist.push(p); S.ex.hi = S.ex.hist.length - 1; renderExplorer(); }
+function placePath(k) { return k === "folder" ? "f:" + (place().path || "") : k === "device" ? "d:" + place().device : k === "remote" ? "r:" + place().device + "/" + place().share + "/" + (place().path || "") : "home"; }
+
+function pairedEntry(fp) { return trustList.find((e) => e.cert_fingerprint === fp || e.device_id === fp) || null; }
+function activeSession(fp) { return sessions.find((s) => s.peer_fp === fp && (s.status === "active" || s.status === "accepted")) || null; }
+
+// ---------- nav ----------
+const NAV = [
+  { id: "devices", label: "View Devices", icon: "monitor" },
+  { id: "paired", label: "View Paired Machines", icon: "link" },
+  { id: "shares", label: "My Shares", icon: "share" },
+  { id: "transfers", label: "Transfers", icon: "transfers" },
+  { id: "settings", label: "Settings", icon: "gear" },
+];
+function renderNav() {
+  const nav = $("nav");
+  clear(nav);
+  for (const n of NAV) {
+    const item = el("div", "nav-item" + (S.view === n.id ? " active" : ""));
+    item.innerHTML = I[n.icon];
+    item.appendChild(el("span", null, n.label));
+    if (n.id === "transfers") {
+      const live = transfersList.filter((t) => t.state !== "Done").length;
+      if (live) item.appendChild(el("span", "nav-badge", String(live)));
+    }
+    item.addEventListener("click", () => showView(n.id));
+    nav.appendChild(item);
+  }
+}
+function showView(id) {
+  S.view = id;
+  for (const n of NAV) $("view-" + n.id).classList.toggle("active", n.id === id);
+  renderNav();
+  if (id === "devices") renderExplorer();
+  if (id === "paired") renderPairedPage();
+  if (id === "shares") renderSharesPage();
+  if (id === "transfers") renderTransfersPage();
+  if (id === "settings") openSettings();
+}
+
+// ---------- toasts ----------
+function toast(msg, kind) {
+  const t = el("div", "toast" + (kind ? " " + kind : ""), msg);
+  $("toasts").appendChild(t);
+  setTimeout(() => { t.style.opacity = "0"; t.style.transition = "opacity .3s"; setTimeout(() => t.remove(), 350); }, 4200);
+}
+
+// ---------- context menu ----------
+function closeMenus() { clear($("ctx-root")); }
+function ctxMenu(items) {
+  const m = el("div", "ctx");
+  m.addEventListener("click", (e) => e.stopPropagation());
+  for (const it of items) {
+    if (!it) continue;
+    if (it.sep) { m.appendChild(el("div", "ctx-sep")); continue; }
+    const row = el("div", "ctx-item");
+    if (it.icon && I[it.icon]) row.innerHTML = I[it.icon];
+    row.appendChild(el("span", null, it.label));
+    if (it.submenu) row.appendChild(el("span", "sub", "\u203a"));
+    row.addEventListener("click", (e) => {
+      e.stopPropagation();
+      if (it.submenu) {
+        const sub = ctxMenu(it.submenu);
+        const r = row.getBoundingClientRect();
+        sub.style.left = Math.min(r.right + 2, window.innerWidth - 220) + "px";
+        sub.style.top = r.top + "px";
+        $("ctx-root").appendChild(sub);
+        return;
+      }
+      closeMenus();
+      if (it.onClick) it.onClick();
+    });
+    m.appendChild(row);
+  }
+  return m;
+}
+function showMenu(x, y, items) {
+  closeMenus();
+  const m = ctxMenu(items);
+  m.style.left = x + "px"; m.style.top = y + "px";
+  $("ctx-root").appendChild(m);
+  const r = m.getBoundingClientRect();
+  if (r.right > window.innerWidth) m.style.left = Math.max(6, window.innerWidth - r.width - 6) + "px";
+  if (r.bottom > window.innerHeight) m.style.top = Math.max(6, window.innerHeight - r.height - 6) + "px";
+}
+document.addEventListener("click", closeMenus);
+document.addEventListener("contextmenu", (e) => { if (!e.target.closest(".file-item,.device-card,.tree-item")) closeMenus(); });
+window.addEventListener("blur", closeMenus);
+
+// ---------- explorer ----------
+function renderExplorer() {
+  renderExSide();
+  renderToolbar();
+  renderBody();
+}
+function renderExSide() {
+  const box = $("ex-side");
+  clear(box);
+  const p = place();
+
+  const home = el("div", "tree-item" + (p.kind === "home" || p.kind === "folder" ? " active" : ""));
+  home.innerHTML = I.home;
+  home.appendChild(el("span", "ti-label", "This PC"));
+  home.addEventListener("click", () => navigate({ kind: "home" }));
+  box.appendChild(home);
+
+  if (S.ex.roots) {
+    for (const q of S.ex.roots.quick) {
+      const it = el("div", "tree-item" + (p.kind === "folder" && p.path === q.path ? " active" : ""));
+      it.innerHTML = quickIcon(q.kind);
+      it.appendChild(el("span", "ti-label", q.name));
+      it.addEventListener("click", () => navigate({ kind: "folder", path: q.path }));
+      it.addEventListener("contextmenu", (e) => { e.preventDefault(); showMenu(e.clientX, e.clientY, folderMenu(q.path, q.name)); });
+      box.appendChild(it);
+    }
+  }
+
+  box.appendChild(el("div", "tree-sep"));
+  box.appendChild(el("div", "tree-label", "Devices"));
+  const list = peers.filter((x) => x.verified);
+  if (!list.length) box.appendChild(el("div", "tree-label", "No devices nearby"));
+  for (const peer of list) {
+    const isDev = (p.kind === "device" || p.kind === "remote") && p.device === peer.device_id;
+    const it = el("div", "tree-item" + (isDev ? " active" : ""));
+    it.innerHTML = smallDeviceIcon(peer.os);
+    it.appendChild(el("span", "ti-label", peer.name || "(unnamed)"));
+    it.addEventListener("click", () => navigate({ kind: "device", device: peer.device_id, name: peer.name }));
+    it.addEventListener("contextmenu", (e) => { e.preventDefault(); showMenu(e.clientX, e.clientY, peerMenu(peer)); });
+    box.appendChild(it);
+  }
+}
+function renderToolbar() {
+  const p = place();
+  $("nav-back").disabled = S.ex.hi <= 0;
+  $("nav-fwd").disabled = S.ex.hi >= S.ex.hist.length - 1;
+  $("nav-up").disabled = !canGoUp(p);
+  const vm = $("view-mode");
+  vm.innerHTML = S.mode === "grid" ? I.list : I.grid;
+  renderCrumbs();
+}
+function canGoUp(p) { return p.kind === "folder" || p.kind === "remote" || p.kind === "device" ? true : false; }
+function renderCrumbs() {
+  const c = $("crumbs");
+  clear(c);
+  const p = place();
+  const crumb = (label, iconHtml, fn) => {
+    const b = el("div", "crumb");
+    if (iconHtml) b.innerHTML = iconHtml;
+    b.appendChild(el("span", null, label));
+    if (fn) b.addEventListener("click", fn);
+    return b;
+  };
+  if (p.kind === "home") {
+    c.appendChild(crumb("This PC", smallDeviceIcon("windows", 16), null));
+  } else if (p.kind === "folder") {
+    c.appendChild(crumb("This PC", smallDeviceIcon("windows", 16), () => navigate({ kind: "home" })));
+    c.appendChild(el("span", "crumb-sep", "/"));
+    const parts = p.path.split(/[\\/]/).filter(Boolean);
+    let acc = "";
+    parts.forEach((part, i) => {
+      acc = acc ? acc + "\\" + part : part;
+      const target = acc;
+      const isLast = i === parts.length - 1;
+      if (i > 0) c.appendChild(el("span", "crumb-sep", "/"));
+      c.appendChild(crumb(part, i === 0 ? I.folder : null, isLast ? null : () => navigate({ kind: "folder", path: target })));
+    });
+  } else if (p.kind === "device") {
+    c.appendChild(crumb("This PC", smallDeviceIcon("windows", 16), () => navigate({ kind: "home" })));
+    c.appendChild(el("span", "crumb-sep", "/"));
+    c.appendChild(crumb(p.name || "Device", smallDeviceIcon(peerOS(p.device), 16), null));
+  } else if (p.kind === "remote") {
+    c.appendChild(crumb("This PC", smallDeviceIcon("windows", 16), () => navigate({ kind: "home" })));
+    c.appendChild(el("span", "crumb-sep", "/"));
+    c.appendChild(crumb(p.name || "Device", smallDeviceIcon(peerOS(p.device), 16), () => navigate({ kind: "device", device: p.device, name: p.name })));
+    c.appendChild(el("span", "crumb-sep", "/"));
+    const parts = (p.path || "").split("/").filter(Boolean);
+    c.appendChild(crumb(p.shareLabel || "share", I.folder, parts.length ? () => navigate({ ...p, path: "" }) : null));
+    let acc = [];
+    parts.forEach((part, i) => {
+      acc.push(part);
+      const target = acc.join("/");
+      const isLast = i === parts.length - 1;
+      c.appendChild(el("span", "crumb-sep", "/"));
+      c.appendChild(crumb(part, null, isLast ? null : () => navigate({ ...p, path: target })));
+    });
+  }
+}
+function peerOS(fp) { const x = peers.find((p) => p.device_id === fp) || trustList.find((e) => e.cert_fingerprint === fp); return x ? (x.os || "") : "windows"; }
+
+function renderBody() {
+  const body = $("ex-body");
+  clear(body);
+  const p = place();
+  if (p.kind === "home") return renderHome(body);
+  if (p.kind === "folder") return renderFolder(body, p);
+  if (p.kind === "device") return renderDevice(body, p);
+  if (p.kind === "remote") return renderRemote(body, p);
+}
+
+// -- home: device cards --
+function renderHome(body) {
+  const list = peers.filter((p) => p.verified && (!S.search || (p.name || "").toLowerCase().includes(S.search) || (p.os || "").toLowerCase().includes(S.search)));
+  if (!list.length) {
+    const wrap = el("div", "empty");
+    wrap.appendChild(el("div", null, peers.some((p) => p.verified) ? "No devices match your search." : "Looking for other devices running LANyard on this network\u2026"));
+    const row = el("div", "form-row"); row.style.justifyContent = "center"; row.style.marginTop = "14px";
+    const inp = el("input"); inp.placeholder = "Add by address (192.168.1.20:47800)"; inp.style.minWidth = "260px";
+    const b = el("button", "btn", "Add");
+    b.addEventListener("click", () => addPeer(inp.value.trim()));
+    inp.addEventListener("keydown", (e) => { if (e.key === "Enter") addPeer(inp.value.trim()); });
+    row.appendChild(inp); row.appendChild(b);
+    wrap.appendChild(row);
+    body.appendChild(wrap);
+    return;
+  }
+  const grid = el("div", "cards");
+  for (const p of list) {
+    const k = devKind(p.os);
+    const card = el("div", "device-card");
+    card.tabIndex = 0;
+    const art = el("div", "dc-art"); art.innerHTML = deviceArt(k); card.appendChild(art);
+    card.appendChild(el("div", "dc-name", devKindName(k)));
+    card.appendChild(el("div", "dc-sub", p.name || "(unnamed)"));
+    const st = el("div", "status");
+    st.appendChild(el("span", "dot"));
+    st.appendChild(el("span", null, "Online"));
+    card.appendChild(st);
+    card.addEventListener("click", () => navigate({ kind: "device", device: p.device_id, name: p.name }));
+    card.addEventListener("contextmenu", (e) => { e.preventDefault(); showMenu(e.clientX, e.clientY, peerMenu(p)); });
+    grid.appendChild(card);
+  }
+  body.appendChild(grid);
+}
+
+// -- local folder --
+function renderFolder(body, p) {
+  const grid = el("div", S.mode === "grid" ? "file-grid" : "file-list");
+  grid.appendChild(el("div", "empty", "Loading\u2026"));
+  body.appendChild(grid);
+  fetch(`/api/fs/list?path=${encodeURIComponent(p.path)}`)
+    .then((r) => r.ok ? r.json() : r.text().then((t) => Promise.reject(t.trim())))
+    .then((data) => {
+      if (place().kind !== "folder" || place().path !== p.path) return; // stale
+      clear(grid);
+      const entries = data.entries || [];
+      if (!entries.length) { grid.appendChild(el("div", "empty", "This folder is empty.")); return; }
+      for (const e of entries) {
+        const item = el("div", "file-item");
+        item.innerHTML = e.is_dir ? quickIcon("folder") : I.file;
+        item.appendChild(el("span", "fi-name", e.name));
+        if (!e.is_dir) item.appendChild(el("span", "fi-size", fmtBytes(e.size)));
+        if (e.is_dir) item.addEventListener("dblclick", () => navigate({ kind: "folder", path: e.path }));
+        item.addEventListener("contextmenu", (ev) => {
+          ev.preventDefault();
+          const items = [];
+          if (e.is_dir) items.push({ label: "Open", icon: "folder", onClick: () => navigate({ kind: "folder", path: e.path }) });
+          items.push({ label: "Share with\u2026", icon: "share", submenu: shareSubmenu(e.path) });
+          items.push({ label: "Share with everyone paired", icon: "share", onClick: () => sharePath(e.path) });
+          items.push({ sep: true });
+          items.push({ label: "Copy path", icon: "copy", onClick: () => copyText(e.path) });
+          showMenu(ev.clientX, ev.clientY, items);
+        });
+        grid.appendChild(item);
+      }
+    })
+    .catch((err) => { grid.replaceChildren(el("div", "empty", String(err))); });
+}
+
+// -- device detail --
+function renderDevice(body, p) {
+  const peer = peers.find((x) => x.device_id === p.device) || { name: p.name, os: "", device_id: p.device };
+  const paired = pairedEntry(p.device);
+  const session = activeSession(p.device);
+  const head = el("div", "row");
+  const main = el("div", "grow");
+  main.appendChild(el("div", "name", peer.name || "(unnamed)"));
+  const bits = [devKindName(devKind(peer.os)), paired ? "Paired" : session ? "Connected" : "Not paired"];
+  if (peer.os) bits.push(peer.os);
+  main.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
+  main.appendChild(el("div", "meta", "ID " + prettyId(p.device)));
+  head.appendChild(main);
+  const actions = el("div", "actions");
+  if (paired) {
+    actions.appendChild(btn("Push files\u2026", () => pushTo(p.device, peer.name)));
+    actions.appendChild(btn("Mount as drive", () => mountDevice(p.device, peer.name), "ghost"));
+    actions.appendChild(btn("Unpair", () => unpair(p.device, paired), "ghost"));
+  } else if (session) {
+    actions.appendChild(btn("Push files\u2026", () => pushTo(p.device, peer.name)));
+    actions.appendChild(btn("Disconnect", () => sessionAction(session.id, "close"), "ghost"));
+  } else {
+    actions.appendChild(btn("Connect", () => startPair(p.device, peer.name, "connect")));
+    actions.appendChild(btn("Pair", () => startPair(p.device, peer.name, "pair")));
+  }
+  head.appendChild(actions);
+  body.appendChild(head);
+
+  body.appendChild(el("div", "section-title", "Shared with you"));
+  const listBox = el("div", "stack");
+  listBox.appendChild(el("div", "empty", "Loading shares\u2026"));
+  body.appendChild(listBox);
+
+  fetch(`/api/remote/shares?device=${encodeURIComponent(p.device)}`)
+    .then((r) => r.ok ? r.json() : r.text().then((t) => Promise.reject(t.trim())))
+    .then((list) => {
+      if (place().kind !== "device" || place().device !== p.device) return;
+      clear(listBox);
+      if (!list.length) { listBox.appendChild(el("div", "empty", "This device is not sharing anything you can see.")); return; }
+      for (const s of list) {
+        const row = el("div", "row");
+        const m = el("div", "grow");
+        m.appendChild(el("div", "name", s.label));
+        const mb = [s.kind];
+        if (s.size) mb.push(fmtBytes(s.size));
+        const life = s.lifetime === "one_time" ? "one-time" : s.lifetime === "timed" && s.expires_at ? fmtCountdown(s.expires_at) : "";
+        if (life) mb.push(life);
+        m.appendChild(el("div", "meta", mb.join(" \u00b7 ")));
+        row.appendChild(m);
+        const acts = el("div", "actions");
+        if (s.kind === "folder") acts.appendChild(btn("Open", () => navigate({ kind: "remote", device: p.device, name: peer.name, share: s.share_id, shareLabel: s.label, path: "" })));
+        acts.appendChild(btn("Download", () => downloadDialog(p.device, peer.name, s.share_id, s.label, [""]), "ghost"));
+        row.appendChild(acts);
+        listBox.appendChild(row);
+      }
+    })
+    .catch((err) => { clear(listBox); listBox.appendChild(el("div", "empty", String(err))); });
+}
+
+// -- remote share browser --
+function renderRemote(body, p) {
+  const bar = el("div", "form-row");
+  const dest = el("input");
+  dest.placeholder = "Download to folder (e.g. C:\\Users\\me\\Downloads)";
+  dest.value = localStorage.getItem("lanyard.dest") || settings.default_download_folder || "";
+  dest.style.flex = "1"; dest.style.minWidth = "260px";
+  const dlHere = btn("Download this folder", () => downloadRemote(p, [p.path], dest.value));
+  bar.appendChild(dest); bar.appendChild(dlHere);
+  body.appendChild(bar);
+
+  const list = el("div", S.mode === "grid" ? "file-grid" : "file-list");
+  list.appendChild(el("div", "empty", "Loading\u2026"));
+  body.appendChild(list);
+
+  const q = `device=${encodeURIComponent(p.device)}&share=${encodeURIComponent(p.share)}&path=${encodeURIComponent(p.path || "")}`;
+  fetch(`/api/remote/tree?${q}`)
+    .then((r) => r.ok ? r.json() : r.text().then((t) => Promise.reject(t.trim())))
+    .then((entries) => {
+      const cur = place();
+      if (cur.kind !== "remote" || cur.device !== p.device || cur.share !== p.share || (cur.path || "") !== (p.path || "")) return;
+      clear(list);
+      if (!entries.length) { list.appendChild(el("div", "empty", "Empty folder.")); return; }
+      for (const e of entries) {
+        const item = el("div", "file-item");
+        item.innerHTML = e.is_dir ? quickIcon("folder") : I.file;
+        item.appendChild(el("span", "fi-name", e.name));
+        if (!e.is_dir) item.appendChild(el("span", "fi-size", fmtBytes(e.size)));
+        if (e.is_dir) item.addEventListener("dblclick", () => navigate({ ...p, path: e.path }));
+        item.addEventListener("contextmenu", (ev) => {
+          ev.preventDefault();
+          const items = [];
+          if (e.is_dir) items.push({ label: "Open", icon: "folder", onClick: () => navigate({ ...p, path: e.path }) });
+          items.push({ label: "Download", icon: "download", onClick: () => downloadRemote(p, [e.path], dest.value) });
+          showMenu(ev.clientX, ev.clientY, items);
+        });
+        list.appendChild(item);
+      }
+    })
+    .catch((err) => { list.replaceChildren(el("div", "empty", String(err))); });
+}
+
+function downloadRemote(p, paths, dest) {
+  if (!dest) { toast("Choose a destination folder first.", "err"); return; }
+  localStorage.setItem("lanyard.dest", dest);
+  fetch("/api/transfers", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ device: p.device, share_id: p.share, share_label: p.shareLabel, peer_name: p.name, paths, dest }),
+  }).then((r) => { if (r.ok) { toast("Download started.", "ok"); showView("transfers"); } else r.text().then((t) => toast(t.trim(), "err")); });
+}
+function downloadDialog(device, name, share, label, paths) {
+  const dlg = el("div", "overlay");
+  const modal = el("div", "modal");
+  const h = el("div", "modal-head"); h.appendChild(el("h2", null, "Download " + (label || "share")));
+  const close = el("button", "btn ghost", "Cancel"); h.appendChild(close);
+  modal.appendChild(h);
+  const inp = el("input"); inp.style.width = "100%";
+  inp.value = localStorage.getItem("lanyard.dest") || settings.default_download_folder || "";
+  inp.placeholder = "Destination folder";
+  modal.appendChild(inp);
+  const go = btn("Download", () => {
+    dlg.remove();
+    downloadRemote({ device, name, share, shareLabel: label }, paths, inp.value.trim());
+  });
+  const acts = el("div", "actions"); acts.style.marginTop = "14px"; acts.appendChild(go); modal.appendChild(acts);
+  close.addEventListener("click", () => dlg.remove());
+  dlg.addEventListener("click", (e) => { if (e.target === dlg) dlg.remove(); });
+  dlg.appendChild(modal); document.body.appendChild(dlg); inp.focus();
+}
+
+// ---------- sharing ----------
+function shareTargets() {
+  const out = [];
+  for (const s of sessions) {
+    if (s.status === "active" || s.status === "accepted") {
+      if (!out.find((x) => x.id === s.peer_fp)) out.push({ id: s.peer_fp, name: s.peer_name || prettyId(s.peer_fp), kind: "connected" });
+    }
+  }
+  for (const e of trustList) {
+    if (!out.find((x) => x.id === (e.cert_fingerprint || e.device_id))) {
+      out.push({ id: e.cert_fingerprint || e.device_id, name: e.name || prettyId(e.cert_fingerprint), kind: "paired" });
+    }
+  }
+  return out;
+}
+function shareSubmenu(path) {
+  const t = shareTargets();
+  if (!t.length) return [{ label: "No connected devices", onClick: () => toast("Pair or connect with a device first.", "err") }];
+  return t.map((x) => ({
+    label: x.name + (x.kind === "connected" ? " (connected)" : ""),
+    icon: devKind(peerOS(x.id)) === "phone" ? "phone" : "monitor",
+    onClick: () => sharePathWith(path, x),
+  }));
+}
+async function sharePathWith(path, target) {
+  const body = { path, label: "", lifetime: "until_stopped", seconds: 0, visibility: "specific", allowed_devices: [target.id] };
+  const r = await fetch("/api/shares", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (r.status === 409) {
+    const j = await r.json();
+    if (!confirm(j.warning)) return;
+    body.confirm = true;
+    const r2 = await fetch("/api/shares", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (r2.ok) toast(`Shared with ${target.name}.`, "ok"); else toast((await r2.text()).trim(), "err");
+    return;
+  }
+  if (r.ok) toast(`Shared with ${target.name}.`, "ok");
+  else toast((await r.text()).trim(), "err");
+}
+async function sharePath(path) {
+  const body = { path, label: "", lifetime: "until_stopped", seconds: 0, confirm: false };
+  let r = await fetch("/api/shares", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (r.status === 409) {
+    const j = await r.json(); if (!confirm(j.warning)) return;
+    body.confirm = true; r = await fetch("/api/shares", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  }
+  if (r.ok) toast("Shared with paired devices.", "ok"); else toast((await r.text()).trim(), "err");
+}
+function folderMenu(path, name) {
+  return [
+    { label: "Open", icon: "folder", onClick: () => navigate({ kind: "folder", path }) },
+    { label: "Share with\u2026", icon: "share", submenu: shareSubmenu(path) },
+    { label: "Share with everyone paired", icon: "share", onClick: () => sharePath(path) },
+    { sep: true },
+    { label: "Copy path", icon: "copy", onClick: () => copyText(path) },
+  ];
+}
+function peerMenu(p) {
+  const paired = pairedEntry(p.device_id);
+  const session = activeSession(p.device_id);
+  const items = [{ label: "Open", icon: "monitor", onClick: () => navigate({ kind: "device", device: p.device_id, name: p.name }) }];
+  if (paired || session) {
+    items.push({ label: "Push files\u2026", icon: "push", onClick: () => pushTo(p.device_id, p.name) });
+    if (paired) items.push({ label: "Unpair", icon: "x", onClick: () => unpair(p.device_id, paired) });
+    else items.push({ label: "Disconnect", icon: "x", onClick: () => sessionAction(session.id, "close") });
+  } else {
+    items.push({ label: "Connect", icon: "link", onClick: () => startPair(p.device_id, p.name, "connect") });
+    items.push({ label: "Pair", icon: "link", onClick: () => startPair(p.device_id, p.name, "pair") });
+  }
+  return items;
+}
+function copyText(t) {
+  navigator.clipboard && navigator.clipboard.writeText(t).then(() => toast("Copied.", "ok")).catch(() => toast(t));
+}
+
+// ---------- paired page ----------
+function renderPairedPage() {
+  const box = $("paired-body");
+  clear(box);
+  const active = sessions.filter((s) => s.status === "pending" || s.status === "accepted" || s.status === "active");
+  if (active.length) {
+    box.appendChild(el("div", "section-title", "Requests & sessions"));
+    const stack = el("div", "stack");
+    for (const s of active) {
+      const row = el("div", "row");
+      const m = el("div", "grow");
+      const who = s.peer_name || prettyId(s.peer_fp) || s.peer_device || "device";
+      m.appendChild(el("div", "name", (s.mode === "pair" ? "Pairing" : "Connect") + " \u00b7 " + who));
+      const st = s.status === "pending" ? (s.incoming ? "wants to connect \u2014 review the code" : "waiting for the other device to accept")
+        : s.status === "accepted" ? (s.incoming ? "accepted \u2014 waiting for them to confirm the code" : "they accepted \u2014 confirm the code") : "connected";
+      m.appendChild(el("div", "meta", st));
+      row.appendChild(m);
+      const acts = el("div", "actions");
+      acts.appendChild(btn("Review", () => openSession(s.id)));
+      if (s.incoming && s.status === "pending") acts.appendChild(btn("Accept", () => acceptSession(s.id), "ghost"));
+      if (!s.incoming && (s.status === "accepted" || s.status === "active")) acts.appendChild(btn("Confirm code", () => confirmSession(s.id), "ghost"));
+      row.appendChild(acts);
+      stack.appendChild(row);
+    }
+    box.appendChild(stack);
+  }
+  box.appendChild(el("div", "section-title", "Paired devices"));
+  const stack = el("div", "stack");
+  if (!trustList.length) stack.appendChild(el("div", "empty", "No paired devices yet. Pair with a device from View Devices."));
+  for (const e of trustList) {
+    const p = e.permissions || {};
+    const row = el("div", "row");
+    const m = el("div", "grow");
+    m.appendChild(el("div", "name", e.name || e.device_id || "device"));
+    const bits = [p.browse ? "can browse" : "no browse", p.push ? "can push" : "no push"];
+    if (p.ask_over) bits.push(`asks over ${Math.round(p.ask_over / 1048576)} MB`);
+    if (p.push_max_bytes) bits.push(`max ${Math.round(p.push_max_bytes / 1048576)} MB`);
+    m.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
+    m.appendChild(el("div", "meta", "ID " + prettyId(e.cert_fingerprint || e.device_id)));
+    row.appendChild(m);
+    const acts = el("div", "actions");
+    acts.appendChild(btn("Push files\u2026", () => pushTo(e.cert_fingerprint || e.device_id, e.name), "ghost"));
+    acts.appendChild(btn("Unpair", () => unpair(e.cert_fingerprint || e.device_id, e), "ghost"));
+    row.appendChild(acts);
+    stack.appendChild(row);
+  }
+  box.appendChild(stack);
+}
+
+// ---------- shares page ----------
+function renderSharesPage() {
+  const box = $("shares-body");
+  clear(box);
+  const stack = el("div", "stack");
+  if (!sharesList.length) stack.appendChild(el("div", "empty", "No shares yet. Share a file or folder from the explorer."));
+  for (const s of sharesList) {
+    const finishing = s.state === "finishing";
+    const row = el("div", "row");
+    const m = el("div", "grow");
+    m.appendChild(el("div", "name", s.label || s.path));
+    const bits = [s.kind || ""];
+    if (s.visibility === "specific") bits.push("specific device");
+    if (finishing) {
+      bits.push("Ended");
+      if (s.active_transfers) bits.push(`finishing ${s.active_transfers}`);
+    } else {
+      bits.push(shareLifetimeText(s));
+      if (s.active_transfers > 0) bits.push(`${s.active_transfers} transferring`);
+    }
+    m.appendChild(el("div", "meta", bits.filter(Boolean).join(" \u00b7 ")));
+    m.appendChild(el("div", "meta", s.path));
+    row.appendChild(m);
+    if (finishing) row.appendChild(el("span", "badge warn", "Finishing"));
+    const stop = el("button", finishing ? "btn danger" : "btn ghost", finishing ? "Stop now" : "Stop");
+    stop.addEventListener("click", () => {
+      if (finishing && (s.active_transfers || 0) > 0 && !confirm("Stop now? Active transfers will be cut off immediately.")) return;
+      fetch(`/api/shares/${encodeURIComponent(s.share_id)}/stop`, { method: "POST" });
+    });
+    row.appendChild(stop);
+    stack.appendChild(row);
+  }
+  box.appendChild(stack);
+}
 function shareLifetimeText(s) {
   const lt = s.lifetime || {};
   switch (lt.type) {
-    case "timed": {
-      const c = fmtCountdown(lt.expires_at);
-      return c === "expired" ? "Expiring…" : "Ends in " + c.replace(" left", "");
-    }
-    case "one_time": return "One-time, ends after one completed download";
+    case "timed": { const c = fmtCountdown(lt.expires_at); return c === "expired" ? "Expiring\u2026" : "Ends in " + c.replace(" left", ""); }
+    case "one_time": return "One-time, ends after one download";
     case "persistent": return "Always";
     default: return "Until stopped";
   }
 }
 
-function renderShares(list) {
-  window.__shares = list;
-  const box = $("shares");
-  box.replaceChildren();
-  $("shares-empty").hidden = list.length > 0;
-  for (const s of list) {
-    const finishing = s.state === "finishing";
-    const row = el("div", "row" + (finishing ? " finishing" : ""));
-    const main = el("div", "grow");
-    main.appendChild(el("div", "name", s.label || s.path));
-    const bits = [s.kind || ""];
-    if (finishing) {
-      bits.push(END_TEXT[s.end_reason] || "Ended");
-      const n = s.active_transfers || 0;
-      bits.push(`finishing ${n} active transfer${n === 1 ? "" : "s"}`);
-      const c = fmtCountdown(s.drain_until);
-      if (c !== "expired") bits.push("force-stops in " + c.replace(" left", ""));
-    } else {
-      bits.push(shareLifetimeText(s));
-      if (s.active_transfers > 0) bits.push(`${s.active_transfers} transferring`);
-    }
-    main.appendChild(el("div", "meta", bits.filter(Boolean).join(" · ")));
-    row.appendChild(main);
-    if (finishing) row.appendChild(el("span", "badge warn", "Finishing"));
-    const stop = el("button", finishing ? "danger" : "ghost", finishing ? "Stop now" : "Stop");
-    stop.addEventListener("click", () => {
-      if (finishing && (s.active_transfers || 0) > 0 &&
-          !confirm("Stop now? The active transfers will be cut off immediately.")) return;
-      shareAction(`/api/shares/${encodeURIComponent(s.share_id)}/stop`);
-    });
-    row.appendChild(stop);
-    box.appendChild(row);
-  }
-}
-
-// --- transfers ---
-const openJobs = new Set(); // job IDs whose file list is expanded (survives re-render)
-const MAX_FILE_ROWS = 200;
-
-function fmtWhen(iso) {
-  if (!iso || iso.startsWith("0001")) return "";
-  return new Date(iso).toLocaleString();
-}
-
-function renderTransfers(list) {
-  const doneIds = new Set(list.filter((t) => t.state === "Done").map((t) => t.id));
-  if (settings.sound_on_complete && window.__lastDone && [...doneIds].some((id) => !window.__lastDone.has(id))) playBeep();
-  window.__lastDone = doneIds;
-  const box = $("transfers");
-  box.replaceChildren();
-  $("transfers-empty").hidden = list.length > 0;
-  $("clear-finished").hidden = !list.some((t) => t.state === "Done");
-  for (const t of list) {
+// ---------- transfers page ----------
+function renderTransfersPage() {
+  const box = $("transfers-body");
+  clear(box);
+  const anyDone = transfersList.some((t) => t.state === "Done");
+  $("clear-finished").hidden = !anyDone;
+  const stack = el("div", "stack");
+  if (!transfersList.length) stack.appendChild(el("div", "empty", "No transfers."));
+  for (const t of transfersList) {
     const row = el("div", "row col");
-    const top = el("div", "row");
     const files = t.files || [];
     const cur = files[t.current_index] || null;
     const name = t.state === "Done" ? (t.share_label || t.share_id) : (cur ? cur.local : (t.share_label || t.share_id));
-    top.appendChild(el("div", "grow name", `${t.direction === "download" ? "↓" : "↑"} ${name}`));
+    const top = el("div", "row");
+    top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
+    top.appendChild(el("div", "grow name", `${t.direction === "download" ? "\u2193" : "\u2191"} ${name}`));
     top.appendChild(el("span", "badge " + stateClass(t.state), t.state));
     row.appendChild(top);
 
@@ -444,357 +745,75 @@ function renderTransfers(list) {
     const bar = el("div", "bar");
     const fill = el("div", "fill" + (t.state === "Waiting for peer" || t.state === "Failed" ? " dim" : ""));
     fill.style.width = pct.toFixed(1) + "%";
-    bar.appendChild(fill);
-    row.appendChild(bar);
+    bar.appendChild(fill); row.appendChild(bar);
 
     const n = t.files_total || files.length;
-    const meta = el("div", "meta");
     const live = t.state === "Transferring" || t.state === "Verifying";
+    const meta = el("div", "meta");
     meta.textContent = `${pct.toFixed(0)}%` +
-      (live ? ` · ${fmtSpeed(t.speed_mbps)} · ETA ${fmtETA(t.eta_seconds)}` : "") +
-      ` · ${fmtBytes(t.done)} / ${fmtBytes(t.total)}` +
-      ` · ${t.files_done} of ${n} file${n === 1 ? "" : "s"}` +
-      (t.state === "Done" && t.finished_at ? ` · finished ${fmtWhen(t.finished_at)}` : "");
+      (live ? ` \u00b7 ${fmtSpeed(t.speed_mbps)} \u00b7 ETA ${fmtETA(t.eta_seconds)}` : "") +
+      ` \u00b7 ${fmtBytes(t.done)} / ${fmtBytes(t.total)}` +
+      ` \u00b7 ${t.files_done} of ${n} file${n === 1 ? "" : "s"}` +
+      (t.state === "Done" && t.finished_at ? ` \u00b7 finished ${fmtWhen(t.finished_at)}` : "");
     row.appendChild(meta);
-
-    if (t.note && t.state !== "Done") row.appendChild(el("div", "note", t.note));
+    if (t.note && t.state !== "Done") row.appendChild(el("div", "meta", t.note));
     if (t.error) row.appendChild(el("div", "msg err", t.error));
-    if (t.peer_name) row.appendChild(el("div", "meta", (t.direction === "download" ? "from " : "to ") + t.peer_name + " · TLS 1.3 mutual auth · SHA-256 verified"));
+    if (t.peer_name) row.appendChild(el("div", "meta", (t.direction === "download" ? "from " : "to ") + t.peer_name));
 
-    if (n > 1 || (n === 1 && files[0].state !== "done")) {
-      const det = document.createElement("details");
-      det.open = openJobs.has(t.id);
-      det.addEventListener("toggle", () => { if (det.open) openJobs.add(t.id); else openJobs.delete(t.id); });
-      det.appendChild(el("summary", null, `Files (${t.files_done}/${n})`));
-      const lst = el("div", "filelist");
-      files.slice(0, MAX_FILE_ROWS).forEach((f) => {
-        const fr = el("div", "frow");
-        fr.appendChild(el("span", "fname", f.local));
-        const fp = f.size ? Math.min(100, (f.done / f.size) * 100) : (f.state === "done" ? 100 : 0);
-        fr.appendChild(el("span", "fstate " + f.state, f.state === "done" ? "done" : f.state === "pending" ? "queued" : `${f.state} ${fp.toFixed(0)}%`));
-        lst.appendChild(fr);
-      });
-      if (n > Math.min(files.length, MAX_FILE_ROWS)) lst.appendChild(el("div", "meta", `…and ${n - Math.min(files.length, MAX_FILE_ROWS)} more not shown`));
-      det.appendChild(lst);
-      row.appendChild(det);
-    }
-
-    const actions = el("div", "actions");
+    const acts = el("div", "actions");
     if (t.state === "Paused" || t.state === "Failed" || t.state === "Waiting for peer") {
-      actions.appendChild(actionBtn("Resume", `/api/transfers/${t.id}/resume`));
+      acts.appendChild(actionBtn("Resume", `/api/transfers/${t.id}/resume`));
     } else if (t.state !== "Done") {
-      actions.appendChild(actionBtn("Pause", `/api/transfers/${t.id}/pause`));
+      acts.appendChild(actionBtn("Pause", `/api/transfers/${t.id}/pause`));
     }
-    const cancel = el("button", "ghost", t.state === "Done" ? "Remove" : "Cancel");
+    const cancel = el("button", "btn ghost", t.state === "Done" ? "Remove" : "Cancel");
     cancel.addEventListener("click", async () => {
       let del = false;
       if (t.state !== "Done") {
         if (!confirm("Cancel this transfer?")) return;
-        del = confirm("Also delete the partial files?\n\nOK = delete them. Cancel = keep them so a later download can pick up where this one stopped.");
+        del = confirm("Also delete the partial files?");
       }
       await fetch(`/api/transfers/${t.id}/cancel${del ? "?delete=1" : ""}`, { method: "POST" });
     });
-    actions.appendChild(cancel);
-    row.appendChild(actions);
-    box.appendChild(row);
+    acts.appendChild(cancel);
+    row.appendChild(acts);
+    stack.appendChild(row);
   }
+  box.appendChild(stack);
 }
-
 function stateClass(state) {
-  switch (state) {
-    case "Done": return "ok";
-    case "Failed": case "Waiting for peer": return "warn";
-    default: return "";
-  }
+  switch (state) { case "Done": return "ok"; case "Failed": case "Waiting for peer": return "warn"; default: return ""; }
 }
+function actionBtn(label, url) { const b = el("button", "btn ghost", label); b.addEventListener("click", () => fetch(url, { method: "POST" })); return b; }
+function btn(label, fn, cls) { const b = el("button", "btn" + (cls ? " " + cls : ""), label); b.addEventListener("click", (e) => { e.stopPropagation(); fn(); }); return b; }
 
-function actionBtn(label, url) {
-  const b = el("button", null, label);
-  b.addEventListener("click", () => fetch(url, { method: "POST" }));
-  return b;
-}
-
-async function shareAction(url) {
-  await fetch(url, { method: "POST" });
-}
-
-// --- remote browser ---
-function openRemote(deviceId, name) {
-  remote = { device: deviceId, name: name || "device", share: "", shareLabel: "", path: "", selected: new Set() };
-  $("remote-title").textContent = "Browse " + (name || "device");
-  $("remote").hidden = false;
-  $("remote-tree-wrap").hidden = true;
-  loadRemoteShares();
-}
-
-function closeRemote() {
-  $("remote").hidden = true;
-}
-
-async function loadRemoteShares() {
-  const box = $("remote-shares");
-  box.replaceChildren();
-  box.appendChild(el("div", "muted", "Loading shares…"));
-  const r = await fetch(`/api/remote/shares?device=${encodeURIComponent(remote.device)}`);
-  if (!r.ok) { box.replaceChildren(el("div", "msg err", (await r.text()).trim())); return; }
-  const list = await r.json();
-  box.replaceChildren();
-  if (!list.length) { box.appendChild(el("div", "muted", "This device is not sharing anything.")); return; }
-  for (const s of list) {
-    const row = el("div", "row");
-    const main = el("div", "grow");
-    main.appendChild(el("div", "name", s.label));
-    const life = s.lifetime === "one_time" ? " · one-time" :
-      s.lifetime === "timed" && s.expires_at ? " · " + fmtCountdown(s.expires_at) : "";
-    main.appendChild(el("div", "meta", `${s.kind}${s.size ? " · " + fmtBytes(s.size) : ""}${life}`));
-    row.appendChild(main);
-    const open = el("button", null, s.kind === "folder" ? "Open" : "Select");
-    open.addEventListener("click", () => {
-      remote.share = s.share_id; remote.shareLabel = s.label;
-      remote.path = ""; remote.selected = new Set();
-      if (s.kind === "folder") loadTree();
-      else { $("remote-tree-wrap").hidden = false; renderTree([]); }
-    });
-    row.appendChild(open);
-    box.appendChild(row);
-  }
-}
-
-async function loadTree() {
-  $("remote-tree-wrap").hidden = false;
-  const tree = $("remote-tree");
-  tree.replaceChildren(el("div", "muted", "Loading…"));
-  const q = `device=${encodeURIComponent(remote.device)}&share=${encodeURIComponent(remote.share)}&path=${encodeURIComponent(remote.path)}`;
-  const r = await fetch(`/api/remote/tree?${q}`);
-  if (!r.ok) { tree.replaceChildren(el("div", "msg err", (await r.text()).trim())); return; }
-  renderTree(await r.json());
-}
-
-function renderTree(entries) {
-  const tree = $("remote-tree");
-  tree.replaceChildren();
-  const crumbs = $("remote-crumbs");
-  crumbs.replaceChildren();
-  const parts = remote.path ? remote.path.split("/") : [];
-  const root = el("a", "crumb", remote.shareLabel || "share");
-  root.href = "#";
-  root.addEventListener("click", (e) => { e.preventDefault(); remote.path = ""; loadTree(); });
-  crumbs.appendChild(root);
-  let acc = [];
-  for (const part of parts) {
-    acc.push(part);
-    crumbs.appendChild(el("span", "crumb-sep", " / "));
-    const a = el("a", "crumb", part);
-    a.href = "#";
-    const target = acc.join("/");
-    a.addEventListener("click", (e) => { e.preventDefault(); remote.path = target; loadTree(); });
-    crumbs.appendChild(a);
-  }
-
-  const dl = el("div", "row");
-  const dlFolder = el("button", null, "Download this folder");
-  dlFolder.addEventListener("click", () => downloadRemote([remote.path]));
-  dl.appendChild(dlFolder);
-  const dlSel = el("button", null, "Download selected");
-  dlSel.addEventListener("click", () => {
-    const paths = [...remote.selected];
-    if (!paths.length) { alert("Nothing selected."); return; }
-    downloadRemote(paths);
-  });
-  dl.appendChild(dlSel);
-  tree.appendChild(dl);
-
-  for (const e of entries) {
-    const row = el("div", "tree-row");
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.checked = remote.selected.has(e.path);
-    cb.addEventListener("change", () => {
-      if (cb.checked) remote.selected.add(e.path); else remote.selected.delete(e.path);
-    });
-    row.appendChild(cb);
-    if (e.is_dir) {
-      const a = el("a", "tree-name dir", "📁 " + e.name);
-      a.href = "#";
-      a.addEventListener("click", (ev) => { ev.preventDefault(); remote.path = e.path; remote.selected = new Set(); loadTree(); });
-      row.appendChild(a);
-    } else {
-      row.appendChild(el("span", "tree-name", "📄 " + e.name));
-      row.appendChild(el("span", "meta", fmtBytes(e.size)));
-    }
-    tree.appendChild(row);
-  }
-  if (!entries.length) tree.appendChild(el("div", "muted", "Empty folder."));
-}
-
-async function downloadRemote(paths) {
-  const dest = $("dest").value.trim();
-  if (!dest) { alert("Enter a destination folder."); return; }
-  localStorage.setItem("lanyard.dest", dest);
-  const msg = $("remote-msg");
-  msg.hidden = false; msg.className = "msg"; msg.textContent = "Starting…";
-  const r = await fetch("/api/transfers", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      device: remote.device, share_id: remote.share, share_label: remote.shareLabel,
-      peer_name: remote.name, paths, dest,
-    }),
-  });
-  if (r.ok) { msg.hidden = true; closeRemote(); }
-  else { msg.className = "msg err"; msg.textContent = (await r.text()).trim(); }
-}
-
-// --- events ---
-function connectEvents() {
-  const es = new EventSource("/api/events");
-  es.addEventListener("peers", (ev) => renderPeers(JSON.parse(ev.data)));
-  es.addEventListener("shares", (ev) => renderShares(JSON.parse(ev.data)));
-  es.addEventListener("transfers", (ev) => renderTransfers(JSON.parse(ev.data)));
-  es.addEventListener("trust", (ev) => renderTrust(JSON.parse(ev.data)));
-  es.addEventListener("approvals", (ev) => renderApprovals(JSON.parse(ev.data)));
-  es.addEventListener("mounts", (ev) => renderMounts(JSON.parse(ev.data)));
-  es.addEventListener("sessions", (ev) => {
-    const list = JSON.parse(ev.data);
-    if (pairView && !pairView.setup) {
-      const fresh = list.find((s) => s.id === pairView.id);
-      if (fresh) { pairView = fresh; renderPair(); }
-    }
-    renderSessions(list);
-  });
-  es.onerror = () => { /* EventSource reconnects on its own */ };
-}
-
-// --- forms ---
-$("add-form").addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const msg = $("add-msg");
-  const addr = $("add-addr").value.trim();
-  if (!addr) return;
-  msg.hidden = false; msg.className = "msg"; msg.textContent = "Connecting…";
-  const r = await fetch("/api/peers/add", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ address: addr }),
-  });
-  if (r.ok) { msg.hidden = true; $("add-addr").value = ""; }
-  else { msg.className = "msg err"; msg.textContent = (await r.text()).trim(); }
-});
-
-$("share-lifetime").addEventListener("change", (ev) => {
-  const custom = ev.target.value === "custom";
-  $("share-custom").hidden = !custom;
-  $("share-custom-unit").hidden = !custom;
-});
-
-let pendingShare = null;
-async function submitShare(confirmFlag) {
-  const lifetime = $("share-lifetime").value;
-  const body = {
-    path: $("share-path").value.trim(),
-    label: $("share-label").value.trim(),
-    lifetime: lifetime === "custom" ? "timed" : lifetime,
-    seconds: lifetime === "custom"
-      ? parseInt($("share-custom").value || "0", 10) * parseInt($("share-custom-unit").value, 10)
-      : parseInt(lifetime, 10) || 0,
-    confirm: !!confirmFlag,
-  };
-  const msg = $("share-msg");
-  msg.hidden = false; msg.className = "msg"; msg.textContent = "Sharing…";
-  const r = await fetch("/api/shares", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (r.ok) {
-    msg.hidden = true;
-    $("share-path").value = ""; $("share-label").value = "";
-    pendingShare = null;
-  } else if (r.status === 409) {
-    const j = await r.json();
-    pendingShare = body;
-    if (confirm(j.warning)) submitShare(true);
-    else msg.hidden = true;
-  } else {
-    msg.className = "msg err"; msg.textContent = (await r.text()).trim();
-  }
-}
-
-$("share-form").addEventListener("submit", (ev) => { ev.preventDefault(); submitShare(false); });
-$("remote-close").addEventListener("click", closeRemote);
-$("remote").addEventListener("click", (ev) => { if (ev.target === $("remote")) closeRemote(); });
-$("pair-close").addEventListener("click", closePair);
-$("pair").addEventListener("click", (ev) => { if (ev.target === $("pair")) closePair(); });
-$("settings-open").addEventListener("click", openSettings);
-$("settings-close").addEventListener("click", () => { $("settings").hidden = true; });
-$("settings").addEventListener("click", (ev) => { if (ev.target === $("settings")) $("settings").hidden = true; });
-
-// --- settings (M6, §11) ---
-function applyTheme(theme) {
-  settings.theme = theme || "system";
-  try { localStorage.setItem("lanyard.theme", settings.theme); } catch (e) { /* ignore */ }
-  if (settings.theme === "system") document.documentElement.removeAttribute("data-theme");
-  else document.documentElement.dataset.theme = settings.theme;
-}
-
-function applySettings(s) {
-  settings = Object.assign(settings, s);
-  applyTheme(settings.theme);
-}
-
-async function loadSettings() {
+// ---------- settings ----------
+async function openSettings() {
+  const box = $("settings-body");
+  clear(box); box.appendChild(el("div", "empty", "Loading\u2026"));
   const r = await fetch("/api/settings");
-  if (r.ok) applySettings(await r.json());
+  if (!r.ok) { clear(box); box.appendChild(el("div", "empty", (await r.text()).trim())); return; }
+  const s = await r.json();
+  applySettings(s);
+  renderSettings(s);
 }
-
-function settingsField(label, input) {
-  const row = el("div", "set-row");
-  row.appendChild(el("label", "set-label", label));
-  row.appendChild(input);
-  return row;
-}
-
-function selectEl(options, value, id) {
-  const sel = document.createElement("select");
-  sel.id = id;
-  for (const [v, t] of options) {
-    const o = document.createElement("option");
-    o.value = v; o.textContent = t;
-    if (v === value) o.selected = true;
-    sel.appendChild(o);
-  }
-  return sel;
-}
-
-function textInput(value, id) {
-  const i = document.createElement("input");
-  i.value = value || ""; i.id = id;
-  return i;
-}
-
 function renderSettings(s) {
   const box = $("settings-body");
-  box.replaceChildren();
+  clear(box);
   const name = textInput(s.device_name, "set-name");
-  const label = textInput(s.device_id_label, "set-label");
-  label.placeholder = s.generated_label || "";
-  const theme = selectEl([["system", "System"], ["light", "Light"], ["dark", "Dark"]], s.theme || "system", "set-theme");
+  const label = textInput(s.device_id_label, "set-label"); label.placeholder = s.generated_label || "";
+  const theme = selectEl([["dark", "Dark"], ["light", "Light"]], s.theme === "light" ? "light" : "dark", "set-theme");
   const speed = selectEl([["mbs", "MB/s"], ["mbps", "Mbps"]], s.speed_unit || "mbs", "set-speed");
-  const sound = document.createElement("input");
-  sound.type = "checkbox"; sound.checked = !!s.sound_on_complete; sound.id = "set-sound";
-  const startup = document.createElement("input");
-  startup.type = "checkbox"; startup.checked = !!s.start_on_login; startup.id = "set-startup";
+  const sound = checkInput(s.sound_on_complete, "set-sound");
+  const startup = checkInput(s.start_on_login, "set-startup");
   const dl = textInput(s.default_download_folder, "set-dl");
-  const inbox = textInput(s.inbox_folder, "set-inbox");
-  inbox.placeholder = "default: <data dir>/Inbox";
-  const bw = document.createElement("input");
-  bw.type = "number"; bw.min = "0"; bw.value = s.bandwidth_limit_mbps || 0; bw.id = "set-bw";
-  const port = document.createElement("input");
-  port.type = "number"; port.value = s.peer_port || 47800; port.id = "set-port";
+  const inbox = textInput(s.inbox_folder, "set-inbox"); inbox.placeholder = "default: <data dir>/Inbox";
+  const bw = numberInput(s.bandwidth_limit_mbps || 0, "set-bw");
+  const port = numberInput(s.peer_port || 47800, "set-port");
 
   box.appendChild(settingsField("Device name", name));
   box.appendChild(settingsField("Device ID (label)", label));
-  box.appendChild(el("p", "muted", "The Device ID is a label; identity stays bound to the certificate fingerprint (" + (s.fingerprint || "").slice(0, 16) + "…). Changing it does not affect pairings."));
+  box.appendChild(el("p", "muted", "The Device ID is a label; identity stays bound to the certificate fingerprint (" + (s.fingerprint || "").slice(0, 16) + "\u2026). Changing it does not affect pairings."));
   box.appendChild(settingsField("Theme", theme));
   box.appendChild(settingsField("Speed unit", speed));
   box.appendChild(settingsField("Sound when a transfer finishes", sound));
@@ -803,83 +822,61 @@ function renderSettings(s) {
   box.appendChild(settingsField("Inbox folder (pushes)", inbox));
   box.appendChild(settingsField("Bandwidth limit (MB/s, 0 = unlimited)", bw));
   box.appendChild(settingsField("Peer port (restart to apply)", port));
-  const msg = el("div", "msg", "");
-  msg.hidden = true; msg.id = "set-msg";
-  box.appendChild(msg);
-  const actions = el("div", "actions");
-  actions.appendChild(btn("Save", saveSettings));
-  const cancelAll = el("button", "ghost", "Cancel all shares");
-  cancelAll.addEventListener("click", cancelAllShares);
-  actions.appendChild(cancelAll);
-  box.appendChild(actions);
+  const msg = el("div", "msg err", ""); msg.hidden = true; msg.id = "set-msg"; box.appendChild(msg);
+  const acts = el("div", "actions");
+  acts.appendChild(btn("Save", saveSettings));
+  acts.appendChild(btn("Cancel all shares", cancelAllShares, "ghost"));
+  box.appendChild(acts);
 
   if (s.paired && s.paired.length) {
-    box.appendChild(el("h3", null, "Paired devices"));
+    box.appendChild(el("div", "section-title", "Paired devices"));
     for (const e of s.paired) {
       const p = e.permissions || {};
       const row = el("div", "row");
-      const main = el("div", "grow");
-      main.appendChild(el("div", "name", e.name || e.device_id || "device"));
-      main.appendChild(el("div", "meta", permissionText(p)));
-      row.appendChild(main);
-      const editor = el("div", "row col");
-      editor.hidden = true;
-      const actions = el("div", "actions");
-      actions.appendChild(btn("Edit", () => { editor.hidden = !editor.hidden; }, "ghost"));
-      actions.appendChild(btn("Unpair", () => unpair(e.cert_fingerprint, e), "ghost"));
-      row.appendChild(actions);
-      box.appendChild(row);
-
+      const m = el("div", "grow");
+      m.appendChild(el("div", "name", e.name || e.device_id || "device"));
+      const bits = [p.browse ? "can browse" : "no browse", p.push ? "can push" : "no push"];
+      if (p.ask_over) bits.push(`asks over ${Math.round(p.ask_over / 1048576)} MB`);
+      if (p.push_max_bytes) bits.push(`max ${Math.round(p.push_max_bytes / 1048576)} MB`);
+      m.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
+      row.appendChild(m);
+      const acts2 = el("div", "actions");
       const browse = checkRow("Let them browse and pull my shares", !!p.browse);
       const push = checkRow("Let them push files to my Inbox", !!p.push);
       const ask = numberRow("Ask for files larger than (MB, 0 = never)", Math.round((p.ask_over || 0) / 1048576));
       const max = numberRow("Maximum push size (MB, 0 = no limit)", Math.round((p.push_max_bytes || 0) / 1048576));
-      editor.appendChild(browse);
-      editor.appendChild(push);
-      editor.appendChild(ask);
-      editor.appendChild(max);
+      const editor = el("div", "row col"); editor.hidden = true;
+      editor.appendChild(browse); editor.appendChild(push); editor.appendChild(ask); editor.appendChild(max);
       editor.appendChild(btn("Save permissions", async () => {
-        const body = {
+        const b = {
           browse: browse.querySelector("input").checked,
           push: push.querySelector("input").checked,
           ask_over: (parseInt(ask.querySelector("input").value || "0", 10) || 0) * 1048576,
           push_max_bytes: (parseInt(max.querySelector("input").value || "0", 10) || 0) * 1048576,
         };
-        const r = await fetch(`/api/trust/${encodeURIComponent(e.cert_fingerprint)}/permissions`, {
-          method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-        });
-        if (!r.ok) { alert((await r.text()).trim()); return; }
+        const rr = await fetch(`/api/trust/${encodeURIComponent(e.cert_fingerprint)}/permissions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+        if (!rr.ok) { toast((await rr.text()).trim(), "err"); return; }
         openSettings();
       }));
+      acts2.appendChild(btn("Edit", () => { editor.hidden = !editor.hidden; }, "ghost"));
+      acts2.appendChild(btn("Unpair", () => unpair(e.cert_fingerprint, e), "ghost"));
+      row.appendChild(acts2);
+      box.appendChild(row);
       box.appendChild(editor);
     }
   }
 }
-
-function permissionText(p) {
-  const bits = [p.browse ? "can browse" : "no browse", p.push ? "can push" : "no push"];
-  if (p.ask_over) bits.push(`asks over ${Math.round(p.ask_over / 1048576)} MB`);
-  if (p.push_max_bytes) bits.push(`max ${Math.round(p.push_max_bytes / 1048576)} MB`);
-  return bits.join(" · ");
+function settingsField(label, input) { const row = el("div", "set-row"); row.appendChild(el("label", "set-label", label)); row.appendChild(input); return row; }
+function selectEl(options, value, id) {
+  const sel = document.createElement("select"); sel.id = id;
+  for (const [v, t] of options) { const o = document.createElement("option"); o.value = v; o.textContent = t; if (v === value) o.selected = true; sel.appendChild(o); }
+  return sel;
 }
-
-function checkRow(label, checked) {
-  const wrap = el("label", "toggle");
-  const cb = document.createElement("input");
-  cb.type = "checkbox"; cb.checked = checked;
-  wrap.appendChild(cb);
-  wrap.appendChild(el("span", null, label));
-  return wrap;
-}
-
-function numberRow(label, value) {
-  const wrap = el("label", "toggle");
-  wrap.appendChild(el("span", null, label));
-  const inp = document.createElement("input");
-  inp.type = "number"; inp.min = "0"; inp.value = value;
-  wrap.appendChild(inp);
-  return wrap;
-}
+function textInput(value, id) { const i = el("input"); i.value = value || ""; i.id = id; return i; }
+function numberInput(value, id) { const i = el("input"); i.type = "number"; i.min = "0"; i.value = value; i.id = id; return i; }
+function checkInput(checked, id) { const i = el("input"); i.type = "checkbox"; i.checked = !!checked; i.id = id; return i; }
+function checkRow(label, checked) { const w = el("label", "toggle"); w.appendChild(checkInput(checked)); w.appendChild(el("span", null, label)); return w; }
+function numberRow(label, value) { const w = el("label", "toggle"); w.appendChild(el("span", null, label)); const i = el("input"); i.type = "number"; i.min = "0"; i.value = value; w.appendChild(i); return w; }
 
 async function saveSettings() {
   const msg = $("set-msg");
@@ -897,156 +894,267 @@ async function saveSettings() {
   };
   const opts = { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   let r = await fetch("/api/settings", opts);
-  if (r.status === 409) {
-    const j = await r.json();
-    if (!confirm(j.warning)) return;
-    body.confirm_device_id = true;
-    r = await fetch("/api/settings", opts);
-  }
+  if (r.status === 409) { const j = await r.json(); if (!confirm(j.warning)) return; body.confirm_device_id = true; r = await fetch("/api/settings", opts); }
   if (!r.ok) { msg.hidden = false; msg.className = "msg err"; msg.textContent = (await r.text()).trim(); return; }
   const s = await r.json();
-  applySettings(s);
-  renderSettings(s);
+  applySettings(s); renderSettings(s); loadSelf();
   msg.hidden = false; msg.className = "msg"; msg.textContent = "Saved.";
-  loadSelf();
 }
-
 async function cancelAllShares() {
-  if (!confirm("Cancel ALL shares and stop every in-progress transfer? This cannot be undone.")) return;
+  if (!confirm("Cancel ALL shares and stop every in-progress transfer?")) return;
   const r = await fetch("/api/cancel-all", { method: "POST" });
-  if (!r.ok) { alert((await r.text()).trim()); return; }
+  if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
   const j = await r.json();
-  alert(`Stopped ${j.shares_stopped} share(s) and cancelled ${j.transfers_cancelled} transfer(s).`);
+  toast(`Stopped ${j.shares_stopped} share(s), cancelled ${j.transfers_cancelled} transfer(s).`, "ok");
 }
 
-async function openSettings() {
-  $("settings").hidden = false;
-  const r = await fetch("/api/settings");
-  if (!r.ok) { $("settings-body").replaceChildren(el("div", "msg err", (await r.text()).trim())); return; }
-  const s = await r.json();
-  applySettings(s);
-  renderSettings(s);
+// ---------- pairing / sessions ----------
+let pairView = null, pairPerms = { browse: true, push: false }, pairKeep = false, pairTimer = null;
+function startPair(deviceId, name, mode) {
+  pairPerms = { browse: true, push: false }; pairKeep = false;
+  if (mode === "pair") { pairView = { setup: true, mode, peer_fp: deviceId, peer_name: name }; $("pair").hidden = false; renderPair(); return; }
+  sendPairRequest(deviceId, name, mode);
 }
-
-function playBeep() {
-  try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
-    if (!Ctx) return;
-    const ctx = new Ctx();
-    const o = ctx.createOscillator(), g = ctx.createGain();
-    o.frequency.value = 880; g.gain.value = 0.08;
-    o.connect(g); g.connect(ctx.destination);
-    o.start(); o.stop(ctx.currentTime + 0.18);
-    setTimeout(() => ctx.close(), 500);
-  } catch (e) { /* audio is best-effort */ }
+async function sendPairRequest(deviceId, name, mode) {
+  const r = await fetch("/api/sessions/request", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: deviceId, mode, permissions: pairPerms, keep_connected: pairKeep }) });
+  if (!r.ok) { pairView = { setup: true, mode, peer_fp: deviceId, peer_name: name, error: (await r.text()).trim() }; $("pair").hidden = false; renderPair(); return; }
+  pairView = await r.json(); $("pair").hidden = false; startPairTimer(); renderPair();
 }
-
-async function loadSelf() {
-  const r = await fetch("/api/self");
-  if (!r.ok) throw new Error("not authorized — open LANyard from its launch link");
-  const s = await r.json();
-  $("self").textContent =
-    `This device: ${s.name} · ${s.os} · port ${s.peer_port} · ID ${s.device_id_pretty.slice(0, 19)}…`;
-}
-
-$("dest").value = (localStorage.getItem("lanyard.dest") || localStorage.getItem("ezshare.dest") || "");
-setInterval(() => { if (!document.hidden) renderShares(window.__shares || []); }, 1000);
-
-loadSettings().then(() => {
-  if (!$("dest").value && settings.default_download_folder) $("dest").value = settings.default_download_folder;
-}).catch(() => {});
-loadSelf().then(connectEvents).catch((e) => { $("self").textContent = e.message; });
-
-$("clear-finished").addEventListener("click", () => fetch("/api/transfers/clear-finished", { method: "POST" }));
-
-// First run on Windows: open the connection help once so the firewall prompt
-// is not a mystery. After that it stays collapsed.
-(async function firstRunHelp() {
-  try {
-    const self = await (await fetch("/api/self")).json();
-    $("fw-windows").hidden = self.os !== "windows";
-    if (self.os === "windows" && !localStorage.getItem("lanyard.fwhelp")) {
-      $("net-help").open = true;
-      localStorage.setItem("lanyard.fwhelp", "1");
+function openSession(id) { pairView = sessions.find((s) => s.id === id) || null; if (!pairView) return; pairKeep = !!pairView.keep_connected; $("pair").hidden = false; startPairTimer(); renderPair(); }
+function startPairTimer() {
+  if (pairTimer) clearInterval(pairTimer);
+  pairTimer = setInterval(async () => {
+    if (!pairView || pairView.setup) return;
+    if (!pairView.incoming && pairView.status !== "active") {
+      try { const r = await fetch(`/api/sessions/${pairView.id}/refresh`, { method: "POST" }); if (r.ok) { pairView = await r.json(); renderPair(); return; } } catch (e) { }
     }
-  } catch (e) { /* the help is optional */ }
-})();
-
-// --- incoming transfers waiting for a decision ---
-// Every string here comes from the other device: textContent only.
-function renderApprovals(list) {
-  const box = $("approvals");
-  const modal = $("approvals-modal");
-  box.hidden = list.length === 0;
-  document.title = (list.length ? `(${list.length}) ` : "") + "LANyard File Transfer";
-  modal.replaceChildren();
-  for (const a of list) {
-    const card = el("div", "row col");
-    const files = a.count === 1 ? "1 file" : `${a.count} files`;
-    card.appendChild(el("div", "name", `${a.peer_name || "A device"} wants to send you ${files} (${fmtBytes(a.total)})`));
-    card.appendChild(el("div", "meta", a.reason === "connect"
-      ? "You are connected to this device for one transfer. The files go to your Inbox."
-      : "This is larger than the limit you set for automatic transfers. The files go to your Inbox."));
-    const lst = el("div", "filelist");
-    (a.files || []).slice(0, 10).forEach((f) => {
-      const fr = el("div", "frow");
-      fr.appendChild(el("span", "fname", f.path));
-      fr.appendChild(el("span", "fstate", fmtBytes(f.size)));
-      lst.appendChild(fr);
-    });
-    if (a.count > 10) lst.appendChild(el("div", "meta", `…and ${a.count - 10} more`));
-    card.appendChild(lst);
-    const actions = el("div", "actions");
-    actions.appendChild(btn("Accept", () => decideApproval(a.id, "accept")));
-    actions.appendChild(btn("Reject", () => decideApproval(a.id, "reject"), "ghost"));
-    card.appendChild(actions);
-    modal.appendChild(card);
+    const fresh = sessions.find((s) => s.id === pairView.id);
+    if (fresh) { pairView = fresh; renderPair(); }
+  }, 1500);
+}
+function closePair() { if (pairTimer) { clearInterval(pairTimer); pairTimer = null; } pairView = null; $("pair").hidden = true; }
+function sasText(sas) { return sas && sas.length === 6 ? `${sas.slice(0, 3)} ${sas.slice(3)}` : (sas || ""); }
+function renderPair() {
+  const body = $("pair-body"); clear(body);
+  if (!pairView) return;
+  const v = pairView;
+  const who = v.peer_name || prettyId(v.peer_fp) || "device";
+  $("pair-title").textContent = (v.mode === "pair" ? "Pair with " : "Connect to ") + who;
+  if (v.setup) {
+    body.appendChild(el("p", "muted", "Choose what " + who + " may do on this device."));
+    body.appendChild(permToggle("browse", "Let them browse and pull my shares", pairPerms.browse));
+    body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push));
+    if (v.error) body.appendChild(el("div", "msg err", v.error));
+    body.appendChild(el("div", "actions", "")).appendChild(btn("Start pairing", () => sendPairRequest(v.peer_fp, who, v.mode)));
+    return;
   }
+  const sasBox = el("div", "sasbox");
+  sasBox.appendChild(el("div", "muted", "Does the other device show this code?"));
+  sasBox.appendChild(el("div", "sas", sasText(v.sas)));
+  body.appendChild(sasBox);
+  const status = el("p", "muted", ""); body.appendChild(status);
+  const actions = el("div", "actions");
+  if (v.incoming && v.status === "pending") {
+    status.textContent = "A device wants to " + (v.mode === "pair" ? "pair" : "connect") + ". Confirm the code matches before accepting.";
+    if (v.mode === "pair") { body.appendChild(permToggle("browse", "Let them browse and pull my shares", pairPerms.browse)); body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push)); }
+    actions.appendChild(btn("Accept", () => acceptSession(v.id)));
+    actions.appendChild(btn("Reject", () => sessionAction(v.id, "reject"), "ghost"));
+  } else if (!v.incoming && (v.status === "pending" || v.status === "accepted")) {
+    status.textContent = v.status === "pending" ? "Waiting for the other device to accept\u2026" : "They accepted. Check the code, then confirm.";
+    actions.appendChild(btn("The codes match \u2014 connect", () => confirmSession(v.id)));
+    actions.appendChild(btn("Cancel", () => sessionAction(v.id, "close"), "ghost"));
+  } else if (v.status === "active") {
+    status.textContent = "Connected.";
+    actions.appendChild(btn("Close session", () => sessionAction(v.id, "close"), "ghost"));
+  } else {
+    status.textContent = "Session " + v.status + (v.error ? ": " + v.error : "") + ".";
+    actions.appendChild(btn("Close", closePair, "ghost"));
+  }
+  body.appendChild(actions);
 }
-
-async function decideApproval(id, action) {
-  const r = await fetch(`/api/approvals/${encodeURIComponent(id)}/${action}`, { method: "POST" });
-  if (!r.ok) alert((await r.text()).trim());
+function permToggle(key, label, checked) {
+  const w = el("label", "toggle");
+  const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = !!checked;
+  cb.addEventListener("change", () => { pairPerms[key] = cb.checked; });
+  w.appendChild(cb); w.appendChild(el("span", null, label)); return w;
 }
+async function acceptSession(id) {
+  const r = await fetch(`/api/sessions/${id}/accept`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ permissions: pairPerms, keep_connected: pairKeep }) });
+  if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
+  pairView = await r.json(); renderPair();
+}
+async function confirmSession(id) {
+  const r = await fetch(`/api/sessions/${id}/confirm`, { method: "POST" });
+  if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
+  pairView = await r.json(); renderPair();
+}
+async function sessionAction(id, action) { await fetch(`/api/sessions/${id}/${action}`, { method: "POST" }); if (action === "close" || action === "reject") closePair(); }
 
-// --- mount a paired device as a drive (read-only) ---
+// ---------- misc actions ----------
+async function addPeer(addr) {
+  if (!addr) return;
+  const r = await fetch("/api/peers/add", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: addr }) });
+  if (r.ok) toast("Added.", "ok"); else toast((await r.text()).trim(), "err");
+}
+async function unpair(fp, entry) {
+  const name = (entry && entry.name) || prettyId(fp);
+  if (!confirm(`Unpair ${name}? Active connections from this device will be rejected immediately.`)) return;
+  await fetch(`/api/trust/${encodeURIComponent(fp)}/unpair`, { method: "POST" });
+}
+async function pushTo(deviceId, name) {
+  const path = prompt(`Path of a file or folder to push to ${name || "the device"}'s Inbox:`);
+  if (!path) return;
+  const r = await fetch("/api/push", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: deviceId, paths: [path] }) });
+  if (!r.ok) toast((await r.text()).trim(), "err"); else toast("Pushed to Inbox.", "ok");
+}
 async function mountDevice(deviceId, name) {
   let drive = "";
   const self = await (await fetch("/api/self")).json();
   if (self.os === "windows") {
-    const ans = prompt(`Drive letter for ${name || "this device"} (for example Z:).\nLeave empty to only get the address and mount it yourself.`, "Z:");
-    if (ans === null) return; // cancelled
-    drive = ans;
+    const ans = prompt(`Drive letter for ${name || "this device"} (e.g. Z:).\nLeave empty to only get the address.`, "Z:");
+    if (ans === null) return; drive = ans;
   }
-  const r = await fetch("/api/mounts", {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ device: deviceId, drive: drive.trim() }),
-  });
-  if (!r.ok) { alert((await r.text()).trim()); return; }
+  const r = await fetch("/api/mounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: deviceId, drive: drive.trim() }) });
+  if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
   const m = await r.json();
-  if (m.mounted) {
-    alert(`${m.name} is mounted read-only as ${m.drive}.`);
-  } else {
-    alert(`${m.name} is served read-only at:\n${m.url}\n\n` +
-      (m.os_error ? `Automatic mounting did not work: ${m.os_error}\n\n` : "") +
-      `To mount it yourself, run:\n${m.hint}`);
-  }
+  toast(m.mounted ? `${m.name} mounted read-only as ${m.drive}.` : `${m.name} served at ${m.url}`, "ok");
+}
+function playBeep() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext; if (!Ctx) return;
+    const ctx = new Ctx(); const o = ctx.createOscillator(), g = ctx.createGain();
+    o.frequency.value = 880; g.gain.value = 0.08; o.connect(g); g.connect(ctx.destination);
+    o.start(); o.stop(ctx.currentTime + 0.18); setTimeout(() => ctx.close(), 500);
+  } catch (e) { }
 }
 
-function renderMounts(list) {
-  $("mounts-section").hidden = list.length === 0;
-  const box = $("mounts");
-  box.replaceChildren();
-  for (const m of list) {
-    const row = el("div", "row");
-    const main = el("div", "grow");
-    main.appendChild(el("div", "name", m.name || "Device"));
-    main.appendChild(el("div", "meta", (m.mounted ? `Drive ${m.drive} · ` : "") + "read-only · " + m.url));
-    if (m.os_error) main.appendChild(el("div", "note", m.os_error));
-    row.appendChild(main);
-    row.appendChild(btn("Unmount", async () => {
-      await fetch(`/api/mounts/${encodeURIComponent(m.id)}/remove`, { method: "POST" });
-    }, "ghost"));
-    box.appendChild(row);
+// ---------- approvals ----------
+function renderApprovals(list) {
+  approvalsList = list;
+  const box = $("approvals"), modal = $("approvals-modal");
+  box.hidden = list.length === 0;
+  document.title = (list.length ? `(${list.length}) ` : "") + "LANyard File Transfer";
+  clear(modal);
+  for (const a of list) {
+    const card = el("div", "row col");
+    const files = a.count === 1 ? "1 file" : `${a.count} files`;
+    card.appendChild(el("div", "name", `${a.peer_name || "A device"} wants to send you ${files} (${fmtBytes(a.total)})`));
+    card.appendChild(el("div", "meta", a.reason === "connect" ? "Connected device for one transfer. Files go to your Inbox." : "Larger than your automatic limit. Files go to your Inbox."));
+    const lst = el("div", "stack");
+    (a.files || []).slice(0, 10).forEach((f) => lst.appendChild(el("div", "meta", f.path + "  \u00b7  " + fmtBytes(f.size))));
+    card.appendChild(lst);
+    const acts = el("div", "actions");
+    acts.appendChild(btn("Accept", () => decideApproval(a.id, "accept")));
+    acts.appendChild(btn("Reject", () => decideApproval(a.id, "reject"), "ghost"));
+    card.appendChild(acts);
+    modal.appendChild(card);
   }
 }
+async function decideApproval(id, action) { const r = await fetch(`/api/approvals/${encodeURIComponent(id)}/${action}`, { method: "POST" }); if (!r.ok) toast((await r.text()).trim(), "err"); }
+
+// ---------- events ----------
+function renderPeers(list) {
+  peers = list;
+  if (S.view === "devices") renderExplorer();
+}
+function renderTrust(list) { trustList = list; if (S.view === "paired") renderPairedPage(); if (S.view === "devices") renderExSide(); }
+function renderShares(list) { sharesList = list; if (S.view === "shares") renderSharesPage(); }
+function renderTransfers(list) {
+  const doneIds = new Set(list.filter((t) => t.state === "Done").map((t) => t.id));
+  if (settings.sound_on_complete && window.__lastDone && [...doneIds].some((id) => !window.__lastDone.has(id))) playBeep();
+  window.__lastDone = doneIds;
+  transfersList = list;
+  renderNav();
+  if (S.view === "transfers") renderTransfersPage();
+}
+function renderSessions(list) {
+  sessions = list;
+  if (pairView && !pairView.setup) { const fresh = list.find((s) => s.id === pairView.id); if (fresh) { pairView = fresh; renderPair(); } }
+  if (S.view === "paired") renderPairedPage();
+  if (S.view === "devices") renderExSide();
+}
+function connectEvents() {
+  const es = new EventSource("/api/events");
+  es.addEventListener("peers", (ev) => renderPeers(JSON.parse(ev.data)));
+  es.addEventListener("shares", (ev) => renderShares(JSON.parse(ev.data)));
+  es.addEventListener("transfers", (ev) => renderTransfers(JSON.parse(ev.data)));
+  es.addEventListener("trust", (ev) => renderTrust(JSON.parse(ev.data)));
+  es.addEventListener("approvals", (ev) => renderApprovals(JSON.parse(ev.data)));
+  es.addEventListener("sessions", (ev) => renderSessions(JSON.parse(ev.data)));
+  es.onerror = () => { };
+}
+
+// ---------- settings helpers ----------
+function applyTheme(theme) {
+  settings.theme = theme || "dark";
+  try { localStorage.setItem("lanyard.theme", settings.theme); } catch (e) { }
+  document.documentElement.dataset.theme = settings.theme === "light" ? "light" : "dark";
+}
+function applySettings(s) { settings = Object.assign(settings, s); applyTheme(settings.theme); }
+
+// ---------- self ----------
+async function loadSelf() {
+  const r = await fetch("/api/self");
+  if (!r.ok) throw new Error("not authorized \u2014 open LANyard from its launch link");
+  const s = await r.json();
+  $("self-name").textContent = s.name || "This device";
+  $("self-name").title = `This device \u00b7 ${s.os} \u00b7 port ${s.peer_port} \u00b7 ID ${s.device_id_pretty}`;
+}
+async function loadRoots() {
+  try { const r = await fetch("/api/fs/roots"); if (r.ok) { S.ex.roots = await r.json(); renderExSide(); } } catch (e) { }
+}
+
+// ---------- window chrome ----------
+function initWindowChrome() {
+  const hasBridge = typeof window.lanWin === "function";
+  $("win-btns").hidden = !hasBridge;
+  if (!hasBridge) return;
+  for (const b of document.querySelectorAll("[data-win]")) {
+    b.addEventListener("click", () => window.lanWin(b.dataset.win));
+  }
+  const drag = $("tb-drag");
+  drag.addEventListener("mousedown", (e) => { if (e.button === 0 && typeof window.lanDrag === "function") window.lanDrag(); });
+  drag.addEventListener("dblclick", () => window.lanWin("max"));
+}
+
+// ---------- init ----------
+$("user-menu").addEventListener("click", () => showView("settings"));
+$("device-search").addEventListener("input", (e) => { S.search = e.target.value.trim().toLowerCase(); if (S.view === "devices" && place().kind === "home") renderBody(); });
+$("refresh-btn").addEventListener("click", () => fetch("/api/peers").then((r) => r.json()).then(renderPeers).catch(() => { }));
+$("refresh-paired").addEventListener("click", () => { renderPairedPage(); });
+$("nav-back").addEventListener("click", () => { if (S.ex.hi > 0) { S.ex.hi--; renderExplorer(); } });
+$("nav-fwd").addEventListener("click", () => { if (S.ex.hi < S.ex.hist.length - 1) { S.ex.hi++; renderExplorer(); } });
+$("nav-up").addEventListener("click", () => {
+  const p = place();
+  if (p.kind === "folder") { const parts = p.path.split(/[\\/]/).filter(Boolean); if (parts.length <= 1) navigate({ kind: "home" }); else navigate({ kind: "folder", path: parts.slice(0, -1).join("\\") }); }
+  else if (p.kind === "remote") { if (p.path) navigate({ ...p, path: p.path.split("/").slice(0, -1).join("/") }); else navigate({ kind: "device", device: p.device, name: p.name }); }
+  else if (p.kind === "device") navigate({ kind: "home" });
+});
+$("view-mode").addEventListener("click", () => { S.mode = S.mode === "grid" ? "list" : "grid"; renderExplorer(); });
+$("share-add").addEventListener("click", () => submitShare(false));
+$("share-path").addEventListener("keydown", (e) => { if (e.key === "Enter") submitShare(false); });
+$("stop-all").addEventListener("click", async () => { if (!confirm("Stop every share now?")) return; await fetch("/api/shares/stop-all", { method: "POST" }); });
+$("clear-finished").addEventListener("click", () => fetch("/api/transfers/clear-finished", { method: "POST" }));
+$("pair-close").addEventListener("click", closePair);
+$("pair").addEventListener("click", (e) => { if (e.target === $("pair")) closePair(); });
+
+async function submitShare(confirmFlag) {
+  const lifetime = $("share-lifetime").value;
+  const body = { path: $("share-path").value.trim(), label: $("share-label").value.trim(), lifetime, seconds: parseInt(lifetime, 10) || 0, confirm: !!confirmFlag };
+  const msg = $("share-msg");
+  if (!body.path) { msg.hidden = false; msg.textContent = "Enter a path to share."; return; }
+  msg.hidden = true;
+  const r = await fetch("/api/shares", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (r.ok) { $("share-path").value = ""; $("share-label").value = ""; toast("Shared.", "ok"); return; }
+  if (r.status === 409) { const j = await r.json(); if (confirm(j.warning)) submitShare(true); return; }
+  msg.hidden = false; msg.textContent = (await r.text()).trim();
+}
+
+setInterval(() => { if (S.view === "shares" && !document.hidden) renderSharesPage(); }, 1000);
+
+applyTheme("dark");
+renderNav();
+initWindowChrome();
+showView("devices");
+loadRoots();
+loadSelf().then(connectEvents).catch((e) => { $("self-name").textContent = e.message; });

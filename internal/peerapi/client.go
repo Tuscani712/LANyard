@@ -250,6 +250,13 @@ func (c *Client) CloseSession(ctx context.Context, host string, port int, expect
 	return c.doJSON(ctx, http.MethodPost, u, nil, expectedFP, nil)
 }
 
+// RevokePairing asks the peer to drop us from its trust store, so an unpair on
+// one device removes the pairing on both.
+func (c *Client) RevokePairing(ctx context.Context, host string, port int, expectedFP string) error {
+	u := c.base(host, port) + "/trust/revoke"
+	return c.doJSON(ctx, http.MethodPost, u, nil, expectedFP, nil)
+}
+
 // --- push client ---
 
 // PushOfferResult is the responder's answer to a push offer.

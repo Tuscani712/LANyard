@@ -362,8 +362,11 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	switch {
 	case native:
 		err := runNativeUI(nativeUIOptions{
-			Base: fmt.Sprintf("http://127.0.0.1:%d", ui.Port()), Token: ui.Token(),
-			Title: "LANyard File Transfer", OnQuit: stop, Done: ctx.Done(), Log: log,
+			URL:      ui.URL(),
+			Title:    "LANyard File Transfer",
+			DataPath: filepath.Join(dataDir, "webview2"),
+			Done:     ctx.Done(),
+			Log:      log,
 		})
 		if err != nil {
 			log.Error("native window unavailable; using the browser UI", "err", err)

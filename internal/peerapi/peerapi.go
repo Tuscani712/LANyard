@@ -100,6 +100,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("GET /api/v1/session/{id}", s.handleSessionStatus)
 	mux.HandleFunc("POST /api/v1/session/{id}/confirm", s.handleSessionConfirm)
 	mux.HandleFunc("POST /api/v1/session/{id}/close", s.handleSessionClose)
+	mux.HandleFunc("POST /api/v1/trust/revoke", s.handleTrustRevoke)
 	mux.HandleFunc("POST /api/v1/push/offer", s.handlePushOffer)
 	mux.HandleFunc("PUT /api/v1/push/{id}/file", s.handlePushFile)
 	mux.HandleFunc("POST /api/v1/push/{id}/complete", s.handlePushComplete)
@@ -147,6 +148,22 @@ func (s *Server) withPeer(next http.Handler) http.Handler {
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.hello())
+}
+
+// handleTrustRevoke lets an authenticated peer remove itself from our trust
+// store. This is how an unpair on the other device becomes mutual: we only ever
+// drop the caller's own entry, so it needs no extra authorization and is safe to
+// repeat.
+func (s *Server) handleTrustRevoke(w http.ResponseWriter, r *http.Request) {
+	fp := PeerID(r.Context())
+	if fp == "" {
+		http.Error(w, "client certificate required", http.StatusUnauthorized)
+		return
+	}
+	if s.trust != nil {
+		s.trust.Unpair(fp)
+	}
+	writeJSON(w, map[string]bool{"ok": true})
 }
 
 func writeJSON(w http.ResponseWriter, v any) {

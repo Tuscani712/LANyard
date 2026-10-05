@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -10,142 +10,157 @@
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<header>
-  <img class="logo" src="/icon.png" alt="">
-  <h1>LANyard</h1>
-  <div id="self" class="self">Starting…</div>
-  <button id="settings-open" class="ghost">Settings</button>
-</header>
-<main>
-  <section>
-    <div class="section-head">
-      <h2>Nearby devices</h2>
-      <form id="add-form" class="add">
-        <input id="add-addr" placeholder="Add by address (192.168.1.20:47800)" autocomplete="off">
-        <button type="submit">Add</button>
-      </form>
-    </div>
-    <div id="add-msg" class="msg" hidden></div>
-    <details id="net-help" class="help">
-      <summary>Not seeing your other device?</summary>
-      <ul>
-        <li>Both devices must run LANyard and be on the same network (same Wi-Fi or cable). Guest networks and some routers isolate devices from each other.</li>
-        <li id="fw-windows"><strong>Windows Firewall:</strong> when Windows asks whether to allow LANyard, choose <em>Private networks</em> and <em>Allow access</em>. If you skipped it: Windows Security &rarr; Firewall &amp; network protection &rarr; Allow an app through firewall &rarr; LANyard &rarr; tick <em>Private</em>.</li>
-        <li>macOS and Linux: allow incoming connections for LANyard if your firewall asks (ports 47800 TCP, 47801 UDP, and UDP 5353 for discovery).</li>
-        <li>On a VPN or another subnet, devices cannot find each other automatically: use <em>Add by address</em> above with the other device's IP address and the port shown at the top of its window.</li>
-      </ul>
-    </details>
-    <div id="peers" class="grid"></div>
-    <p id="empty" class="muted">Looking for other devices running LANyard on this network…</p>
-  </section>
 
-  <section id="mounts-section" hidden>
-    <div class="section-head"><h2>Mounted drives</h2></div>
-    <div id="mounts" class="list"></div>
-  </section>
-
-  <section id="requests-section" hidden>
-    <div class="section-head">
-      <h2>Requests &amp; sessions</h2>
-    </div>
-    <div id="requests" class="list"></div>
-  </section>
-
-  <section>
-    <div class="section-head">
-      <h2>Paired devices</h2>
-    </div>
-    <div id="trust" class="list"></div>
-    <p id="trust-empty" class="muted">No paired devices.</p>
-  </section>
-
-  <section>
-    <div class="section-head">
-      <h2>My shares</h2>
-    </div>
-    <form id="share-form" class="add wrap">
-      <input id="share-path" placeholder="Absolute path to a file or folder" autocomplete="off">
-      <input id="share-label" placeholder="Label (optional)" autocomplete="off" class="narrow">
-      <select id="share-lifetime" aria-label="Lifetime">
-        <option value="until_stopped">Until I stop</option>
-        <option value="persistent">Always</option>
-        <option value="one_time">One-time</option>
-        <option value="300">5 minutes</option>
-        <option value="900">15 minutes</option>
-        <option value="1800">30 minutes</option>
-        <option value="3600">1 hour</option>
-        <option value="7200">2 hours</option>
-        <option value="10800">3 hours</option>
-        <option value="21600">6 hours</option>
-        <option value="43200">12 hours</option>
-        <option value="86400">24 hours</option>
-        <option value="custom">Custom…</option>
-      </select>
-      <input id="share-custom" type="number" min="10" placeholder="10" class="tiny" hidden>
-      <select id="share-custom-unit" hidden aria-label="Unit">
-        <option value="1">seconds</option>
-        <option value="60">minutes</option>
-        <option value="3600">hours</option>
-      </select>
-      <button type="submit">Share</button>
-    </form>
-    <div id="share-msg" class="msg" hidden></div>
-    <div id="shares" class="list"></div>
-    <p id="shares-empty" class="muted">No shares yet.</p>
-  </section>
-
-  <section>
-    <div class="section-head">
-      <h2>Transfers</h2>
-      <button id="clear-finished" class="ghost" hidden>Clear finished</button>
-    </div>
-    <div id="transfers" class="list"></div>
-    <p id="transfers-empty" class="muted">No transfers.</p>
-  </section>
-</main>
-
-<div id="remote" class="overlay" hidden>
-  <div class="modal">
-    <div class="section-head">
-      <h2 id="remote-title">Browse</h2>
-      <button id="remote-close" class="ghost">Close</button>
-    </div>
-    <div id="remote-shares" class="list"></div>
-    <div id="remote-tree-wrap" hidden>
-      <div class="crumbs" id="remote-crumbs"></div>
-      <div id="remote-tree" class="tree"></div>
-      <div class="dl">
-        <input id="dest" placeholder="Download to folder (e.g. C:\Users\me\Downloads)" autocomplete="off">
-        <button id="download-btn">Download</button>
-      </div>
-      <div id="remote-msg" class="msg" hidden></div>
-    </div>
+<div id="titlebar">
+  <div class="brand">
+    <img src="/icon.png" alt="">
+    <div><b>LANyard</b> <span>File Transfer</span></div>
+  </div>
+  <div id="tb-drag"></div>
+  <div class="win-btns" id="win-btns" hidden>
+    <button class="wbtn" data-win="min" title="Minimize" aria-label="Minimize">
+      <svg width="12" height="12" viewBox="0 0 12 12"><path d="M1 6h10" stroke="currentColor" stroke-width="1.2"/></svg>
+    </button>
+    <button class="wbtn" data-win="max" title="Maximize" aria-label="Maximize">
+      <svg width="12" height="12" viewBox="0 0 12 12"><rect x="1.5" y="1.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1.2"/></svg>
+    </button>
+    <button class="wbtn close" data-win="close" title="Close" aria-label="Close">
+      <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.2"/></svg>
+    </button>
   </div>
 </div>
 
+<div id="app">
+  <aside id="sidebar">
+    <div class="user">
+      <div class="avatar" id="self-avatar">
+        <svg viewBox="0 0 24 24" fill="none"><circle cx="12" cy="8.2" r="3.6" fill="currentColor"/><path d="M4.6 20c.7-3.9 3.8-6.1 7.4-6.1s6.7 2.2 7.4 6.1" fill="currentColor"/></svg>
+      </div>
+      <div class="u-text">
+        <div class="u-welcome">Welcome,</div>
+        <div class="u-name" id="self-name">This device</div>
+      </div>
+      <button class="chev" id="user-menu" title="Your device">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
+    </div>
+    <nav id="nav"></nav>
+  </aside>
+
+  <main id="content">
+    <!-- View Devices -->
+    <section class="view active" id="view-devices">
+      <header class="view-head">
+        <div>
+          <h1>View Devices</h1>
+          <p class="sub">Select a device to browse its files and transfer data.</p>
+        </div>
+        <div class="head-tools">
+          <label class="search">
+            <svg viewBox="0 0 24 24" fill="none"><circle cx="11" cy="11" r="6.5" stroke="currentColor" stroke-width="1.8"/><path d="M16 16l4.5 4.5" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            <input id="device-search" placeholder="Search devices..." autocomplete="off">
+          </label>
+          <button class="icon-btn" id="refresh-btn" title="Refresh">
+            <svg viewBox="0 0 24 24" fill="none"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+      </header>
+      <div class="explorer">
+        <div class="ex-side" id="ex-side"></div>
+        <div class="ex-main">
+          <div class="ex-toolbar">
+            <button class="icon-btn" id="nav-back" title="Back">
+              <svg viewBox="0 0 24 24" fill="none"><path d="M15 5l-7 7 7 7" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button class="icon-btn" id="nav-fwd" title="Forward">
+              <svg viewBox="0 0 24 24" fill="none"><path d="M9 5l7 7-7 7" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <button class="icon-btn" id="nav-up" title="Up">
+              <svg viewBox="0 0 24 24" fill="none"><path d="M12 19V6M6 12l6-6 6 6" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div class="crumbs" id="crumbs"></div>
+            <div class="spacer"></div>
+            <button class="icon-btn" id="view-mode" title="Change view">
+              <svg viewBox="0 0 24 24" fill="none"><rect x="3.5" y="3.5" width="7" height="7" rx="1.4" stroke="currentColor" stroke-width="1.6"/><rect x="13.5" y="3.5" width="7" height="7" rx="1.4" stroke="currentColor" stroke-width="1.6"/><rect x="3.5" y="13.5" width="7" height="7" rx="1.4" stroke="currentColor" stroke-width="1.6"/><rect x="13.5" y="13.5" width="7" height="7" rx="1.4" stroke="currentColor" stroke-width="1.6"/></svg>
+            </button>
+          </div>
+          <div class="ex-body" id="ex-body"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- View Paired Machines -->
+    <section class="view" id="view-paired">
+      <header class="view-head">
+        <div><h1>View Paired Machines</h1><p class="sub">Devices you have paired with, and the permissions they hold.</p></div>
+        <div class="head-tools"><button class="icon-btn" id="refresh-paired" title="Refresh">
+          <svg viewBox="0 0 24 24" fill="none"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button></div>
+      </header>
+      <div id="paired-body" style="overflow:auto"></div>
+    </section>
+
+    <!-- My Shares -->
+    <section class="view" id="view-shares">
+      <header class="view-head">
+        <div><h1>My Shares</h1><p class="sub">Files and folders this device is sharing.</p></div>
+        <div class="head-tools"><button class="btn ghost" id="stop-all">Stop all</button></div>
+      </header>
+      <div class="form-row">
+        <input id="share-path" placeholder="Absolute path to a file or folder" autocomplete="off" style="flex:1;min-width:280px">
+        <input id="share-label" placeholder="Label (optional)" autocomplete="off" style="width:170px">
+        <select id="share-lifetime" aria-label="Lifetime">
+          <option value="until_stopped">Until I stop</option>
+          <option value="persistent">Always</option>
+          <option value="one_time">One-time</option>
+          <option value="300">5 minutes</option>
+          <option value="900">15 minutes</option>
+          <option value="1800">30 minutes</option>
+          <option value="3600">1 hour</option>
+          <option value="7200">2 hours</option>
+          <option value="21600">6 hours</option>
+          <option value="86400">24 hours</option>
+        </select>
+        <button class="btn" id="share-add">Share</button>
+      </div>
+      <div id="share-msg" class="msg err" hidden></div>
+      <div id="shares-body" style="overflow:auto"></div>
+    </section>
+
+    <!-- Transfers -->
+    <section class="view" id="view-transfers">
+      <header class="view-head">
+        <div><h1>Transfers</h1><p class="sub">Active and finished file transfers.</p></div>
+        <div class="head-tools"><button class="btn ghost" id="clear-finished" hidden>Clear finished</button></div>
+      </header>
+      <div id="transfers-body" style="overflow:auto"></div>
+    </section>
+
+    <!-- Settings -->
+    <section class="view" id="view-settings">
+      <header class="view-head">
+        <div><h1>Settings</h1><p class="sub">Device identity, folders, bandwidth and paired permissions.</p></div>
+      </header>
+      <div id="settings-body" style="overflow:auto"></div>
+    </section>
+  </main>
+</div>
+
+<!-- Pairing / connect -->
 <div id="pair" class="overlay" hidden>
   <div class="modal">
-    <div class="section-head">
-      <h2 id="pair-title">Connect</h2>
-      <button id="pair-close" class="ghost">Close</button>
-    </div>
+    <div class="modal-head"><h2 id="pair-title">Connect</h2><button class="btn ghost" id="pair-close">Close</button></div>
     <div id="pair-body"></div>
   </div>
 </div>
 
-<div id="settings" class="overlay" hidden>
-  <div class="modal">
-    <div class="section-head">
-      <h2>Settings</h2>
-      <button id="settings-close" class="ghost">Close</button>
-    </div>
-    <div id="settings-body"></div>
-  </div>
-</div>
-
+<!-- Incoming transfers awaiting a decision -->
 <div id="approvals" class="overlay" hidden>
   <div class="modal" id="approvals-modal"></div>
 </div>
+
+<div id="ctx-root"></div>
+<div id="toasts"></div>
 
 <script src="/app.js"></script>
 </body>

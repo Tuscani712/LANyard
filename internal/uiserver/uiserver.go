@@ -149,6 +149,8 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("GET /api/self", s.auth(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.d.Self()) }))
 	mux.HandleFunc("GET /api/peers", s.auth(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.d.Peers()) }))
 	mux.HandleFunc("POST /api/peers/add", s.auth(s.handleAdd))
+	mux.HandleFunc("GET /api/fs/roots", s.auth(s.handleFSRoots))
+	mux.HandleFunc("GET /api/fs/list", s.auth(s.handleFSList))
 	mux.HandleFunc("GET /api/shares", s.auth(s.handleShares))
 	mux.HandleFunc("POST /api/shares", s.auth(s.handleShareAdd))
 	mux.HandleFunc("POST /api/shares/stop-all", s.auth(s.handleShareStopAll))

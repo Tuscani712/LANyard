@@ -1,10 +1,12 @@
 package uiserver
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"lanyard/internal/peerapi"
 	"lanyard/internal/trust"
@@ -27,8 +29,35 @@ func (s *Server) handleUnpair(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not paired", http.StatusNotFound)
 		return
 	}
-	s.dropMountsOf(r.PathValue("fp")) // unpairing revokes the drive
+	fp := r.PathValue("fp")
+	s.dropMountsOf(fp) // unpairing revokes the drive
+	s.revokeRemote(fp) // make the unpair mutual, best effort
 	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// revokeRemote tells the paired device to drop us too, so an unpair on one side
+// is reflected on the other. Best effort: the peer may be offline, and the local
+// unpair already succeeded.
+func (s *Server) revokeRemote(fp string) {
+	if s.d.Client == nil || s.d.Peers == nil {
+		return
+	}
+	var host string
+	var port int
+	for _, p := range s.d.Peers() {
+		if p.DeviceID == fp && len(p.Addrs) > 0 {
+			host, port = p.Addrs[0], p.Port
+			break
+		}
+	}
+	if host == "" || port == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := s.d.Client.RevokePairing(ctx, host, port, fp); err != nil && s.d.Log != nil {
+		s.d.Log.Debug("unpair: could not notify the peer", "fp", fp, "err", err)
+	}
 }
 
 // handleTrustPermissions edits a paired device's permissions without re-pairing.
