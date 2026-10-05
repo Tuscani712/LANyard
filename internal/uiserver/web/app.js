@@ -973,6 +973,24 @@ function renderSettings(s) {
   box.appendChild(settingsField("Inbox folder (pushes)", withBrowse(inbox, "Choose the Inbox folder")));
   box.appendChild(settingsField("Bandwidth limit (MB/s, 0 = unlimited)", bw));
   box.appendChild(settingsField("Peer port (restart to apply)", port));
+
+  // Updates (release channel is not live yet; nothing is fetched until a URL
+  // is set below).
+  const updURL = textInput(s.update_url, "set-update-url");
+  updURL.placeholder = "https://\u2026/latest.json (not live yet)";
+  updURL.style.minWidth = "360px";
+  const auto = checkInput(s.auto_update, "set-auto-update");
+  const updResult = el("div", "msg", ""); updResult.hidden = true; updResult.id = "set-upd-result";
+  box.appendChild(el("div", "section-title", "Updates"));
+  box.appendChild(settingsField("Running version", el("div", "muted", s.version || "")));
+  box.appendChild(settingsField("Update manifest URL (https)", updURL));
+  box.appendChild(settingsField("Download new versions automatically", auto));
+  const updActions = el("div", "actions");
+  updActions.appendChild(btn("Check for updates", checkForUpdates, "ghost"));
+  updActions.appendChild(btn("Download update", downloadUpdate, "ghost"));
+  box.appendChild(updActions);
+  box.appendChild(updResult);
+
   const msg = el("div", "msg err", ""); msg.hidden = true; msg.id = "set-msg"; box.appendChild(msg);
   const acts = el("div", "actions");
   acts.appendChild(btn("Save", saveSettings));
@@ -1035,6 +1053,28 @@ function checkInput(checked, id) { const i = el("input"); i.type = "checkbox"; i
 function checkRow(label, checked) { const w = el("label", "toggle"); w.appendChild(checkInput(checked)); w.appendChild(el("span", null, label)); return w; }
 function numberRow(label, value) { const w = el("label", "toggle"); w.appendChild(el("span", null, label)); const i = el("input"); i.type = "number"; i.min = "0"; i.value = value; w.appendChild(i); return w; }
 
+async function checkForUpdates() {
+  const res = $("set-upd-result");
+  if (!res) return;
+  res.hidden = false; res.className = "msg"; res.textContent = "Checking\u2026";
+  const r = await fetch("/api/update/check", { method: "POST" });
+  if (!r.ok) { res.className = "msg err"; res.textContent = (await r.text()).trim(); return; }
+  const j = await r.json();
+  if (!j.configured) { res.className = "msg"; res.textContent = "Automatic updates are not enabled yet (no release channel is set)."; return; }
+  if (j.available) { res.className = "msg"; res.textContent = "Update available: " + j.current + " \u2192 " + j.latest + (j.notes ? " \u2014 " + j.notes : ""); }
+  else { res.className = "msg"; res.textContent = "Up to date (" + j.current + ")."; }
+}
+async function downloadUpdate() {
+  const res = $("set-upd-result");
+  if (!res) return;
+  res.hidden = false; res.className = "msg"; res.textContent = "Downloading and verifying\u2026";
+  const r = await fetch("/api/update/download", { method: "POST" });
+  if (!r.ok) { res.className = "msg err"; res.textContent = (await r.text()).trim(); return; }
+  const j = await r.json();
+  res.className = "msg";
+  res.textContent = j.staged ? ("Downloaded and verified " + j.version + ". It will be applied on the next start.") : "Already up to date.";
+}
+
 async function saveSettings() {
   const msg = $("set-msg");
   const body = {
@@ -1049,6 +1089,8 @@ async function saveSettings() {
     inbox_folder: $("set-inbox").value.trim(),
     bandwidth_limit_mbps: parseInt($("set-bw").value || "0", 10) || 0,
     peer_port: parseInt($("set-port").value || "47800", 10) || 47800,
+    ...($("set-update-url") ? { update_url: $("set-update-url").value.trim() } : {}),
+    ...($("set-auto-update") ? { auto_update: $("set-auto-update").checked } : {}),
   };
   const opts = { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   let r = await fetch("/api/settings", opts);

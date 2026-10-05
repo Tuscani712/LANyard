@@ -29,6 +29,7 @@ import (
 	"lanyard/internal/transfer"
 	"lanyard/internal/trust"
 	"lanyard/internal/uiserver"
+	"lanyard/internal/update"
 )
 
 const version = "1.0.0"
@@ -48,7 +49,7 @@ func main() {
 		if runCLI(os.Args[1], os.Args[2:]) {
 			return
 		}
-		fmt.Fprintf(os.Stderr, "unknown command %q\nusage: lanyard [server flags] | peers | share add <path> | get <peer> <share> [dest] | settings get|set | mount add|list|remove | shares cancel-all\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unknown command %q\nusage: lanyard [server flags] | peers | share add <path> | get <peer> <share> [dest] | settings get|set | mount add|list|remove | shares cancel-all | update status|check|download\n", os.Args[1])
 		os.Exit(2)
 	}
 	var (
@@ -80,6 +81,17 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 			return err
 		}
 		dataDir = d
+	}
+
+	// Apply a previously downloaded, verified update. On Windows a running
+	// binary may be renamed but not overwritten, so this happens before
+	// anything else touches the executable.
+	if exe, err := os.Executable(); err == nil {
+		if applied, err := update.ApplyStaged(exe, update.EmbeddedPublicKey); err != nil {
+			log.Warn("could not apply a staged update", "err", err)
+		} else if applied {
+			log.Info("applied a staged update; the new build is used from the next start")
+		}
 	}
 	cfg, err := config.Open(dataDir)
 	if err != nil {
@@ -126,6 +138,46 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// If auto-update is on and a channel is configured, check shortly after
+	// start and stage a newer, verified build for the next launch. Inert until
+	// a manifest URL is set (the release channel is not live yet).
+	if st.AutoUpdate {
+		go func() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(20 * time.Second):
+			}
+			u := st.UpdateURL
+			if u == "" {
+				u = update.DefaultManifestURL
+			}
+			if u == "" {
+				return
+			}
+			exe, err := os.Executable()
+			if err != nil {
+				return
+			}
+			cctx, cancel := context.WithTimeout(context.Background(), 16*time.Minute)
+			defer cancel()
+			res, err := update.Check(cctx, nil, u, version)
+			if err != nil {
+				log.Warn("update check failed", "err", err)
+				return
+			}
+			if !res.Available {
+				return
+			}
+			log.Info("update available", "current", version, "latest", res.Latest)
+			if _, err := update.StageDownload(cctx, nil, exe, res, update.EmbeddedPublicKey); err != nil {
+				log.Warn("could not stage the update", "err", err)
+				return
+			}
+			log.Info("update downloaded and verified; it will apply on the next start", "version", res.Latest)
+		}()
+	}
 
 	client := peerapi.NewClient(id)
 

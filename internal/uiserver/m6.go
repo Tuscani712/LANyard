@@ -26,6 +26,9 @@ type settingsView struct {
 	StartOnLogin          bool          `json:"start_on_login"`
 	MinimizeToTray        bool          `json:"minimize_to_tray"`
 	TraySupported         bool          `json:"tray_supported"`
+	Version               string        `json:"version"`
+	UpdateURL             string        `json:"update_url"`
+	AutoUpdate            bool          `json:"auto_update"`
 	Paired                []trust.Entry `json:"paired"`
 }
 
@@ -46,6 +49,9 @@ func (s *Server) settingsView() settingsView {
 	v.StartOnLogin = st.StartOnLogin
 	v.MinimizeToTray = st.MinimizeToTray
 	v.TraySupported = runtime.GOOS == "windows"
+	v.Version = self.Version
+	v.UpdateURL = st.UpdateURL
+	v.AutoUpdate = st.AutoUpdate
 	if s.d.StartOnLoginEnabled != nil {
 		v.StartOnLogin = s.d.StartOnLoginEnabled() // what the OS really has
 	}
@@ -80,6 +86,8 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		BandwidthLimitMBps    *int    `json:"bandwidth_limit_mbps"`
 		StartOnLogin          *bool   `json:"start_on_login"`
 		MinimizeToTray        *bool   `json:"minimize_to_tray"`
+		UpdateURL             *string `json:"update_url"`
+		AutoUpdate            *bool   `json:"auto_update"`
 		ConfirmDeviceID       bool    `json:"confirm_device_id"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16384)).Decode(&req); err != nil {
@@ -153,6 +161,17 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 
 	if req.MinimizeToTray != nil {
 		next.MinimizeToTray = *req.MinimizeToTray
+	}
+	if req.UpdateURL != nil {
+		u := strings.TrimSpace(*req.UpdateURL)
+		if u != "" && !strings.HasPrefix(u, "https://") {
+			http.Error(w, "the update URL must use https", http.StatusBadRequest)
+			return
+		}
+		next.UpdateURL = cleanText(u, 512)
+	}
+	if req.AutoUpdate != nil {
+		next.AutoUpdate = *req.AutoUpdate
 	}
 	if req.StartOnLogin != nil {
 		if s.d.SetStartOnLogin == nil {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"lanyard/internal/config"
+	"lanyard/internal/update"
 )
 
 // runCLI handles `lanyard <command> ...` by talking to the running instance's
@@ -20,7 +21,7 @@ import (
 // known command, so the caller can start the server instead.
 func runCLI(cmd string, args []string) bool {
 	switch cmd {
-	case "peers", "share", "shares", "get", "settings", "pair", "cancel-all", "mount":
+	case "peers", "share", "shares", "get", "settings", "pair", "cancel-all", "mount", "update":
 	default:
 		return false
 	}
@@ -74,10 +75,70 @@ func cliMain(cmd string, args []string) error {
 		return c.settings(rest)
 	case "mount":
 		return c.mount(rest)
+	case "update":
+		return c.update(rest)
 	case "pair":
 		return fmt.Errorf("CLI pairing is not supported yet; use the web UI to pair")
 	}
 	return nil
+}
+
+// update implements `lanyard update [status|check|download]`.
+func (c *cliClient) update(args []string) error {
+	action := "status"
+	if len(args) > 0 {
+		action = strings.TrimSpace(args[0])
+	}
+	switch action {
+	case "status":
+		var v struct {
+			Current    string `json:"current"`
+			Platform   string `json:"platform"`
+			Configured bool   `json:"configured"`
+			AutoUpdate bool   `json:"auto_update"`
+		}
+		if err := c.do("GET", "/api/update", nil, &v); err != nil {
+			return err
+		}
+		fmt.Printf("version:      %s\nplatform:     %s\nchannel set:  %v\nauto-update:  %v\n", v.Current, v.Platform, v.Configured, v.AutoUpdate)
+		if !v.Configured {
+			fmt.Println("note: the release channel is not configured yet")
+		}
+		return nil
+	case "check":
+		var r update.Result
+		if err := c.do("POST", "/api/update/check", nil, &r); err != nil {
+			return err
+		}
+		if !r.Configured {
+			fmt.Printf("version %s; the release channel is not configured yet\n", r.Current)
+			return nil
+		}
+		if r.Available {
+			fmt.Printf("update available: %s -> %s\n", r.Current, r.Latest)
+			if r.Notes != "" {
+				fmt.Println(r.Notes)
+			}
+		} else {
+			fmt.Printf("up to date (%s)\n", r.Current)
+		}
+		return nil
+	case "download":
+		var out struct {
+			Staged  bool   `json:"staged"`
+			Version string `json:"version"`
+		}
+		if err := c.do("POST", "/api/update/download", nil, &out); err != nil {
+			return err
+		}
+		if out.Staged {
+			fmt.Printf("downloaded and verified %s; it will be applied on the next start\n", out.Version)
+		} else {
+			fmt.Println("already up to date; nothing downloaded")
+		}
+		return nil
+	}
+	return fmt.Errorf("usage: lanyard update [status|check|download]")
 }
 
 func takeDataDir(args []string) (string, []string) {

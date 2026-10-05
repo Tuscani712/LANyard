@@ -40,6 +40,12 @@ type Settings struct {
 	// MinimizeToTray hides the window to the system tray when it is minimized
 	// or closed, instead of using the taskbar / quitting (Windows).
 	MinimizeToTray bool `json:"minimize_to_tray,omitempty"`
+	// UpdateURL is the https manifest for the release channel. Empty means
+	// updates are disabled (the channel is not live yet).
+	UpdateURL string `json:"update_url,omitempty"`
+	// AutoUpdate checks the release channel shortly after start and stages a
+	// newer, verified build for the next launch.
+	AutoUpdate bool `json:"auto_update,omitempty"`
 
 	// Shares is owned by internal/shares and kept as an opaque blob so this
 	// package never needs to import it (avoids an import cycle).
