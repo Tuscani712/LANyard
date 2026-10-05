@@ -16,7 +16,8 @@ lanyard.log
 *.p12
 .env
 .env.*
-Inbox/
+# Repo-root Inbox (runtime). Anchored so it cannot match internal/inbox.
+/Inbox/
 
 # Local tooling / editor / OS
 .claude/
