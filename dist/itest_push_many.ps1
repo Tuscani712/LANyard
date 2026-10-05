@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 # Pushes a folder of 3,000 small files plus one 2 MB file from Bob to Alice's
 # Inbox through the real programs, then checks every file arrived intact
 # (count, sizes, and SHA-256 of a sample and of the big file) and how long it took.
-$exe = Join-Path $PSScriptRoot "lanyard.exe"
+$exe = Join-Path $PSScriptRoot "lanyard-console.exe"
 $stamp = [Guid]::NewGuid().ToString("N").Substring(0, 8)
 $base = Join-Path $env:TEMP "lanyard-pushmany-$stamp"
 $dirA = Join-Path $base "A"; $dirB = Join-Path $base "B"

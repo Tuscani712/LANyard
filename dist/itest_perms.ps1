@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 # Paired-device permission editing: changing "browse" for a paired peer takes
 # effect on the next request, without re-pairing.
-$exe = Join-Path $PSScriptRoot "lanyard.exe"
+$exe = Join-Path $PSScriptRoot "lanyard-console.exe"
 $stamp = [Guid]::NewGuid().ToString("N").Substring(0, 8)
 $base = Join-Path $env:TEMP "lanyard-perm-$stamp"
 $dirA = Join-Path $base "A"; $dirB = Join-Path $base "B"

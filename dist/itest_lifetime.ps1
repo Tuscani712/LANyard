@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 # (and a second download is refused with a reason), and a timed share vanishes
 # after its time, with the receiver told it expired. The two instances pair
 # first (real trust; no bypass).
-$exe = Join-Path $PSScriptRoot "lanyard.exe"
+$exe = Join-Path $PSScriptRoot "lanyard-console.exe"
 $stamp = [Guid]::NewGuid().ToString("N").Substring(0, 8)
 $base = Join-Path $env:TEMP "lanyard-lt-$stamp"
 $dirA = Join-Path $base "A"; $dirB = Join-Path $base "B"

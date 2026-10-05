@@ -127,8 +127,9 @@ Release builds are produced by `build.ps1 -Release` into `dist\release\`:
 | `lanyard-mac-arm64`, `lanyard-mac-x64` | macOS (Apple silicon / Intel) |
 | `lanyard-linux-x64`, `lanyard-linux-arm64` | Linux |
 
-Building needs Go (the version in `go.mod`, currently 1.27) and nothing else: `.\build.ps1` makes the development build `dist\lanyard.exe`;
-the program is a single static executable with the window embedded. Windows builds carry the app icon (in Explorer,
+Building needs Go (the version in `go.mod`, currently 1.27) and nothing else: `.\build.ps1` makes the development build
+`dist\lanyard.exe` (no console window) and `dist\lanyard-console.exe` (console, for the CLI and the `dist\itest*.ps1`
+scripts); the program is a single static executable with the UI embedded. Windows builds carry the app icon (in Explorer,
 the taskbar and the browser tab) and a **system-tray icon** (left-click to open the window, right-click to quit;
 `--no-tray` to skip it). Tests: `go test ./...`; end-to-end scripts are `dist\itest*.ps1`.
 

@@ -31,7 +31,7 @@ import (
 	"lanyard/internal/uiserver"
 )
 
-const version = "0.5.0-rc1"
+const version = "1.0.0"
 
 type runInfo struct {
 	PID     int    `json:"pid"`

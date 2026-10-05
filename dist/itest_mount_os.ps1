@@ -6,7 +6,7 @@ if ((Get-Service WebClient -ErrorAction SilentlyContinue).Status -ne "Running") 
   Write-Host "SKIP: the Windows WebClient service is not running, so web folders cannot be mounted."
   exit 0
 }
-$exe = Join-Path $PSScriptRoot "lanyard.exe"
+$exe = Join-Path $PSScriptRoot "lanyard-console.exe"
 $stamp = [Guid]::NewGuid().ToString("N").Substring(0, 8)
 $base = Join-Path $env:TEMP "lanyard-mountos-$stamp"
 $dirA = Join-Path $base "A"; $dirB = Join-Path $base "B"

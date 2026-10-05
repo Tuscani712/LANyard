@@ -1,14 +1,16 @@
 # Builds LANyard File Transfer.
 #
-#   .\build.ps1            development build: dist\lanyard.exe (console window; used by dist\itest*.ps1)
+#   .\build.ps1            development build: dist\lanyard.exe (windowless app)
+#                          and dist\lanyard-console.exe (console; used by dist\itest*.ps1)
 #   .\build.ps1 -Release   also builds the distributable binaries into dist\release\
 #
 # Every binary is a single static executable (CGO off) with the web UI embedded.
-# The Windows release build uses -H=windowsgui, so double-clicking it opens no
-# console window; it still prints to the terminal it was started from when you
-# use the command line (lanyard peers, lanyard settings get, ...). PowerShell
-# pipes and redirects work; cmd.exe does not wait for a windowless program, so
-# for batch files use lanyard-win-x64-console.exe, which behaves like any CLI.
+# The app build uses -H=windowsgui, so double-clicking it opens no console
+# window; it still prints to the terminal it was started from when you use the
+# command line (lanyard peers, lanyard settings get, ...). PowerShell pipes and
+# redirects work; cmd.exe does not wait for a windowless program, so for batch
+# files use the console build (dist\lanyard-console.exe, or the release
+# lanyard-win-x64-console.exe), which behaves like any CLI.
 #
 # The Windows binaries carry the app icon from cmd\lanyard\rsrc_windows_amd64.syso
 # (a Go linker resource object). To regenerate after changing icons\icon.png:
@@ -37,7 +39,8 @@ function Build($os, $arch, $out, $extra) {
 if ($LASTEXITCODE -ne 0) { throw "go vet failed" }
 
 New-Item -ItemType Directory -Force dist | Out-Null
-Build windows amd64 "dist\lanyard.exe" ""
+Build windows amd64 "dist\lanyard.exe" "-H=windowsgui"
+Build windows amd64 "dist\lanyard-console.exe" ""
 
 if ($Release) {
     New-Item -ItemType Directory -Force dist\release | Out-Null

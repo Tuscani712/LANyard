@@ -489,7 +489,7 @@ function renderDevice(body, p) {
 function renderRemote(body, p) {
   const bar = el("div", "form-row");
   const dest = el("input");
-  dest.placeholder = "Download to folder (e.g. C:\\Users\\me\\Downloads)";
+  dest.placeholder = "Download to folder";
   dest.value = localStorage.getItem("lanyard.dest") || settings.default_download_folder || "";
   dest.style.flex = "1"; dest.style.minWidth = "260px";
   const dlHere = btn("Download this folder", () => downloadRemote(p, [p.path], dest.value));
