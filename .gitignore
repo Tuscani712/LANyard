@@ -1,0 +1,26 @@
+# Build output (rebuild with .\build.ps1 -Release)
+/dist/*.exe
+/dist/release/
+*.exe
+*.test
+*.out
+
+# Runtime data: device keys, certificates, trust list, logs, received files
+run.json
+lanyard.log
+*.lanpart
+*.lanstate
+*.pem
+*.key
+*.pfx
+*.p12
+.env
+.env.*
+Inbox/
+
+# Local tooling / editor / OS
+.claude/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
