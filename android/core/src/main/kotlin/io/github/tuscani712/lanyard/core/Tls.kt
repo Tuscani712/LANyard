@@ -50,6 +50,30 @@ object Tls {
     /** An [SSLSocketFactory] that offers only TLS 1.3, like the Go peer requires. */
     fun socketFactory(identity: Identity, expectedFingerprint: String): SSLSocketFactory =
         Tls13SocketFactory(sslContext(identity, expectedFingerprint).socketFactory)
+
+    /**
+     * A factory that accepts **any** server certificate and records the one that
+     * was actually presented. Use this *only* for the `GET /api/v1/hello`
+     * discovery probe, to learn who is at an address; everything that reads or
+     * writes real data must go through [socketFactory], which pins the expected
+     * fingerprint. [ProbeClient] is the only caller and exposes no data methods.
+     */
+    fun probeSocketFactory(identity: Identity, recorder: FingerprintRecorder): SSLSocketFactory {
+        val context = SSLContext.getInstance("TLS", provider)
+        context.init(
+            arrayOf(IdentityKeyManager(identity)),
+            arrayOf(RecordingTrustManager(recorder)),
+            SecureRandom(),
+        )
+        return Tls13SocketFactory(context.socketFactory)
+    }
+}
+
+/** Holds the fingerprint most recently presented during a probe handshake. */
+class FingerprintRecorder {
+    @Volatile
+    var fingerprint: String? = null
+        internal set
 }
 
 /** Delegates to a real factory but pins every socket to TLS 1.3. */
@@ -144,5 +168,30 @@ class FingerprintTrustManager(private val expectedFingerprint: String) : X509Ext
                 "peer fingerprint ${presented.take(8)}… does not match the expected ${expectedFingerprint.take(8)}…",
             )
         }
+    }
+}
+
+/**
+ * Accepts any server certificate and records its Device ID for the caller to
+ * inspect. This performs **no** trust decision and must never guard a request
+ * that reads or writes data — see [Tls.probeSocketFactory].
+ */
+private class RecordingTrustManager(private val recorder: FingerprintRecorder) : X509ExtendedTrustManager() {
+    override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String) = record(chain)
+
+    override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String, socket: Socket?) = record(chain)
+
+    override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String, engine: SSLEngine?) = record(chain)
+
+    override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) = Unit
+
+    override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String, socket: Socket?) = Unit
+
+    override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String, engine: SSLEngine?) = Unit
+
+    override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+
+    private fun record(chain: Array<X509Certificate>) {
+        if (chain.isNotEmpty()) recorder.fingerprint = Identity.fingerprintOf(chain[0])
     }
 }

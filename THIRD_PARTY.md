@@ -66,6 +66,10 @@ Versions are pinned in `android/gradle/libs.versions.toml`.
 | androidx.core:core-ktx | 1.15.0 | Apache-2.0 | AndroidX core |
 | androidx.activity:activity-compose | 1.9.3 | Apache-2.0 | Compose entry point / `ComponentActivity` |
 | androidx.lifecycle:lifecycle-runtime-ktx | 2.8.7 | Apache-2.0 | Lifecycle runtime |
+| androidx.lifecycle:lifecycle-runtime-compose | 2.8.7 | Apache-2.0 | `collectAsStateWithLifecycle` |
+| androidx.lifecycle:lifecycle-viewmodel-compose | 2.8.7 | Apache-2.0 | `viewModel()` in Compose |
+| org.jetbrains.kotlinx:kotlinx-coroutines-android | 1.9.0 | Apache-2.0 | Coroutine dispatchers on Android |
+| com.google.code.gson:gson | 2.11.0 | Apache-2.0 | JSON for the peer/UI APIs |
 | androidx.compose:compose-bom | 2024.12.01 | Apache-2.0 | Aligns Compose artifact versions |
 | androidx.compose.ui:ui / ui-tooling-preview / ui-tooling | 1.7.6 (BOM) | Apache-2.0 | Compose UI and previews |
 | androidx.compose.material3:material3 | 1.3.1 (BOM) | Apache-2.0 | Material 3 components |

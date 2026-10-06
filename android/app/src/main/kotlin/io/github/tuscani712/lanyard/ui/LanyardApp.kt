@@ -36,6 +36,8 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import io.github.tuscani712.lanyard.DevicesViewModel
 import io.github.tuscani712.lanyard.IdentityHolder
 
 private data class Tab(val label: String, val icon: ImageVector)
@@ -48,7 +50,7 @@ private val TABS = listOf(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun LanyardApp() {
+fun LanyardApp(viewModel: DevicesViewModel = viewModel()) {
     var selected by rememberSaveable { mutableIntStateOf(0) }
 
     Scaffold(
@@ -69,7 +71,7 @@ fun LanyardApp() {
         },
     ) { inner ->
         when (selected) {
-            0 -> DevicesScreen(inner)
+            0 -> DevicesScreen(inner, viewModel)
             1 -> TransfersScreen(inner)
             else -> SettingsScreen(inner)
         }
@@ -107,16 +109,6 @@ private fun EmptyState(
             textAlign = TextAlign.Center,
         )
     }
-}
-
-@Composable
-private fun DevicesScreen(padding: PaddingValues) {
-    EmptyState(
-        icon = Icons.Filled.Devices,
-        title = "No connected devices",
-        subtitle = "Devices on your network will appear here.",
-        padding = padding,
-    )
 }
 
 @Composable
