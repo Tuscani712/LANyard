@@ -203,3 +203,9 @@ func applyShellFrame(hwnd windows.HWND) {
 	procDwmSetWindowAttribute.Call(uintptr(hwnd), dwmwaDarkMode-1,
 		uintptr(unsafe.Pointer(&dark)), unsafe.Sizeof(dark))
 }
+
+// nativeProfileDir is the WebView2 user-data folder inside the data directory.
+const nativeProfileDir = "webview2"
+
+// nativeSupported: Windows always has a native (WebView2) window.
+func nativeSupported() bool { return true }
