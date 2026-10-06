@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
@@ -13,7 +15,25 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = "0.1.0-beta.1"
+    }
+
+    // The release key is never in the repository: point LANYARD_KEYSTORE_PROPS at a
+    // properties file (storeFile, storePassword, keyAlias, keyPassword). Without it
+    // the release build is left unsigned.
+    val keystoreProps = System.getenv("LANYARD_KEYSTORE_PROPS")
+        ?.let { file(it) }?.takeIf { it.isFile }
+        ?.let { f -> Properties().apply { f.inputStream().use { load(it) } } }
+
+    signingConfigs {
+        if (keystoreProps != null) {
+            create("release") {
+                storeFile = file(keystoreProps.getProperty("storeFile"))
+                storePassword = keystoreProps.getProperty("storePassword")
+                keyAlias = keystoreProps.getProperty("keyAlias")
+                keyPassword = keystoreProps.getProperty("keyPassword")
+            }
+        }
     }
 
     buildTypes {
@@ -22,6 +42,7 @@ android {
         }
         release {
             isMinifyEnabled = false
+            if (keystoreProps != null) signingConfig = signingConfigs.getByName("release")
         }
     }
 
