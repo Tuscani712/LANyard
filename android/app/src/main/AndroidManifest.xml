@@ -30,6 +30,20 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".transfer.TransferService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <activity
+            android:name=".scan.QrScanActivity"
+            android:exported="false"
+            android:theme="@style/Theme.LANyard" />
+
+        <receiver
+            android:name=".transfer.TransferCancelReceiver"
+            android:exported="false" />
     </application>
 
 </manifest>

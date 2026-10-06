@@ -53,7 +53,7 @@ class PeerClient(
     private val port: Int,
     private val identity: Identity,
     private val expectedFingerprint: String,
-) {
+) : ShareReader {
     private val base = "https://$host:$port/api/v1"
     private val socketFactory = Tls.socketFactory(identity, expectedFingerprint)
 
@@ -234,6 +234,28 @@ class PeerClient(
         val conn = open("GET", "/shares/${encode(shareId)}/file?path=${encodeQuery(path)}", null, emptyMap())
         if (rangeFrom > 0) conn.setRequestProperty("Range", "bytes=$rangeFrom-")
         return checkAndStream(conn)
+    }
+
+    // --- ShareReader: the download session's view of a share ---
+
+    override fun manifestFiles(shareId: String, path: String): JsonObject = manifest(shareId, path)
+
+    override fun openFileStream(shareId: String, path: String, rangeFrom: Long): InputStream =
+        openFile(shareId, path, rangeFrom)
+
+    override fun wholeFileHash(shareId: String, path: String): String = fileHash(shareId, path).str("sha256")
+
+    override fun reportComplete(shareId: String, verified: List<Pair<String, String>>): Boolean {
+        val arr = JsonArray()
+        verified.forEach { (path, sha) ->
+            arr.add(JsonObject().apply {
+                addProperty("path", path)
+                addProperty("sha256", sha)
+            })
+        }
+        val body = JsonObject().apply { add("files", arr) }
+        val json = requestJson("POST", "/shares/${encode(shareId)}/complete", body.toString())
+        return json.get("consumed")?.takeIf { !it.isJsonNull }?.asBoolean ?: false
     }
 
     // --- transport ---

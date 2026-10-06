@@ -72,6 +72,7 @@ Versions are pinned in `android/gradle/libs.versions.toml`.
 | com.google.zxing:core | 3.5.3 | Apache-2.0 | QR decoding (no Play Services) |
 | androidx.camera:camera-core / camera-camera2 | 1.4.0 | Apache-2.0 | CameraX preview and capture |
 | androidx.camera:camera-lifecycle / camera-view | 1.4.0 | Apache-2.0 | Lifecycle-bound camera and `PreviewView` |
+| androidx.documentfile:documentfile | 1.0.1 | Apache-2.0 | SAF folder tree access for downloads |
 | com.google.code.gson:gson | 2.11.0 | Apache-2.0 | JSON for the peer/UI APIs |
 | androidx.compose:compose-bom | 2024.12.01 | Apache-2.0 | Aligns Compose artifact versions |
 | androidx.compose.ui:ui / ui-tooling-preview / ui-tooling | 1.7.6 (BOM) | Apache-2.0 | Compose UI and previews |

@@ -1,5 +1,9 @@
 package io.github.tuscani712.lanyard.ui
 
+import android.app.Activity
+import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -40,6 +44,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -47,6 +52,7 @@ import io.github.tuscani712.lanyard.DevicesViewModel
 import io.github.tuscani712.lanyard.PairedStatus
 import io.github.tuscani712.lanyard.PairingStatus
 import io.github.tuscani712.lanyard.net.NearbyDevice
+import io.github.tuscani712.lanyard.scan.QrScanActivity
 
 private val OnlineGreen = Color(0xFF3FB950)
 
@@ -56,27 +62,20 @@ fun shortFingerprint(fp: String): String =
 @Composable
 fun DevicesScreen(padding: PaddingValues, vm: DevicesViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val context = LocalContext.current
     var showAdd by rememberSaveable { mutableStateOf(false) }
-    var showScan by rememberSaveable { mutableStateOf(false) }
     var explain by remember { mutableStateOf<NearbyDevice?>(null) }
+
+    val scanLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        val data = result.data
+        when {
+            result.resultCode == Activity.RESULT_OK -> data?.getStringExtra(QrScanActivity.EXTRA_LINK)?.let { vm.pair(it) }
+            data?.getBooleanExtra(QrScanActivity.EXTRA_PASTE, false) == true -> showAdd = true
+        }
+    }
 
     if (state.detail != null) {
         PeerDetailScreen(padding, vm)
-        return
-    }
-
-    if (showScan) {
-        QrScanScreen(
-            onDecoded = { link ->
-                showScan = false
-                vm.pair(link)
-            },
-            onCancel = { showScan = false },
-            onPasteInstead = {
-                showScan = false
-                showAdd = true
-            },
-        )
         return
     }
 
@@ -103,7 +102,7 @@ fun DevicesScreen(padding: PaddingValues, vm: DevicesViewModel) {
             SectionHeader("Paired")
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(onClick = { showAdd = true }) { Text("Add device") }
-                Button(onClick = { showScan = true }) {
+                Button(onClick = { scanLauncher.launch(Intent(context, QrScanActivity::class.java)) }) {
                     Icon(Icons.Filled.QrCodeScanner, contentDescription = null, modifier = Modifier.size(18.dp))
                     Spacer(Modifier.width(6.dp))
                     Text("Scan QR")

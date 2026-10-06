@@ -6,12 +6,14 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import io.github.tuscani712.lanyard.ui.LanyardApp
 import io.github.tuscani712.lanyard.ui.theme.LanyardTheme
+import io.github.tuscani712.lanyard.transfer.TransferManager
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         IdentityHolder.init(applicationContext)
+        TransferManager.init(application)
         setContent {
             LanyardTheme {
                 LanyardApp()

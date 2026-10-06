@@ -1,7 +1,12 @@
 package io.github.tuscani712.lanyard.ui
 
+import android.Manifest
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -26,7 +31,6 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -35,16 +39,17 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.tuscani712.lanyard.DevicesViewModel
 import io.github.tuscani712.lanyard.PeerDetail
-import io.github.tuscani712.lanyard.PushUi
 import io.github.tuscani712.lanyard.ShareItem
 import io.github.tuscani712.lanyard.TreeItem
 
@@ -95,18 +100,55 @@ fun PeerDetailScreen(padding: PaddingValues, vm: DevicesViewModel) {
 
 @Composable
 private fun DevicePage(detail: PeerDetail, vm: DevicesViewModel) {
+    val context = LocalContext.current
+    var pending by remember { mutableStateOf<ShareItem?>(null) }
+    val treePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        val share = pending
+        pending = null
+        if (uri != null && share != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
+                )
+            }
+            vm.rememberTree(uri)
+            vm.downloadShare(detail.peer, share, uri)
+        }
+    }
+
     Column(modifier = Modifier.fillMaxSize()) {
         PeerActions(detail, vm)
         detail.notice?.let { NoticeCard(it, onDismiss = vm::dismissNotice) }
-        detail.push?.let { PushCard(it, onCancel = vm::cancelPush, onDismiss = vm::dismissPush) }
         Box(modifier = Modifier.weight(1f)) {
             if (detail.loading) {
                 CenterMessage("Loading…", spinner = true)
             } else if (detail.error != null) {
                 CenterMessage(detail.error)
             } else {
-                SharesList(detail.shares, onOpen = vm::openShare)
+                SharesList(
+                    shares = detail.shares,
+                    onOpen = vm::openShare,
+                    onDownload = { share ->
+                        pending = share
+                        treePicker.launch(vm.rememberedTree())
+                    },
+                )
             }
+        }
+    }
+}
+
+@Composable
+private fun rememberNotificationPermission(): () -> Unit {
+    val context = LocalContext.current
+    val launcher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { }
+    return {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            launcher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 }
@@ -116,10 +158,17 @@ private fun PeerActions(detail: PeerDetail, vm: DevicesViewModel) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) vm.sendFiles(detail.peer, uris)
     }
+    val ensureNotifications = rememberNotificationPermission()
     var text by rememberSaveable { mutableStateOf("") }
 
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-        Button(onClick = { picker.launch(arrayOf("*/*")) }, modifier = Modifier.fillMaxWidth()) {
+        Button(
+            onClick = {
+                ensureNotifications()
+                picker.launch(arrayOf("*/*"))
+            },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
             Text("Send files")
         }
         Spacer(Modifier.height(8.dp))
@@ -157,54 +206,7 @@ private fun NoticeCard(text: String, onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun PushCard(push: PushUi, onCancel: () -> Unit, onDismiss: () -> Unit) {
-    Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
-        Column(modifier = Modifier.padding(16.dp)) {
-            Text(
-                when {
-                    push.running -> "Sending…"
-                    push.ok -> "Sent"
-                    else -> "Send failed"
-                },
-                style = MaterialTheme.typography.titleSmall,
-            )
-            Spacer(Modifier.height(8.dp))
-            push.files.forEach { file ->
-                Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                    Row(modifier = Modifier.fillMaxWidth()) {
-                        Text(file.name, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
-                        Text(
-                            "${humanSize(file.sent)} / ${humanSize(file.total)}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                    if (file.total > 0 && push.running) {
-                        LinearProgressIndicator(
-                            progress = { (file.sent.toFloat() / file.total).coerceIn(0f, 1f) },
-                            modifier = Modifier.fillMaxWidth(),
-                        )
-                    }
-                }
-            }
-            push.message?.let {
-                Spacer(Modifier.height(8.dp))
-                Text(it, style = MaterialTheme.typography.bodyMedium)
-            }
-            Spacer(Modifier.height(8.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-                if (push.running) {
-                    OutlinedButton(onClick = onCancel) { Text("Cancel") }
-                } else {
-                    TextButton(onClick = onDismiss) { Text("Dismiss") }
-                }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SharesList(shares: List<ShareItem>, onOpen: (ShareItem) -> Unit) {
+private fun SharesList(shares: List<ShareItem>, onOpen: (ShareItem) -> Unit, onDownload: (ShareItem) -> Unit) {
     if (shares.isEmpty()) {
         CenterMessage("No shares yet. Share a file or folder from the explorer.")
         return
@@ -214,16 +216,16 @@ private fun SharesList(shares: List<ShareItem>, onOpen: (ShareItem) -> Unit) {
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clickable { onOpen(share) }
-                    .padding(horizontal = 16.dp, vertical = 14.dp),
+                    .padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(Icons.Filled.Folder, contentDescription = null, modifier = Modifier.size(24.dp))
                 Spacer(Modifier.width(12.dp))
-                Column(modifier = Modifier.weight(1f)) {
+                Column(modifier = Modifier.weight(1f).clickable { onOpen(share) }) {
                     Text(share.label.ifEmpty { share.name.ifEmpty { "Share" } }, style = MaterialTheme.typography.titleSmall)
                     Text(share.lifetime, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
+                OutlinedButton(onClick = { onDownload(share) }) { Text("Download") }
             }
         }
     }

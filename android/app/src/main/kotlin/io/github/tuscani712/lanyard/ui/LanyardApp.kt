@@ -79,49 +79,6 @@ fun LanyardApp(viewModel: DevicesViewModel = viewModel()) {
 }
 
 @Composable
-private fun EmptyState(
-    icon: ImageVector,
-    title: String,
-    subtitle: String,
-    padding: PaddingValues,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(padding)
-            .padding(horizontal = 32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
-    ) {
-        Icon(
-            icon,
-            contentDescription = null,
-            modifier = Modifier.size(64.dp),
-            tint = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(Modifier.height(16.dp))
-        Text(title, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
-        Spacer(Modifier.height(8.dp))
-        Text(
-            subtitle,
-            style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center,
-        )
-    }
-}
-
-@Composable
-private fun TransfersScreen(padding: PaddingValues) {
-    EmptyState(
-        icon = Icons.Filled.SwapVert,
-        title = "No transfers.",
-        subtitle = "Files you send or receive will show up here.",
-        padding = padding,
-    )
-}
-
-@Composable
 private fun SettingsScreen(padding: PaddingValues) {
     var name by rememberSaveable { mutableStateOf(IdentityHolder.deviceName) }
 

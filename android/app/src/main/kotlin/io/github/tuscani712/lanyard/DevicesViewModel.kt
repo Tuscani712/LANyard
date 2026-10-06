@@ -13,12 +13,11 @@ import io.github.tuscani712.lanyard.core.PairingFlow
 import io.github.tuscani712.lanyard.core.PeerClient
 import io.github.tuscani712.lanyard.core.PeerStatusException
 import io.github.tuscani712.lanyard.core.ProbeClient
-import io.github.tuscani712.lanyard.core.PushResult
-import io.github.tuscani712.lanyard.core.PushSession
 import io.github.tuscani712.lanyard.core.PushSource
 import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.net.NearbyDevice
 import io.github.tuscani712.lanyard.net.NsdDiscovery
+import io.github.tuscani712.lanyard.transfer.TransferManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -28,7 +27,6 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.IOException
-import java.util.concurrent.atomic.AtomicBoolean
 
 /** A paired peer plus its last-known reachability. */
 data class PairedStatus(val peer: PairedPeer, val online: Boolean)
@@ -52,17 +50,6 @@ data class ShareItem(
 /** One entry in a share's folder tree. */
 data class TreeItem(val name: String, val path: String, val isDir: Boolean, val size: Long)
 
-/** Progress for one file being sent. */
-data class PushProgress(val name: String, val sent: Long, val total: Long)
-
-/** State of a push in progress (or its final message). */
-data class PushUi(
-    val running: Boolean,
-    val files: List<PushProgress>,
-    val message: String? = null,
-    val ok: Boolean = false,
-)
-
 /** The detail view for one paired peer. */
 data class PeerDetail(
     val peer: PairedPeer,
@@ -73,7 +60,6 @@ data class PeerDetail(
     val treePath: String = "",
     val tree: List<TreeItem> = emptyList(),
     val treeLoading: Boolean = false,
-    val push: PushUi? = null,
     val notice: String? = null,
 )
 
@@ -93,7 +79,6 @@ data class DevicesUiState(
 class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     private val store: TrustStore = JsonFileTrustStore(File(app.filesDir, "trust/peers.json"))
     private val discovery = NsdDiscovery(app)
-    private var pushCancel: AtomicBoolean? = null
 
     private val _state = MutableStateFlow(DevicesUiState())
     val state: StateFlow<DevicesUiState> = _state.asStateFlow()
@@ -201,52 +186,32 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Streams the picked documents to the peer's Inbox. */
+    /** Streams the picked documents to the peer's Inbox (see Transfers). */
     fun sendFiles(peer: PairedPeer, uris: List<Uri>) {
         if (uris.isEmpty()) return
         val app = getApplication<Application>()
         viewModelScope.launch {
-            val identity = IdentityHolder.identity ?: return@launch
             val sources = withContext(Dispatchers.IO) { uris.mapNotNull { toSource(app, it) } }
             if (sources.isEmpty()) {
                 setNotice("Those files could not be opened.")
                 return@launch
             }
-            val cancel = AtomicBoolean(false)
-            pushCancel = cancel
-            setPush(PushUi(running = true, files = sources.map { PushProgress(it.relPath, 0, it.size) }))
-
-            val result = withContext(Dispatchers.IO) {
-                try {
-                    PushSession(PeerClient(peer.host, peer.port, identity, peer.fingerprint)).push(
-                        sources = sources,
-                        onProgress = { index, sent, total -> updateProgress(index, sent, total) },
-                        isCancelled = { cancel.get() },
-                    )
-                } catch (e: Exception) {
-                    PushResult.Failed(e.message ?: "could not send")
-                }
-            }
-            pushCancel = null
-            val message = when (result) {
-                is PushResult.Sent -> "Sent ${result.files} file(s)."
-                PushResult.Refused -> "The other device is not accepting files."
-                PushResult.CancelledByReceiver -> "The other device cancelled the transfer."
-                PushResult.Cancelled -> "Transfer cancelled."
-                is PushResult.Failed -> "Could not send: ${result.message}"
-            }
-            setPush(PushUi(running = false, files = _state.value.detail?.push?.files.orEmpty(), message = message, ok = result is PushResult.Sent))
+            val label = sources.first().relPath + if (sources.size > 1) " +${sources.size - 1}" else ""
+            TransferManager.enqueuePush(peer, sources, label)
+            setNotice("Sending ${sources.size} file(s). See Transfers.")
         }
     }
 
-    fun cancelPush() {
-        pushCancel?.set(true)
+    /** Pulls a share into the chosen SAF folder (see Transfers). */
+    fun downloadShare(peer: PairedPeer, share: ShareItem, tree: Uri) {
+        val label = share.label.ifEmpty { share.name.ifEmpty { "share" } }
+        TransferManager.enqueueDownload(peer, share.id, "", label, tree)
+        setNotice("Receiving \"$label\". See Transfers.")
     }
 
-    fun dismissPush() = _state.update { current ->
-        val detail = current.detail ?: return@update current
-        current.copy(detail = detail.copy(push = null))
-    }
+    fun rememberTree(uri: Uri) = TransferManager.rememberTree(uri)
+
+    fun rememberedTree(): Uri? = TransferManager.rememberedTree()
 
     private fun toSource(app: Application, uri: Uri): PushSource? {
         val resolver = app.contentResolver
@@ -264,20 +229,6 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         return PushSource(safeName, size, System.currentTimeMillis()) {
             resolver.openInputStream(uri) ?: throw IOException("cannot open $safeName")
         }
-    }
-
-    private fun updateProgress(index: Int, sent: Long, total: Long) = _state.update { current ->
-        val detail = current.detail ?: return@update current
-        val push = detail.push ?: return@update current
-        if (index !in push.files.indices) return@update current
-        val files = push.files.toMutableList()
-        files[index] = files[index].copy(sent = sent, total = total)
-        current.copy(detail = detail.copy(push = push.copy(files = files)))
-    }
-
-    private fun setPush(push: PushUi) = _state.update { current ->
-        val detail = current.detail ?: return@update current
-        current.copy(detail = detail.copy(push = push))
     }
 
     private fun setNotice(text: String) = _state.update { current ->
