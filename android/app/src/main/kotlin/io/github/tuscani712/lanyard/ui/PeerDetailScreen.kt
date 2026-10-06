@@ -131,8 +131,13 @@ private fun DevicePage(detail: PeerDetail, vm: DevicesViewModel) {
                     shares = detail.shares,
                     onOpen = vm::openShare,
                     onDownload = { share ->
-                        pending = share
-                        treePicker.launch(vm.rememberedTree())
+                        val folder = vm.validDownloadFolder()
+                        if (folder != null) {
+                            vm.downloadShare(detail.peer, share, folder)
+                        } else {
+                            pending = share
+                            treePicker.launch(vm.rememberedTree())
+                        }
                     },
                 )
             }

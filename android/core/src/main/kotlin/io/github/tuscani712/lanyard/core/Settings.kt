@@ -19,6 +19,12 @@ data class AppSettings(
     val speedUnit: SpeedUnit = SpeedUnit.MBps,
     val notifications: Boolean = true,
     val soundOnComplete: Boolean = false,
+    /** Refuse transfers on a metered or mobile connection. */
+    val wifiOnly: Boolean = true,
+    /** Persisted SAF tree URI for downloads, or null to ask each time. */
+    val downloadFolder: String? = null,
+    /** Bandwidth cap in MB/s; 0 means unlimited. */
+    val bandwidthLimitMbps: Int = 0,
 )
 
 /** Persists [AppSettings]. Implementations must never throw on read. */

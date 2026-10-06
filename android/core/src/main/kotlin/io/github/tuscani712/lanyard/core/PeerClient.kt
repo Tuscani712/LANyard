@@ -153,6 +153,7 @@ class PeerClient(
         source: InputStream,
         onBytes: (Long) -> Unit = {},
         isCancelled: () -> Boolean = { false },
+        throttle: Throttle = NoThrottle,
     ): StreamedFile {
         val conn = URL(base + "/push/${encode(pushId)}/file?path=${encodeQuery(relPath)}").openConnection()
             as HttpsURLConnection
@@ -193,6 +194,7 @@ class PeerClient(
                     digest.update(buf, 0, r)
                     sent += r
                     onBytes(sent)
+                    throttle.pace(r)
                 }
             }
             val status = conn.responseCode

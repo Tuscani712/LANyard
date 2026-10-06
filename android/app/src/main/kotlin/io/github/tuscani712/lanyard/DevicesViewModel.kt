@@ -197,22 +197,17 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun closePeer() = _state.update { it.copy(detail = null) }
 
-    /** Sends a text snippet (the desktop caps these at 64 KB). */
+    /** Sends a text snippet (the desktop caps these at 64 KB), through the same gate as files. */
     fun sendText(peer: PairedPeer, text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
-        viewModelScope.launch {
-            val identity = IdentityHolder.identity ?: return@launch
-            val failure = withContext(Dispatchers.IO) {
-                try {
-                    PeerClient(peer.host, peer.port, identity, peer.fingerprint).sendSnippet(trimmed.take(64 * 1024))
-                    null
-                } catch (e: Exception) {
-                    friendly(e)
-                }
-            }
-            setNotice(if (failure == null) "Text sent." else "Could not send text: $failure")
+        val blocked = TransferManager.refusal()
+        if (blocked != null) {
+            setNotice(blocked)
+            return
         }
+        TransferManager.enqueueSnippet(peer, trimmed.take(64 * 1024))
+        setNotice("Text sending. See Transfers.")
     }
 
     /** Spools the picked documents and pushes them to the peer's Inbox (see Transfers). */
@@ -246,6 +241,14 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     fun rememberTree(uri: Uri) = TransferManager.rememberTree(uri)
 
     fun rememberedTree(): Uri? = TransferManager.rememberedTree()
+
+    /** The remembered download folder if its persisted permission is still held. */
+    fun validDownloadFolder(): Uri? {
+        val uri = TransferManager.rememberedTree() ?: return null
+        val held = getApplication<Application>().contentResolver.persistedUriPermissions
+            .any { it.uri == uri && it.isReadPermission && it.isWritePermission }
+        return if (held) uri else null
+    }
 
     private fun setNotice(text: String) = _state.update { current ->
         val detail = current.detail ?: return@update current

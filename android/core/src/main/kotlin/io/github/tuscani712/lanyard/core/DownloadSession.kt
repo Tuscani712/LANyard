@@ -66,7 +66,7 @@ interface ShareReader {
  * because every manifest path is validated first. Blocking; call off the main
  * thread.
  */
-class DownloadSession(private val reader: ShareReader) {
+class DownloadSession(private val reader: ShareReader, private val throttle: Throttle = NoThrottle) {
 
     fun download(
         shareId: String,
@@ -170,6 +170,7 @@ class DownloadSession(private val reader: ShareReader) {
                     digest.update(buf, 0, n)
                     received += n
                     onProgress(index, file, offset + received, file.size)
+                    throttle.pace(n)
                 }
             }
         }

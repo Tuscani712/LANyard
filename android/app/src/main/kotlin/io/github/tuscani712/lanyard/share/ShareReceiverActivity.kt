@@ -23,6 +23,7 @@ import io.github.tuscani712.lanyard.core.PushSource
 import io.github.tuscani712.lanyard.core.ShareTarget
 import io.github.tuscani712.lanyard.core.ShareValidation
 import io.github.tuscani712.lanyard.core.ThemeMode
+import io.github.tuscani712.lanyard.net.AndroidMeteredNetwork
 import io.github.tuscani712.lanyard.transfer.TransferManager
 import io.github.tuscani712.lanyard.ui.theme.LanyardTheme
 import kotlinx.coroutines.CoroutineScope
@@ -60,7 +61,7 @@ class ShareReceiverActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         IdentityHolder.init(applicationContext)
         SettingsHolder.init(applicationContext)
-        TransferManager.init(application)
+        TransferManager.init(application, AndroidMeteredNetwork(applicationContext))
 
         val received = intent
         scope.launch {

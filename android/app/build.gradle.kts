@@ -59,6 +59,13 @@ android {
         compose = true
     }
 
+    sourceSets {
+        getByName("main") {
+            // THIRD_PARTY.md is copied here by copyLicenses below.
+            assets.srcDir(layout.buildDirectory.dir("generated/licenses"))
+        }
+    }
+
     packaging {
         resources {
             // BouncyCastle ships multi-release jars whose per-version OSGI
@@ -98,4 +105,14 @@ dependencies {
     implementation(libs.compose.material.icons.extended)
 
     debugImplementation(libs.compose.ui.tooling)
+}
+
+// Bundle the repository's third-party notices as an asset for the About screen.
+val copyLicenses by tasks.registering(Copy::class) {
+    from(rootProject.file("../THIRD_PARTY.md"))
+    into(layout.buildDirectory.dir("generated/licenses"))
+}
+
+tasks.named("preBuild") {
+    dependsOn(copyLicenses)
 }

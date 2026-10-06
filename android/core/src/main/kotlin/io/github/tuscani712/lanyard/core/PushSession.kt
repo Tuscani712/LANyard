@@ -36,7 +36,7 @@ sealed class PushResult {
  * whole. [onProgress] reports per-file bytes as they go; [isCancelled] is polled
  * between buffers so a transfer can be stopped promptly.
  */
-class PushSession(private val client: PeerClient) {
+class PushSession(private val client: PeerClient, private val throttle: Throttle = NoThrottle) {
 
     fun push(
         sources: List<PushSource>,
@@ -67,6 +67,7 @@ class PushSession(private val client: PeerClient) {
                     source = source.open(),
                     onBytes = { sent -> onProgress(index, sent, source.size) },
                     isCancelled = isCancelled,
+                    throttle = throttle,
                 )
                 client.pushCompleteFile(offer.pushId, source.relPath, result.sha256)
                 overall += result.bytes

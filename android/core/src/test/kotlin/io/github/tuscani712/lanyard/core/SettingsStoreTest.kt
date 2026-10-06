@@ -2,6 +2,7 @@ package io.github.tuscani712.lanyard.core
 
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.io.File
@@ -21,6 +22,9 @@ class SettingsStoreTest {
         assertEquals(ThemeMode.System, store.load().theme)
         assertTrue(store.load().notifications)
         assertFalse(store.load().soundOnComplete)
+        assertTrue(store.load().wifiOnly)
+        assertNull(store.load().downloadFolder)
+        assertEquals(0, store.load().bandwidthLimitMbps)
     }
 
     @Test
@@ -32,6 +36,9 @@ class SettingsStoreTest {
                 speedUnit = SpeedUnit.Mbps,
                 notifications = false,
                 soundOnComplete = true,
+                wifiOnly = false,
+                downloadFolder = "content://com.android.externalstorage.documents/tree/primary%3ADownload",
+                bandwidthLimitMbps = 7,
             ),
         )
 
@@ -40,6 +47,9 @@ class SettingsStoreTest {
         assertEquals(SpeedUnit.Mbps, reopened.speedUnit)
         assertFalse(reopened.notifications)
         assertTrue(reopened.soundOnComplete)
+        assertFalse(reopened.wifiOnly)
+        assertEquals("content://com.android.externalstorage.documents/tree/primary%3ADownload", reopened.downloadFolder)
+        assertEquals(7, reopened.bandwidthLimitMbps)
     }
 
     @Test
@@ -58,6 +68,9 @@ class SettingsStoreTest {
         assertEquals(SpeedUnit.MBps, loaded.speedUnit)
         assertTrue(loaded.notifications)
         assertFalse(loaded.soundOnComplete)
+        assertTrue(loaded.wifiOnly)
+        assertNull(loaded.downloadFolder)
+        assertEquals(0, loaded.bandwidthLimitMbps)
     }
 
     @Test

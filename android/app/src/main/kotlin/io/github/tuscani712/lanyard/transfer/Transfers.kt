@@ -1,7 +1,6 @@
 package io.github.tuscani712.lanyard.transfer
 
 import android.app.Application
-import android.content.Context
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import com.google.gson.Gson
@@ -11,13 +10,18 @@ import io.github.tuscani712.lanyard.IdentityHolder
 import io.github.tuscani712.lanyard.core.DownloadResult
 import io.github.tuscani712.lanyard.core.DownloadSession
 import io.github.tuscani712.lanyard.core.DownloadTarget
+import io.github.tuscani712.lanyard.core.MeteredNetwork
 import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PeerClient
 import io.github.tuscani712.lanyard.core.PushResult
 import io.github.tuscani712.lanyard.core.PushSession
 import io.github.tuscani712.lanyard.core.PushSource
+import io.github.tuscani712.lanyard.core.RateThrottle
 import io.github.tuscani712.lanyard.core.ShareValidation
 import io.github.tuscani712.lanyard.core.SpoolEntry
+import io.github.tuscani712.lanyard.core.Throttle
+import io.github.tuscani712.lanyard.core.TransferPolicy
+import io.github.tuscani712.lanyard.SettingsHolder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -54,11 +58,10 @@ data class TransferRecord(
  * storage.
  */
 object TransferManager {
-    private const val PREFS = "transfers"
-    private const val KEY_TREE = "download_tree"
     private const val HISTORY_CAP = 100
 
     private lateinit var app: Application
+    private var meter: MeteredNetwork = MeteredNetwork { false }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val gson: Gson = GsonBuilder().create()
     private val historyType = object : TypeToken<MutableList<TransferRecord>>() {}.type
@@ -70,11 +73,18 @@ object TransferManager {
     private val speedSamples = java.util.concurrent.ConcurrentHashMap<String, SpeedSample>()
     private val cleanups = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
 
-    fun init(application: Application) {
+    fun init(application: Application, meteredNetwork: MeteredNetwork = MeteredNetwork { false }) {
         app = application
+        meter = meteredNetwork
         _state.value = loadHistory()
         sweepSpool()
     }
+
+    /** The current Wi-Fi-only refusal, or null when a transfer may start. */
+    fun refusal(): String? =
+        TransferPolicy.wifiOnlyRefusal(SettingsHolder.settings.value.wifiOnly, meter.isMetered())
+
+    private fun throttle(): Throttle = RateThrottle.fromMbps(SettingsHolder.settings.value.bandwidthLimitMbps)
 
     /** Deletes share-spool files left behind by a crash, on app start. */
     private fun sweepSpool() {
@@ -111,28 +121,45 @@ object TransferManager {
 
     // --- destination folder (SAF) ---
 
-    fun rememberedTree(): Uri? = app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_TREE, null)?.let(Uri::parse)
+    fun rememberedTree(): Uri? = SettingsHolder.settings.value.downloadFolder?.let(Uri::parse)
 
     fun rememberTree(uri: Uri) {
-        app.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY_TREE, uri.toString()).apply()
+        SettingsHolder.update { it.copy(downloadFolder = uri.toString()) }
+    }
+
+    fun clearTree() {
+        SettingsHolder.update { it.copy(downloadFolder = null) }
     }
 
     // --- enqueue ---
 
     fun enqueuePush(peer: PairedPeer, sources: List<PushSource>, label: String, onFinished: (() -> Unit)? = null): String {
         val id = newId()
+        val blocked = refusal()
+        if (blocked != null) {
+            add(TransferRecord(id, "send", peer.name, peer.fingerprint, label, sources.sumOf { it.size }, 0, TransferState.Failed, blocked, 0.0, now()))
+            onFinished?.invoke()
+            return id
+        }
         if (onFinished != null) cleanups[id] = onFinished
         add(TransferRecord(id, "send", peer.name, peer.fingerprint, label, sources.sumOf { it.size }, 0, TransferState.Queued, null, 0.0, now()))
         TransferService.start(app)
-        scope.launch { runPush(id, peer, sources) }
+        val throttle = throttle()
+        scope.launch { runPush(id, peer, sources, throttle) }
         return id
     }
 
     fun enqueueDownload(peer: PairedPeer, shareId: String, path: String, label: String, tree: Uri): String {
         val id = newId()
+        val blocked = refusal()
+        if (blocked != null) {
+            add(TransferRecord(id, "receive", peer.name, peer.fingerprint, label, 0, 0, TransferState.Failed, blocked, 0.0, now()))
+            return id
+        }
         add(TransferRecord(id, "receive", peer.name, peer.fingerprint, label, 0, 0, TransferState.Queued, null, 0.0, now()))
         TransferService.start(app)
-        scope.launch { runDownload(id, peer, shareId, path, tree) }
+        val throttle = throttle()
+        scope.launch { runDownload(id, peer, shareId, path, tree, throttle) }
         return id
     }
 
@@ -143,6 +170,11 @@ object TransferManager {
     fun enqueueSnippet(peer: PairedPeer, text: String): String {
         val id = newId()
         val size = text.toByteArray(Charsets.UTF_8).size.toLong()
+        val blocked = refusal()
+        if (blocked != null) {
+            add(TransferRecord(id, "send", peer.name, peer.fingerprint, "Text", size, 0, TransferState.Failed, blocked, 0.0, now()))
+            return id
+        }
         add(TransferRecord(id, "send", peer.name, peer.fingerprint, "Text", size, 0, TransferState.Queued, null, 0.0, now()))
         scope.launch { runSnippet(id, peer, text) }
         return id
@@ -160,7 +192,7 @@ object TransferManager {
         if (failure == null) complete(id, "Text sent") else fail(id, failure)
     }
 
-    private suspend fun runPush(id: String, peer: PairedPeer, sources: List<PushSource>) {
+    private suspend fun runPush(id: String, peer: PairedPeer, sources: List<PushSource>, throttle: Throttle) {
         try {
             val identity = IdentityHolder.identity ?: return fail(id, "no identity on this device")
             val cancel = AtomicBoolean(false)
@@ -168,7 +200,7 @@ object TransferManager {
             setState(id, TransferState.Running)
             val sent = LongArray(sources.size)
             val result = try {
-                PushSession(PeerClient(peer.host, peer.port, identity, peer.fingerprint)).push(
+                PushSession(PeerClient(peer.host, peer.port, identity, peer.fingerprint), throttle).push(
                     sources = sources,
                     onProgress = { index, bytes, _ ->
                         sent[index] = bytes
@@ -187,7 +219,7 @@ object TransferManager {
         }
     }
 
-    private suspend fun runDownload(id: String, peer: PairedPeer, shareId: String, path: String, tree: Uri) {
+    private suspend fun runDownload(id: String, peer: PairedPeer, shareId: String, path: String, tree: Uri, throttle: Throttle) {
         val identity = IdentityHolder.identity ?: return fail(id, "no identity on this device")
         val root = DocumentFile.fromTreeUri(app, tree) ?: return fail(id, "cannot open the destination folder")
         val cancel = AtomicBoolean(false)
@@ -195,7 +227,7 @@ object TransferManager {
         setState(id, TransferState.Running)
         val sent = HashMap<Int, Long>()
         val result = try {
-            DownloadSession(PeerClient(peer.host, peer.port, identity, peer.fingerprint)).download(
+            DownloadSession(PeerClient(peer.host, peer.port, identity, peer.fingerprint), throttle).download(
                 shareId = shareId,
                 path = path,
                 targetFor = { file ->
