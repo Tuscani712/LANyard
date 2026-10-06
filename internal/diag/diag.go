@@ -44,10 +44,13 @@ type Peer struct {
 
 // Env supplies the environment the checks inspect. Tests provide a fake.
 type Env interface {
-	// ConfiguredPeerPort is the port the user asked for (settings); PeerPort is
-	// the port the server actually bound (it may differ if the first was busy).
-	ConfiguredPeerPort() int
+	// RequestedPeerPort is the port the user asked for (settings or flag);
+	// PeerPort is the port the server actually bound. PeerPortFallback reports
+	// whether the requested port was the one that failed to bind, which is the
+	// only case that deserves a warning.
+	RequestedPeerPort() int
 	PeerPort() int
+	PeerPortFallback() bool
 	// LocalAddrs are this host's private/link-local addresses.
 	LocalAddrs() []string
 	Peers() []Peer
@@ -112,9 +115,9 @@ func checkPeerPort(ctx context.Context, env Env) Check {
 		c.Fix = "Restart LANyard."
 		return c
 	}
-	if want := env.ConfiguredPeerPort(); want != 0 && want != actual {
+	if env.PeerPortFallback() {
 		c.Status = StatusWarn
-		c.Detail = fmt.Sprintf("Port %d was in use by another program, so the peer service is running on port %d instead.", want, actual)
+		c.Detail = fmt.Sprintf("Port %d was in use by another program, so the peer service is running on port %d instead.", env.RequestedPeerPort(), actual)
 		c.Fix = "Free that port or allow LANyard through the firewall on its current port."
 		return c
 	}

@@ -43,7 +43,11 @@ type SelfInfo struct {
 	DeviceLabel    string `json:"device_label"`
 	OS             string `json:"os"`
 	PeerPort       int    `json:"peer_port"`
-	Version        string `json:"version"`
+	// PeerPortRequested is the port we tried to bind; PeerPortFallback is true
+	// when it was busy and the service moved to PeerPort instead.
+	PeerPortRequested int    `json:"peer_port_requested,omitempty"`
+	PeerPortFallback  bool   `json:"peer_port_fallback,omitempty"`
+	Version           string `json:"version"`
 }
 
 // Notice is a user-facing notification pushed to every open UI as an SSE

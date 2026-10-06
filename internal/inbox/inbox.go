@@ -209,8 +209,36 @@ type Manager struct {
 }
 
 // FreeSpace reports the bytes available to the current user on the volume
-// holding path, or 0 if that cannot be determined.
-func FreeSpace(path string) int64 { return freeSpace(path) }
+// holding path, or 0 if that cannot be determined. When path does not exist yet
+// (an Inbox is only created on the first push), the nearest existing parent is
+// measured instead, since it is on the same volume.
+func FreeSpace(path string) int64 {
+	if n := freeSpace(path); n > 0 {
+		return n
+	}
+	if dir := nearestExistingDir(path); dir != "" {
+		return freeSpace(dir)
+	}
+	return 0
+}
+
+// nearestExistingDir returns the closest existing ancestor of path, or "".
+func nearestExistingDir(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	p := filepath.Clean(path)
+	for {
+		if info, err := os.Stat(p); err == nil && info.IsDir() {
+			return p
+		}
+		parent := filepath.Dir(p)
+		if parent == p { // reached the volume root
+			return ""
+		}
+		p = parent
+	}
+}
 
 func New(dir string, onChange func()) *Manager {
 	if onChange == nil {

@@ -8,11 +8,12 @@ import (
 )
 
 type fakeEnv struct {
-	configuredPort int
-	port           int
-	addrs          []string
-	peers          []Peer
-	target         string
+	requestedPort int
+	port          int
+	fellBack      bool
+	addrs         []string
+	peers         []Peer
+	target        string
 
 	tcpFn   func(host string, port int) error
 	probeFn func(host string, port int) (string, error)
@@ -26,11 +27,12 @@ type fakeEnv struct {
 	now       time.Time
 }
 
-func (f *fakeEnv) ConfiguredPeerPort() int { return f.configuredPort }
-func (f *fakeEnv) PeerPort() int           { return f.port }
-func (f *fakeEnv) LocalAddrs() []string    { return f.addrs }
-func (f *fakeEnv) Peers() []Peer           { return f.peers }
-func (f *fakeEnv) TargetDevice() string    { return f.target }
+func (f *fakeEnv) RequestedPeerPort() int { return f.requestedPort }
+func (f *fakeEnv) PeerPort() int          { return f.port }
+func (f *fakeEnv) PeerPortFallback() bool { return f.fellBack }
+func (f *fakeEnv) LocalAddrs() []string   { return f.addrs }
+func (f *fakeEnv) Peers() []Peer          { return f.peers }
+func (f *fakeEnv) TargetDevice() string   { return f.target }
 func (f *fakeEnv) PeerByID(id string) (Peer, bool) {
 	for _, p := range f.peers {
 		if p.DeviceID == id || strings.HasPrefix(p.DeviceID, id) {
@@ -59,7 +61,7 @@ func (f *fakeEnv) Now() time.Time                   { return f.now }
 
 func baseEnv() *fakeEnv {
 	return &fakeEnv{
-		configuredPort: 47800, port: 47800,
+		requestedPort: 47800, port: 47800,
 		addrs: []string{"192.168.1.20"}, now: time.Now(),
 	}
 }
@@ -79,10 +81,24 @@ func TestRunOrderAndCount(t *testing.T) {
 
 func TestPeerPortPortInUseFallsBack(t *testing.T) {
 	env := baseEnv()
-	env.port = 50000 // server bound a different port
+	env.fellBack = true // the requested port failed to bind; the server moved
+	env.requestedPort = 47800
+	env.port = 50000
 	c := checkPeerPort(context.Background(), env)
 	if c.Status != StatusWarn || !strings.Contains(c.Detail, "50000") {
 		t.Fatalf("got %+v, want warn about the fallback port", c)
+	}
+}
+
+// A --port flag that differs from the settings value is not a fallback and must
+// not warn.
+func TestPeerPortNoFalseWarning(t *testing.T) {
+	env := baseEnv()
+	env.requestedPort = 12345 // --port override
+	env.port = 12345
+	env.fellBack = false
+	if c := checkPeerPort(context.Background(), env); c.Status != StatusOK {
+		t.Fatalf("got %+v, want ok", c)
 	}
 }
 

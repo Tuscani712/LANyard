@@ -210,3 +210,24 @@ func TestAddDismissSnippet(t *testing.T) {
 		t.Fatal("dismissing an unknown snippet must fail")
 	}
 }
+
+func TestFreeSpaceUsesNearestExistingParent(t *testing.T) {
+	base := t.TempDir()
+	missing := filepath.Join(base, "Inbox", "nested")
+	if got := FreeSpace(missing); got <= 0 {
+		t.Fatalf("FreeSpace(%q) = %d, want > 0 (measure the existing parent)", missing, got)
+	}
+}
+
+func TestNearestExistingDir(t *testing.T) {
+	base := t.TempDir()
+	if got := nearestExistingDir(filepath.Join(base, "a", "b")); got != base {
+		t.Fatalf("nearestExistingDir(nonexistent) = %q, want %q", got, base)
+	}
+	if got := nearestExistingDir(base); got != base {
+		t.Fatalf("nearestExistingDir(existing) = %q, want %q", got, base)
+	}
+	if got := nearestExistingDir(""); got != "" {
+		t.Fatalf("nearestExistingDir(\"\") = %q, want \"\"", got)
+	}
+}

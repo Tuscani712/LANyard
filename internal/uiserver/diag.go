@@ -21,11 +21,11 @@ type diagEnv struct {
 	device string
 }
 
-func (e diagEnv) ConfiguredPeerPort() int {
-	if e.s.d.Cfg == nil {
+func (e diagEnv) RequestedPeerPort() int {
+	if e.s.d.Self == nil {
 		return 0
 	}
-	return e.s.d.Cfg.Get().PeerPort
+	return e.s.d.Self().PeerPortRequested
 }
 
 func (e diagEnv) PeerPort() int {
@@ -33,6 +33,13 @@ func (e diagEnv) PeerPort() int {
 		return 0
 	}
 	return e.s.d.Self().PeerPort
+}
+
+func (e diagEnv) PeerPortFallback() bool {
+	if e.s.d.Self == nil {
+		return false
+	}
+	return e.s.d.Self().PeerPortFallback
 }
 
 func (e diagEnv) LocalAddrs() []string { return lanaddr.Addrs() }

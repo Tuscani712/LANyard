@@ -62,9 +62,11 @@ type Server struct {
 	log       *slog.Logger
 	// mu guards srv and port, which Listen and Serve write while Shutdown and
 	// Port may read from other goroutines.
-	mu   sync.Mutex
-	srv  *http.Server
-	port int
+	mu        sync.Mutex
+	srv       *http.Server
+	port      int
+	requested int  // the port Listen was asked for
+	fellBack  bool // Listen could not bind requested and used a random port
 }
 
 func NewServer(id *identity.Identity, hello func() discovery.Hello, sh *shares.Manager, tr *trust.Store, auth Authorizer, log *slog.Logger) *Server {
@@ -84,15 +86,19 @@ func (s *Server) tlsConfig() *tls.Config {
 // Listen binds the preferred port, falling back to any free port.
 func (s *Server) Listen(preferred int) (net.Listener, error) {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", preferred))
+	fellBack := false
 	if err != nil {
 		s.log.Info("preferred port unavailable, choosing a random one", "port", preferred, "err", err)
 		ln, err = net.Listen("tcp", ":0")
 		if err != nil {
 			return nil, err
 		}
+		fellBack = true
 	}
 	s.mu.Lock()
 	s.port = ln.Addr().(*net.TCPAddr).Port
+	s.requested = preferred
+	s.fellBack = fellBack
 	s.mu.Unlock()
 	return ln, nil
 }
@@ -101,6 +107,22 @@ func (s *Server) Port() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.port
+}
+
+// RequestedPort is the port Listen was asked for (settings or --port). It may
+// differ from Port() only when PortFellBack reports true.
+func (s *Server) RequestedPort() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.requested
+}
+
+// PortFellBack reports whether the requested port was unavailable and a random
+// one was used instead.
+func (s *Server) PortFellBack() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fellBack
 }
 
 func (s *Server) Serve(ln net.Listener) error {

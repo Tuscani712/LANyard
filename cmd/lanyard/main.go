@@ -460,6 +460,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 				Name: cur.DeviceName, DeviceID: id.DeviceID, Pretty: identity.Pretty(id.DeviceID),
 				GeneratedLabel: gen, DeviceLabel: label,
 				OS: runtime.GOOS, PeerPort: peerSrv.Port(), Version: version,
+				PeerPortRequested: peerSrv.RequestedPort(), PeerPortFallback: peerSrv.PortFellBack(),
 			}
 		},
 		Peers:     disc.Peers,
