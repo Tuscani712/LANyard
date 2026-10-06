@@ -2,10 +2,12 @@
 
 > **Protocol:** Claude Code and opencode take turns. Whoever finishes a turn **overwrites this whole file** with the current state (keep it short and accurate), and sets "Last updated by" and "Next agent". Read `p2p_file_transfer_specification_v2.md` for the design; this file is only the current state.
 
-- **Last updated by:** Claude Code, 2026-10-05
+- **Last updated by:** Claude Code (Sonnet 5.5), 2026-10-06, branch `ubuntu` (local, not pushed)
 - **Next agent:** opencode
-- **Milestone just finished:** two-machine test feedback: notifications, native file dialogs, receiver-side cancel, Shared with me, minimize to tray.
-- **Next:** re-test on two machines; remaining items in the lists at the bottom.
+- **Milestone just finished:** Linux port: native WebKitGTK window, D-Bus tray, GTK file chooser, `--data-dir` before the command fixed.
+- **Next:** test on GNOME/Wayland and on a real second machine (Windows <-> Ubuntu); merge `ubuntu` after Meatbag approves.
+- **Linux files:** `cmd/lanyard/nativeui_linux.go` (cgo GTK3 + webkit2gtk-4.1; window, SIGUSR2 raise, file chooser via `uiserver.PickHook`), `tray_linux.go` (pure-Go godbus SNI + dbusmenu), `nativeui_other.go`/`tray_other.go` are the fallbacks. SIGUSR1 is reserved by WebKit's JS engine; do not use it. Closing the window quits unless `minimize_to_tray` is on and a tray host registered.
+- **Linux tested here:** two local instances pair + pull a 5 MB file (hash ok); window renders; picker cancel; hide-to-tray, tray Activate/Quit, second launch raises window (KDE X11). Not tested: push, mount, GNOME, Wayland.
 
 ## Environment
 - Go 1.27.0 (default install in Program Files\Go\bin; `build.ps1` finds it even if it is not on PATH. For plain `go` in a non-interactive shell: `$env:Path += ";$env:ProgramFiles\Go\bin"`).

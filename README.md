@@ -133,6 +133,16 @@ scripts); the program is a single static executable with the UI embedded. Window
 the taskbar and the browser tab) and a **system-tray icon** (left-click to open the window, right-click to quit;
 `--no-tray` to skip it). Tests: `go test ./...`; end-to-end scripts are `dist\itest*.ps1`.
 
+## Linux
+
+On Linux the program opens in its own window (an embedded WebKitGTK view, same UI as Windows), has a system-tray
+icon (StatusNotifierItem: KDE, XFCE, GNOME with the AppIndicator extension) and uses the desktop's own file dialogs.
+With no display (ssh, servers) it runs headless, or `--web` uses the browser.
+
+* **Run:** needs `libwebkit2gtk-4.1-0` and GTK 3 (`sudo apt install libwebkit2gtk-4.1-0`; present on most desktops).
+* **Build:** `sudo apt install libwebkit2gtk-4.1-dev build-essential`, then `go build -o lanyard ./cmd/lanyard`.
+  This build uses cgo. A cross-compiled (`CGO_ENABLED=0`) Linux binary still works, but opens the browser instead of a window.
+
 ## Where things are stored
 
 Settings, the device key and certificate, trust list and log live in `%APPDATA%\LANyard` (Windows),
@@ -145,4 +155,4 @@ Received pushes go to the Inbox folder, by default `Inbox` inside that folder.
   report what you see.
 * Received files are not encrypted at rest (use your disk's own encryption).
 * Mounting needs an OS component (WebClient on Windows, davfs2 on Linux).
-* The system-tray icon is Windows-only for now.
+* The Linux window needs WebKitGTK installed; the tray needs a desktop with a tray host. Not tested on GNOME or Wayland yet.

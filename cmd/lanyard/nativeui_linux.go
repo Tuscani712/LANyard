@@ -128,6 +128,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"lanyard/internal/uiserver"
@@ -185,7 +186,6 @@ func runNativeUI(opts nativeUIOptions) error {
 	nativeOpen = true
 	uiserver.PickHook = pickNative
 	defer func() { uiserver.PickHook = nil }()
-	C.lan_set_hide_on_close(boolToInt(minimizeToTray.Load() && currentTrayActive()))
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGUSR2)
@@ -193,8 +193,13 @@ func runNativeUI(opts nativeUIOptions) error {
 	defer close(stop)
 	defer signal.Stop(sig)
 	go func() {
+		// The hide-on-close flag follows the setting live; GTK reads it in delete-event.
+		tick := time.NewTicker(500 * time.Millisecond)
+		defer tick.Stop()
 		for {
 			select {
+			case <-tick.C:
+				C.lan_set_hide_on_close(boolToInt(minimizeToTray.Load() && trayActive.Load()))
 			case <-sig:
 				C.lan_show()
 			case <-opts.Done:
@@ -222,9 +227,6 @@ func boolToInt(b bool) C.int {
 	}
 	return 0
 }
-
-// currentTrayActive is false until the Linux tray exists.
-func currentTrayActive() bool { return false }
 
 var pickMu sync.Mutex
 
