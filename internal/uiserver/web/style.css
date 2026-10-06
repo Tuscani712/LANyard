@@ -49,6 +49,7 @@ svg { display: block; }
 .brand span { color: var(--muted); }
 #tb-drag { flex: 1; }
 .win-btns { display: flex; align-items: stretch; }
+.win-btns[hidden] { display: none; }
 .wbtn { width: 46px; border: 0; background: transparent; color: #c3ccd9; display: grid; place-items: center; cursor: default; }
 .wbtn:hover { background: var(--hover); }
 .wbtn.close:hover { background: #c0392b; color: #fff; }
