@@ -57,7 +57,7 @@ func main() {
 	var (
 		dataDir   = flag.String("data-dir", "", "data directory (default: per-user config dir)")
 		noBrowser = flag.Bool("no-browser", false, "run headless (no window, no browser)")
-		webUI     = flag.Bool("web", false, "use the browser UI instead of the native window (Windows)")
+		webUI     = flag.Bool("web", false, "use the browser UI instead of the native window (Windows, Linux)")
 		noTray    = flag.Bool("no-tray", false, "do not show a system tray icon (Windows)")
 		name      = flag.String("name", "", "override device name (saved)")
 		uiPort    = flag.Int("ui-port", 0, "preferred UI port (default 47810)")
@@ -103,7 +103,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 
 	// Which interface this launch will use; recorded in run.json so a second
 	// launch can find/focus an existing window instead of opening a browser.
-	nativeMode := runtime.GOOS == "windows" && !noBrowser && !webUI
+	nativeMode := nativeSupported() && !noBrowser && !webUI
 	uiMode := "headless"
 	if nativeMode {
 		uiMode = "native"
@@ -508,7 +508,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		err := runNativeUI(nativeUIOptions{
 			URL:      ui.URL(),
 			Title:    "LANyard File Transfer",
-			DataPath: filepath.Join(dataDir, "webview2"),
+			DataPath: filepath.Join(dataDir, nativeProfileDir),
 			Done:     ctx.Done(),
 			Log:      log,
 		})
