@@ -14,8 +14,8 @@ android {
         applicationId = "io.github.tuscani712.lanyard"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.1.0-beta.1"
+        versionCode = 2
+        versionName = "0.1.0-beta.2"
     }
 
     // The release key is never in the repository: point LANYARD_KEYSTORE_PROPS at a
