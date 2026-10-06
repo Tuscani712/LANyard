@@ -27,6 +27,9 @@ type Settings struct {
 	// SpeedUnit is "mbs" (MB/s, default) or "mbps".
 	SpeedUnit       string `json:"speed_unit,omitempty"`
 	SoundOnComplete bool   `json:"sound_on_complete,omitempty"`
+	// Notifications shows desktop notifications for an incoming pairing
+	// request and for a finished or failed transfer. Absent means on.
+	Notifications *bool `json:"notifications,omitempty"`
 	// DefaultDownloadFolder prefills the download destination.
 	DefaultDownloadFolder string `json:"default_download_folder,omitempty"`
 	// InboxFolder is where pushes land; empty means <data-dir>/Inbox.
@@ -116,6 +119,12 @@ func Open(dir string) (*Store, error) {
 		s.data.SpeedUnit = "mbs"
 	}
 	return s, nil
+}
+
+// NotificationsEnabled reports whether desktop notifications are on. The
+// setting defaults to on when it has never been set.
+func (s Settings) NotificationsEnabled() bool {
+	return s.Notifications == nil || *s.Notifications
 }
 
 func (s *Store) Dir() string { return s.dir }

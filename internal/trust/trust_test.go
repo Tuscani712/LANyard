@@ -2,6 +2,7 @@ package trust
 
 import (
 	"testing"
+	"time"
 
 	"lanyard/internal/config"
 )
@@ -121,5 +122,34 @@ func TestUpdatePermissions(t *testing.T) {
 	}
 	if st.UpdatePermissions("nobody", Permissions{}) {
 		t.Error("updating an unknown fingerprint should fail")
+	}
+}
+
+func TestIncomingSessionFiresCallback(t *testing.T) {
+	st := newStore(t)
+	got := make(chan string, 1)
+	st.SetOnIncoming(func(sess *Session) { got <- sess.Mode })
+	if _, err := st.CreateIncoming(ModePair, "peer-fp", "Bob", "bob-dev", "nonceA", Permissions{}); err != nil {
+		t.Fatalf("CreateIncoming: %v", err)
+	}
+	select {
+	case mode := <-got:
+		if mode != ModePair {
+			t.Fatalf("callback mode = %q, want %q", mode, ModePair)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("onIncoming was not called for an incoming request")
+	}
+}
+
+func TestOutgoingSessionDoesNotFireCallback(t *testing.T) {
+	st := newStore(t)
+	got := make(chan struct{}, 1)
+	st.SetOnIncoming(func(*Session) { got <- struct{}{} })
+	st.CreateOutgoing(ModeConnect, "peer-fp", "Bob", "bob-dev", Permissions{})
+	select {
+	case <-got:
+		t.Fatal("onIncoming must not fire for an outgoing request")
+	case <-time.After(50 * time.Millisecond):
 	}
 }

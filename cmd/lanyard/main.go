@@ -24,6 +24,7 @@ import (
 	"lanyard/internal/identity"
 	"lanyard/internal/inbox"
 	"lanyard/internal/mount"
+	"lanyard/internal/notify"
 	"lanyard/internal/peerapi"
 	"lanyard/internal/shares"
 	"lanyard/internal/transfer"
@@ -133,6 +134,9 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		_ = cfg.Update(func(s *config.Settings) { s.DeviceName = name })
 	}
 	st := cfg.Get()
+	// Desktop notifications are on unless the person turned them off. The
+	// setting is read at send time so a change takes effect without a restart.
+	notifier := notify.New(func() bool { return cfg.Get().NotificationsEnabled() })
 	id, err := identity.LoadOrCreate(dataDir, st.DeviceName)
 	if err != nil {
 		return fmt.Errorf("identity: %w", err)
@@ -189,14 +193,14 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	// resolvePeer turns a certificate fingerprint into a friendly device name;
 	// assigned once discovery exists, and read from the notification callbacks.
 	var resolvePeer func(fp string) string
-	notify := func() {
+	onChange := func() {
 		if ui != nil {
 			ui.Notify()
 		}
 	}
 
 	// Shares and their expiry scheduler.
-	shMgr := shares.New(cfg, id.DeviceID, notify)
+	shMgr := shares.New(cfg, id.DeviceID, onChange)
 	if err := shMgr.Load(); err != nil {
 		return err
 	}
@@ -205,13 +209,13 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	defer close(shStop)
 
 	// Transfer jobs.
-	trMgr := transfer.New(cfg, client, log, 3, notify)
+	trMgr := transfer.New(cfg, client, log, 3, onChange)
 	if err := trMgr.Load(); err != nil {
 		return err
 	}
 
 	// Trust store and Connect/Pair sessions.
-	trustStore := trust.New(cfg, id.DeviceID, notify)
+	trustStore := trust.New(cfg, id.DeviceID, onChange)
 	if err := trustStore.Load(); err != nil {
 		return err
 	}
@@ -222,7 +226,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	// Peer service (mutual TLS). Authorization always comes from the trust
 	// store; there is no bypass in a shipped build.
 	var auth peerapi.Authorizer = trustStore
-	inboxMgr := inbox.New(inboxDir(dataDir, st.InboxFolder), notify)
+	inboxMgr := inbox.New(inboxDir(dataDir, st.InboxFolder), onChange)
 	trMgr.SetBandwidthLimit(st.BandwidthLimitMBps)
 	var peerSrv *peerapi.Server
 	hello := func() discovery.Hello {
@@ -238,19 +242,20 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	}
 	peerSrv = peerapi.NewServer(id, hello, shMgr, trustStore, auth, log)
 	peerSrv.SetInbox(inboxMgr)
-	approvals := approval.New(notify)
+	approvals := approval.New(onChange)
 	peerSrv.SetApprovals(approvals)
 
 	// A Connect session is for a single transfer: when one finishes, end the
 	// session on both sides unless "Keep connected" was chosen. The same event
 	// tells the person their download or send finished (or failed).
 	trMgr.SetOnDone(func(ji transfer.JobInfo) {
-		if ui == nil {
-			return
-		}
 		peer := ji.PeerName
 		if peer == "" && resolvePeer != nil {
 			peer = resolvePeer(ji.PeerID)
+		}
+		notifier.Notify(notify.Notice{Title: "LANyard", Body: transferDoneText(ji.Direction, peer, ji.Files)})
+		if ui == nil {
+			return
 		}
 		kind := "download"
 		if ji.Direction == "push" {
@@ -262,12 +267,13 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		client.EndConnectAfterTransfer(ctx, trustStore, ji.PeerID, ji.Host, ji.Port)
 	})
 	trMgr.SetOnFail(func(ji transfer.JobInfo) {
-		if ui == nil {
-			return
-		}
 		peer := ji.PeerName
 		if peer == "" && resolvePeer != nil {
 			peer = resolvePeer(ji.PeerID)
+		}
+		notifier.Notify(notify.Notice{Title: "LANyard", Body: transferFailText(ji.Direction, peer)})
+		if ui == nil {
+			return
 		}
 		kind := "download-failed"
 		if ji.Direction == "push" {
@@ -324,6 +330,23 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		if ui != nil {
 			ui.NotifyUser(uiserver.Notice{Kind: "receive", Peer: resolvePeer(peerFP), Files: files, Total: total})
 		}
+	})
+
+	// A device asking to Connect or Pair is shown even when the window is not
+	// focused; the request itself is still answered in the UI.
+	trustStore.SetOnIncoming(func(sess *trust.Session) {
+		who := sess.PeerName
+		if who == "" && resolvePeer != nil {
+			who = resolvePeer(sess.PeerFP)
+		}
+		if who == "" {
+			who = "A device"
+		}
+		action := "wants to connect"
+		if sess.Mode == trust.ModePair {
+			action = "wants to pair"
+		}
+		notifier.Notify(notify.Notice{Title: "LANyard", Body: who + " " + action})
 	})
 
 	// When a peer (re)appears, refresh its jobs' address and retry at once.
@@ -606,6 +629,37 @@ func setStartOnLogin(dataDir string, enable bool) error {
 		args = append(args, "--data-dir", dataDir)
 	}
 	return autostart.Enable(exe, args...)
+}
+
+// transferDoneText is the body of a finished-transfer desktop notification.
+func transferDoneText(direction, peer string, files int) string {
+	act, prep := "Received", "from"
+	if direction == "push" {
+		act, prep = "Sent", "to"
+	}
+	return fmt.Sprintf("%s %d %s %s %s", act, files, fileWord(files), prep, peerOrDevice(peer))
+}
+
+// transferFailText is the body of a failed-transfer desktop notification.
+func transferFailText(direction, peer string) string {
+	if direction == "push" {
+		return "Sending to " + peerOrDevice(peer) + " failed"
+	}
+	return "Download from " + peerOrDevice(peer) + " failed"
+}
+
+func peerOrDevice(peer string) string {
+	if peer == "" {
+		return "a device"
+	}
+	return peer
+}
+
+func fileWord(n int) string {
+	if n == 1 {
+		return "file"
+	}
+	return "files"
 }
 
 // hoistDataDir moves a leading `--data-dir X` / `--data-dir=X` after the

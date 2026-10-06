@@ -19,6 +19,7 @@ type settingsView struct {
 	Theme                 string        `json:"theme"`
 	SpeedUnit             string        `json:"speed_unit"`
 	SoundOnComplete       bool          `json:"sound_on_complete"`
+	Notifications         bool          `json:"notifications"`
 	DefaultDownloadFolder string        `json:"default_download_folder"`
 	InboxFolder           string        `json:"inbox_folder"`
 	PeerPort              int           `json:"peer_port"`
@@ -43,6 +44,7 @@ func (s *Server) settingsView() settingsView {
 		DeviceName: st.DeviceName, DeviceIDLabel: st.DeviceIDLabel,
 		Fingerprint: self.DeviceID, GeneratedLabel: generated,
 		Theme: st.Theme, SpeedUnit: st.SpeedUnit, SoundOnComplete: st.SoundOnComplete,
+		Notifications:         st.NotificationsEnabled(),
 		DefaultDownloadFolder: st.DefaultDownloadFolder, InboxFolder: st.InboxFolder,
 		PeerPort: st.PeerPort, BandwidthLimitMBps: st.BandwidthLimitMBps,
 	}
@@ -80,6 +82,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		Theme                 *string `json:"theme"`
 		SpeedUnit             *string `json:"speed_unit"`
 		SoundOnComplete       *bool   `json:"sound_on_complete"`
+		Notifications         *bool   `json:"notifications"`
 		DefaultDownloadFolder *string `json:"default_download_folder"`
 		InboxFolder           *string `json:"inbox_folder"`
 		PeerPort              *int    `json:"peer_port"`
@@ -137,6 +140,9 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.SoundOnComplete != nil {
 		next.SoundOnComplete = *req.SoundOnComplete
+	}
+	if req.Notifications != nil {
+		next.Notifications = req.Notifications
 	}
 	if req.DefaultDownloadFolder != nil {
 		next.DefaultDownloadFolder = cleanPath(*req.DefaultDownloadFolder)

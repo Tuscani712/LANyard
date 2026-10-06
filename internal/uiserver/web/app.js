@@ -145,7 +145,7 @@ function smallDeviceIcon(os, size) {
 }
 
 // ---------- state ----------
-let settings = { speed_unit: "mbs", sound_on_complete: false, theme: "dark", default_download_folder: "" };
+let settings = { speed_unit: "mbs", sound_on_complete: false, notifications: true, theme: "dark", default_download_folder: "" };
 // Online means the device answered a recent check (discovery probes every few
 // seconds). A paired device that stops answering stays listed as Offline.
 const seenAt = (() => { try { return JSON.parse(localStorage.getItem("lanyard.seen") || "{}"); } catch (e) { return {}; } })();
@@ -974,6 +974,7 @@ function renderSettings(s) {
   const theme = selectEl([["dark", "Dark"], ["light", "Light"]], s.theme === "light" ? "light" : "dark", "set-theme");
   const speed = selectEl([["mbs", "MB/s"], ["mbps", "Mbps"]], s.speed_unit || "mbs", "set-speed");
   const sound = checkInput(s.sound_on_complete, "set-sound");
+  const notif = checkInput(s.notifications, "set-notif");
   const startup = checkInput(s.start_on_login, "set-startup");
   const dl = textInput(s.default_download_folder, "set-dl");
   const inbox = textInput(s.inbox_folder, "set-inbox"); inbox.placeholder = "default: <data dir>/Inbox";
@@ -987,6 +988,7 @@ function renderSettings(s) {
   box.appendChild(settingsField("Theme", theme));
   box.appendChild(settingsField("Speed unit", speed));
   box.appendChild(settingsField("Sound when a transfer finishes", sound));
+  box.appendChild(settingsField("Show desktop notifications for pairing requests and finished transfers", notif));
   box.appendChild(settingsField("Start LANyard when I sign in", startup));
   if (s.tray_supported) box.appendChild(settingsField("Minimize to system tray (closing or minimizing hides the window; use the tray icon to reopen or quit)", tray));
   box.appendChild(settingsField("Default download folder", withBrowse(dl, "Choose the default download folder")));
@@ -1103,6 +1105,7 @@ async function saveSettings() {
     theme: $("set-theme").value,
     speed_unit: $("set-speed").value,
     sound_on_complete: $("set-sound").checked,
+    notifications: $("set-notif").checked,
     start_on_login: $("set-startup").checked,
     ...($("set-tray") ? { minimize_to_tray: $("set-tray").checked } : {}),
     default_download_folder: $("set-dl").value.trim(),

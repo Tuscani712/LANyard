@@ -120,6 +120,10 @@ type Store struct {
 	cfg      *config.Store
 	selfFP   string
 	onChange func()
+	// onIncoming, when set, is invoked for each incoming Connect/Pair request
+	// so the host can raise a desktop notification. It is called in its own
+	// goroutine and must not block.
+	onIncoming func(*Session)
 
 	mu       sync.RWMutex
 	paired   map[string]*Entry // key: peer fingerprint
@@ -132,6 +136,14 @@ func New(cfg *config.Store, selfFP string, onChange func()) *Store {
 	}
 	return &Store{cfg: cfg, selfFP: selfFP, onChange: onChange,
 		paired: map[string]*Entry{}, sessions: map[string]*Session{}}
+}
+
+// SetOnIncoming registers a callback invoked for each incoming Connect/Pair
+// request. The callback runs in its own goroutine and receives a copy.
+func (s *Store) SetOnIncoming(fn func(*Session)) {
+	s.mu.Lock()
+	s.onIncoming = fn
+	s.mu.Unlock()
 }
 
 // Load restores paired entries from config.
@@ -330,6 +342,10 @@ func (s *Store) CreateIncoming(mode, peerFP, peerName, peerDevice, peerNonce str
 		CreatedAt: now, UpdatedAt: now,
 	}
 	s.sessions[sess.ID] = sess
+	if fn := s.onIncoming; fn != nil {
+		snap := *sess
+		go fn(&snap)
+	}
 	go s.onChange()
 	return sess, nil
 }
