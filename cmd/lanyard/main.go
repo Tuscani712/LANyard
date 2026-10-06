@@ -45,11 +45,13 @@ type runInfo struct {
 func main() {
 	attachParentConsole()
 	// Subcommands talk to the running instance; anything else starts the server.
-	if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
-		if runCLI(os.Args[1], os.Args[2:]) {
+	// A leading --data-dir is allowed before the command (README), so hoist it.
+	args := hoistDataDir(os.Args[1:])
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		if runCLI(args[0], args[1:]) {
 			return
 		}
-		fmt.Fprintf(os.Stderr, "unknown command %q\nusage: lanyard [server flags] | peers | share add <path> | get <peer> <share> [dest] | settings get|set | mount add|list|remove | shares cancel-all | update status|check|download\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unknown command %q\nusage: lanyard [server flags] | peers | share add <path> | get <peer> <share> [dest] | settings get|set | mount add|list|remove | shares cancel-all | update status|check|download\n", args[0])
 		os.Exit(2)
 	}
 	var (
@@ -604,4 +606,30 @@ func setStartOnLogin(dataDir string, enable bool) error {
 		args = append(args, "--data-dir", dataDir)
 	}
 	return autostart.Enable(exe, args...)
+}
+
+// hoistDataDir moves a leading `--data-dir X` / `--data-dir=X` after the
+// command word, so `lanyard --data-dir X peers` behaves like
+// `lanyard peers --data-dir X`. Server invocations (no command) are unchanged.
+func hoistDataDir(args []string) []string {
+	var lead []string
+	i := 0
+	for i < len(args) {
+		switch {
+		case args[i] == "--data-dir" && i+1 < len(args):
+			lead = append(lead, args[i], args[i+1])
+			i += 2
+		case strings.HasPrefix(args[i], "--data-dir="):
+			lead = append(lead, args[i])
+			i++
+		default:
+			goto done
+		}
+	}
+done:
+	if len(lead) == 0 || i >= len(args) || strings.HasPrefix(args[i], "-") {
+		return args
+	}
+	out := append([]string{args[i]}, args[i+1:]...)
+	return append(out, lead...)
 }
