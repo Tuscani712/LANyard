@@ -29,6 +29,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.tuscani712.lanyard.SettingsHolder
+import io.github.tuscani712.lanyard.core.SpeedUnit
+import io.github.tuscani712.lanyard.core.formatSpeed
 import io.github.tuscani712.lanyard.transfer.TransferManager
 import io.github.tuscani712.lanyard.transfer.TransferRecord
 import io.github.tuscani712.lanyard.transfer.TransferState
@@ -36,6 +39,7 @@ import io.github.tuscani712.lanyard.transfer.TransferState
 @Composable
 fun TransfersScreen(padding: PaddingValues) {
     val records by TransferManager.state.collectAsStateWithLifecycle()
+    val settings by SettingsHolder.settings.collectAsStateWithLifecycle()
 
     if (records.isEmpty()) {
         Column(
@@ -50,13 +54,13 @@ fun TransfersScreen(padding: PaddingValues) {
 
     LazyColumn(modifier = Modifier.fillMaxSize().padding(padding)) {
         items(records, key = { it.id }) { record ->
-            TransferRow(record, onCancel = { TransferManager.cancel(record.id) })
+            TransferRow(record, settings.speedUnit, onCancel = { TransferManager.cancel(record.id) })
         }
     }
 }
 
 @Composable
-private fun TransferRow(record: TransferRecord, onCancel: () -> Unit) {
+private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: () -> Unit) {
     Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -87,8 +91,13 @@ private fun TransferRow(record: TransferRecord, onCancel: () -> Unit) {
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Spacer(Modifier.height(4.dp))
+                val speed = if (record.state == TransferState.Running && record.speed > 0) {
+                    " · " + formatSpeed(record.speed, speedUnit)
+                } else {
+                    ""
+                }
                 Text(
-                    "${humanSize(record.done)} / ${humanSize(record.total)}",
+                    "${humanSize(record.done)} / ${humanSize(record.total)}$speed",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

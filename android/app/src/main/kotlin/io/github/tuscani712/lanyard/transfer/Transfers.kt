@@ -35,11 +35,13 @@ data class TransferRecord(
     val id: String,
     val direction: String, // "send" | "receive"
     val peerName: String,
+    val peerFingerprint: String = "",
     val label: String,
     val total: Long,
     val done: Long,
     val state: TransferState,
     val message: String? = null,
+    val speed: Double = 0.0, // bytes per second, smoothed
     val startedAt: Long,
 )
 
@@ -63,6 +65,7 @@ object TransferManager {
     val state: StateFlow<List<TransferRecord>> = _state.asStateFlow()
 
     private val cancels = HashMap<String, AtomicBoolean>()
+    private val speedSamples = java.util.concurrent.ConcurrentHashMap<String, SpeedSample>()
 
     fun init(application: Application) {
         app = application
@@ -77,6 +80,14 @@ object TransferManager {
 
     fun cancelAllRunning() {
         cancels.values.forEach { it.set(true) }
+    }
+
+    /** Cancels every running or queued transfer to the peer with [fingerprint]. */
+    fun cancelForPeer(fingerprint: String) {
+        _state.value
+            .filter { it.peerFingerprint.equals(fingerprint, ignoreCase = true) }
+            .filter { it.state == TransferState.Running || it.state == TransferState.Queued }
+            .forEach { cancels[it.id]?.set(true) }
     }
 
     fun clearFinished() {
@@ -96,7 +107,7 @@ object TransferManager {
 
     fun enqueuePush(peer: PairedPeer, sources: List<PushSource>, label: String): String {
         val id = newId()
-        add(TransferRecord(id, "send", peer.name, label, sources.sumOf { it.size }, 0, TransferState.Queued, null, now()))
+        add(TransferRecord(id, "send", peer.name, peer.fingerprint, label, sources.sumOf { it.size }, 0, TransferState.Queued, null, 0.0, now()))
         TransferService.start(app)
         scope.launch { runPush(id, peer, sources) }
         return id
@@ -104,7 +115,7 @@ object TransferManager {
 
     fun enqueueDownload(peer: PairedPeer, shareId: String, path: String, label: String, tree: Uri): String {
         val id = newId()
-        add(TransferRecord(id, "receive", peer.name, label, 0, 0, TransferState.Queued, null, now()))
+        add(TransferRecord(id, "receive", peer.name, peer.fingerprint, label, 0, 0, TransferState.Queued, null, 0.0, now()))
         TransferService.start(app)
         scope.launch { runDownload(id, peer, shareId, path, tree) }
         return id
@@ -121,7 +132,8 @@ object TransferManager {
                 sources = sources,
                 onProgress = { index, bytes, _ ->
                     sent[index] = bytes
-                    update(id) { it.copy(done = sent.sum()) }
+                    val done = sent.sum()
+                    update(id) { it.copy(done = done, total = maxOf(it.total, done), speed = sampleSpeed(id, done)) }
                 },
                 isCancelled = { cancel.get() },
             )
@@ -149,7 +161,8 @@ object TransferManager {
                 },
                 onProgress = { index, file, received, total ->
                     sent[index] = received
-                    update(id) { it.copy(done = sent.values.sum(), total = maxOf(it.total, total)) }
+                    val done = sent.values.sum()
+                    update(id) { it.copy(done = done, total = maxOf(it.total, total, done), speed = sampleSpeed(id, done)) }
                 },
                 isCancelled = { cancel.get() },
             )
@@ -230,14 +243,39 @@ object TransferManager {
     }
 
     private fun complete(id: String, message: String, state: TransferState = TransferState.Done) {
-        update(id) { it.copy(state = state, message = message, done = if (state == TransferState.Done) it.total else it.done) }
+        update(id) { it.copy(state = state, message = message, speed = 0.0, done = if (state == TransferState.Done) it.total else it.done) }
         persist()
+        speedSamples.remove(id)
+        if (state == TransferState.Done) notifyCompletion(id)
     }
 
     private fun fail(id: String, message: String) {
-        update(id) { it.copy(state = TransferState.Failed, message = message) }
+        update(id) { it.copy(state = TransferState.Failed, message = message, speed = 0.0) }
         persist()
+        speedSamples.remove(id)
+        notifyCompletion(id)
     }
+
+    /** Posts a finished/failed notification, honoring the user's setting. */
+    private fun notifyCompletion(id: String) {
+        val record = _state.value.firstOrNull { it.id == id } ?: return
+        runCatching { TransferNotifications.completion(app, record) }
+    }
+
+    private fun sampleSpeed(id: String, done: Long): Double {
+        val at = now()
+        val sample = speedSamples.getOrPut(id) { SpeedSample(done, at, 0.0) }
+        val dt = (at - sample.at) / 1000.0
+        if (dt >= 0.4) {
+            val instant = (done - sample.bytes).coerceAtLeast(0) / dt
+            sample.ema = if (sample.ema <= 0.0) instant else sample.ema * 0.6 + instant * 0.4
+            sample.bytes = done
+            sample.at = at
+        }
+        return sample.ema
+    }
+
+    private class SpeedSample(var bytes: Long, var at: Long, var ema: Double)
 
     private fun newId(): String {
         val buf = ByteArray(6)

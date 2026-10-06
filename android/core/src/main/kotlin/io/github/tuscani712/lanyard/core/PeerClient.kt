@@ -219,6 +219,13 @@ class PeerClient(
         return requestJson("POST", "/snippet", body.toString())
     }
 
+    /**
+     * Asks the peer to drop us from its trust store, so an unpair on this phone
+     * also removes it there. The peer only ever drops the caller's own entry, so
+     * this needs no extra authorization and is safe to repeat.
+     */
+    fun revokeTrust(): JsonObject = requestJson("POST", "/trust/revoke", "{}")
+
     fun listShares(): List<JsonObject> = requestArray("GET", "/shares").map { it.asJsonObject }
 
     fun tree(shareId: String, path: String): List<JsonObject> =

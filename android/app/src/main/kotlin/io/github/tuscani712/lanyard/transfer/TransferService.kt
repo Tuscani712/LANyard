@@ -1,7 +1,6 @@
 package io.github.tuscani712.lanyard.transfer
 
 import android.app.Notification
-import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
@@ -13,6 +12,8 @@ import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import io.github.tuscani712.lanyard.SettingsHolder
+import io.github.tuscani712.lanyard.core.formatSpeed
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -31,7 +32,7 @@ class TransferService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        createChannel()
+        TransferChannels.ensure(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -68,7 +69,11 @@ class TransferService : Service() {
         val sending = active.any { it.direction == "send" }
         val text = when {
             active.isEmpty() -> "Preparing…"
-            active.size == 1 -> (if (sending) "Sending " else "Receiving ") + active[0].label
+            active.size == 1 -> {
+                val a = active[0]
+                val speed = if (a.speed > 0) " · " + formatSpeed(a.speed, SettingsHolder.settings.value.speedUnit) else ""
+                (if (sending) "Sending " else "Receiving ") + a.label + speed
+            }
             else -> "${active.size} transfers"
         }
         val cancel = PendingIntent.getBroadcast(
@@ -76,7 +81,7 @@ class TransferService : Service() {
             Intent(this, TransferCancelReceiver::class.java).setAction(TransferCancelReceiver.ACTION_CANCEL),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
-        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, TransferChannels.PROGRESS)
             .setSmallIcon(if (sending) android.R.drawable.stat_sys_upload else android.R.drawable.stat_sys_download)
             .setContentTitle("LANyard")
             .setContentText(text)
@@ -92,19 +97,7 @@ class TransferService : Service() {
         return builder.build()
     }
 
-    private fun createChannel() {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val manager = ContextCompat.getSystemService(this, NotificationManager::class.java) ?: return
-        if (manager.getNotificationChannel(CHANNEL_ID) != null) return
-        val channel = NotificationChannel(CHANNEL_ID, "Transfers", NotificationManager.IMPORTANCE_LOW).apply {
-            description = "File transfers in progress"
-            setShowBadge(false)
-        }
-        manager.createNotificationChannel(channel)
-    }
-
     companion object {
-        private const val CHANNEL_ID = "lanyard.transfers"
         private const val NOTIFICATION_ID = 0x1a4
 
         fun start(context: Context) {

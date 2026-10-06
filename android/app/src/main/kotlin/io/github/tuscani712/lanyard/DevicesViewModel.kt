@@ -136,6 +136,36 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
 
     fun dismissPairing() = _state.update { it.copy(pairing = null) }
 
+    /**
+     * Removes a pairing. The peer is told to drop us too (best effort: it may be
+     * offline, and the local unpair still stands), the local trust entry is
+     * always removed, running transfers to it are cancelled, and the paired and
+     * open-detail state is refreshed.
+     */
+    fun unpair(peer: PairedPeer) {
+        viewModelScope.launch {
+            val identity = IdentityHolder.identity
+            withContext(Dispatchers.IO) {
+                if (identity != null) {
+                    runCatching {
+                        PeerClient(peer.host, peer.port, identity, peer.fingerprint).revokeTrust()
+                    }
+                }
+                store.remove(peer.fingerprint)
+                TransferManager.cancelForPeer(peer.fingerprint)
+            }
+            _state.update { current ->
+                val detail = current.detail
+                if (detail != null && detail.peer.fingerprint.equals(peer.fingerprint, ignoreCase = true)) {
+                    current.copy(detail = null)
+                } else {
+                    current
+                }
+            }
+            refreshPaired()
+        }
+    }
+
     fun openPeer(peer: PairedPeer) {
         _state.update { it.copy(detail = PeerDetail(peer = peer, loading = true)) }
         viewModelScope.launch {
