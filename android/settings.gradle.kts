@@ -17,3 +17,4 @@ dependencyResolutionManagement {
 rootProject.name = "lanyard-android"
 
 include(":core")
+include(":app")

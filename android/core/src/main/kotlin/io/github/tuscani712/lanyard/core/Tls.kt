@@ -1,6 +1,5 @@
 package io.github.tuscani712.lanyard.core
 
-import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.jsse.provider.BouncyCastleJsseProvider
 import java.net.InetAddress
 import java.net.Socket
@@ -8,7 +7,6 @@ import java.security.Principal
 import java.security.PrivateKey
 import java.security.Provider
 import java.security.SecureRandom
-import java.security.Security
 import java.security.cert.CertificateException
 import java.security.cert.X509Certificate
 import javax.net.ssl.SSLEngine
@@ -33,9 +31,9 @@ import javax.net.ssl.X509ExtendedTrustManager
  * written to an impersonating peer.
  */
 object Tls {
-    /** The BouncyCastle JSSE provider, with the BC provider registered. */
+    /** The BouncyCastle JSSE provider, with the full BC provider installed. */
     val provider: Provider by lazy {
-        if (Security.getProvider("BC") == null) Security.addProvider(BouncyCastleProvider())
+        installBouncyCastle()
         BouncyCastleJsseProvider()
     }
 

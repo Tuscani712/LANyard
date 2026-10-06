@@ -10,7 +10,6 @@ import org.bouncycastle.asn1.x509.KeyPurposeId
 import org.bouncycastle.asn1.x509.KeyUsage
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter
 import org.bouncycastle.cert.jcajce.JcaX509v3CertificateBuilder
-import org.bouncycastle.jce.provider.BouncyCastleProvider
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder
 import java.io.File
 import java.math.BigInteger
@@ -20,7 +19,6 @@ import java.security.MessageDigest
 import java.security.PrivateKey
 import java.security.Provider
 import java.security.SecureRandom
-import java.security.Security
 import java.security.cert.CertificateFactory
 import java.security.cert.X509Certificate
 import java.security.spec.PKCS8EncodedKeySpec
@@ -46,7 +44,7 @@ class Identity(
     fun privateKeyPkcs8(): ByteArray = privateKey.encoded
 
     companion object {
-        private val PROVIDER: Provider = ensureBouncyCastle()
+        private val PROVIDER: Provider = installBouncyCastle()
 
         /** Generates a new identity; the subject mirrors the Go implementation. */
         fun generate(deviceName: String): Identity {
@@ -80,9 +78,9 @@ class Identity(
 
         /** Rebuilds an identity from a PKCS#8 key and a DER certificate. */
         fun fromEncoded(privateKeyPkcs8: ByteArray, certificateDer: ByteArray): Identity {
-            val keyFactory = KeyFactory.getInstance("Ed25519")
+            val keyFactory = KeyFactory.getInstance("Ed25519", PROVIDER)
             val privateKey = keyFactory.generatePrivate(PKCS8EncodedKeySpec(privateKeyPkcs8))
-            val certificate = CertificateFactory.getInstance("X.509")
+            val certificate = CertificateFactory.getInstance("X.509", PROVIDER)
                 .generateCertificate(certificateDer.inputStream()) as X509Certificate
             return Identity(certificate, privateKey)
         }
@@ -92,13 +90,6 @@ class Identity(
             val digest = MessageDigest.getInstance("SHA-256")
                 .digest(certificate.publicKey.encoded)
             return digest.joinToString("") { "%02x".format(it) }
-        }
-
-        private fun ensureBouncyCastle(): Provider {
-            Security.getProvider("BC")?.let { return it }
-            val provider = BouncyCastleProvider()
-            Security.addProvider(provider)
-            return provider
         }
     }
 }

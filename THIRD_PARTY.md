@@ -38,10 +38,12 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
-## Android `:core` (Gradle/Maven dependencies)
+## Android `android/` (Gradle/Maven dependencies)
 
-The Android module under `android/` pulls the following libraries at build time.
+The Android modules under `android/` pull the following libraries at build time.
 Versions are pinned in `android/gradle/libs.versions.toml`.
+
+`:core` (Kotlin/JVM library):
 
 | Library | Version | License | Purpose |
 | :--- | :--- | :--- | :--- |
@@ -55,6 +57,21 @@ Versions are pinned in `android/gradle/libs.versions.toml`.
 | org.jetbrains.kotlin:kotlin-test | 2.0.21 | Apache-2.0 | Test assertions |
 | org.jetbrains.kotlin:kotlin-stdlib / kotlin-gradle-plugin | 2.0.21 | Apache-2.0 | Kotlin/JVM toolchain |
 
-The Android `:app` build (a later task) will use `org.conscrypt:conscrypt-android` (AAR,
-`minSdkVersion=21`; native libraries for arm64-v8a, armeabi-v7a, x86, x86_64) in place of
-`conscrypt-openjdk-uber`.
+`:app` (Android application, Jetpack Compose):
+
+| Library | Version | License | Purpose |
+| :--- | :--- | :--- | :--- |
+| com.android.tools.build:gradle (AGP) | 8.7.3 | Apache-2.0 | Android build tooling |
+| org.jetbrains.kotlin.android / kotlin.plugin.compose | 2.0.21 | Apache-2.0 | Kotlin and Compose compiler Gradle plugins |
+| androidx.core:core-ktx | 1.15.0 | Apache-2.0 | AndroidX core |
+| androidx.activity:activity-compose | 1.9.3 | Apache-2.0 | Compose entry point / `ComponentActivity` |
+| androidx.lifecycle:lifecycle-runtime-ktx | 2.8.7 | Apache-2.0 | Lifecycle runtime |
+| androidx.compose:compose-bom | 2024.12.01 | Apache-2.0 | Aligns Compose artifact versions |
+| androidx.compose.ui:ui / ui-tooling-preview / ui-tooling | 1.7.6 (BOM) | Apache-2.0 | Compose UI and previews |
+| androidx.compose.material3:material3 | 1.3.1 (BOM) | Apache-2.0 | Material 3 components |
+| androidx.compose.material:material-icons-extended | 1.7.6 (BOM) | Apache-2.0 | Navigation-bar icons |
+
+The Android `:app` build uses `org.conscrypt:conscrypt-android` at runtime if a
+Conscrypt-based path is ever used (AAR, `minSdkVersion=21`; native libraries for
+arm64-v8a, armeabi-v7a, x86, x86_64). The current TLS path is BouncyCastle JSSE
+(`bctls`), which is pure Java.

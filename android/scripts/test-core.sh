@@ -14,10 +14,10 @@ echo "Building the Go binary (CGO off, headless) into android/build/lanyard"
 export LANYARD_BIN="$android_dir/build/lanyard"
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android}"
 
-# Gradle needs a full JDK 21 (javac), not just a JRE. Use $JAVA_HOME if it is one,
-# else the JDK installed under $ANDROID_HOME/jdk, else the system one.
+# Gradle needs a full JDK 21 (javac), not just a JRE. Use $JAVA_HOME if it is
+# one, else the verified Temurin JDK installed under $ANDROID_HOME/jdk.
 if [ -z "${JAVA_HOME:-}" ] || [ ! -x "${JAVA_HOME}/bin/javac" ]; then
-  for candidate in "$ANDROID_HOME"/jdk/jdk-21* /usr/lib/jvm/java-21-openjdk-amd64; do
+  for candidate in "$ANDROID_HOME"/jdk/jdk-21*; do
     if [ -x "$candidate/bin/javac" ]; then
       export JAVA_HOME="$candidate"
       break
