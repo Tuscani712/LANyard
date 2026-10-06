@@ -24,7 +24,7 @@ class SettingsStoreTest {
         assertFalse(store.load().soundOnComplete)
         assertTrue(store.load().wifiOnly)
         assertNull(store.load().downloadFolder)
-        assertEquals(0, store.load().bandwidthLimitMbps)
+        assertEquals(0, store.load().bandwidthLimitMBps)
     }
 
     @Test
@@ -38,7 +38,7 @@ class SettingsStoreTest {
                 soundOnComplete = true,
                 wifiOnly = false,
                 downloadFolder = "content://com.android.externalstorage.documents/tree/primary%3ADownload",
-                bandwidthLimitMbps = 7,
+                bandwidthLimitMBps = 7,
             ),
         )
 
@@ -49,7 +49,7 @@ class SettingsStoreTest {
         assertTrue(reopened.soundOnComplete)
         assertFalse(reopened.wifiOnly)
         assertEquals("content://com.android.externalstorage.documents/tree/primary%3ADownload", reopened.downloadFolder)
-        assertEquals(7, reopened.bandwidthLimitMbps)
+        assertEquals(7, reopened.bandwidthLimitMBps)
     }
 
     @Test
@@ -70,7 +70,7 @@ class SettingsStoreTest {
         assertFalse(loaded.soundOnComplete)
         assertTrue(loaded.wifiOnly)
         assertNull(loaded.downloadFolder)
-        assertEquals(0, loaded.bandwidthLimitMbps)
+        assertEquals(0, loaded.bandwidthLimitMBps)
     }
 
     @Test

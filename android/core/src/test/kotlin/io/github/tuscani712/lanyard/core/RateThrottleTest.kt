@@ -29,10 +29,10 @@ class RateThrottleTest {
 
     @Test
     fun zeroAndClamps() {
-        assertSame(NoThrottle, RateThrottle.fromMbps(0))
-        assertSame(NoThrottle, RateThrottle.fromMbps(-5))
-        assertEquals(Bandwidth.MAX_MBPS, Bandwidth.clampMbps(99_999_999))
-        assertEquals(0, Bandwidth.clampMbps(-1))
-        assertEquals(5, Bandwidth.clampMbps(5))
+        assertSame(NoThrottle, RateThrottle.fromMBps(0))
+        assertSame(NoThrottle, RateThrottle.fromMBps(-5))
+        assertEquals(Bandwidth.MAX_MBPS, Bandwidth.clampMBps(99_999_999))
+        assertEquals(0, Bandwidth.clampMBps(-1))
+        assertEquals(5, Bandwidth.clampMBps(5))
     }
 }

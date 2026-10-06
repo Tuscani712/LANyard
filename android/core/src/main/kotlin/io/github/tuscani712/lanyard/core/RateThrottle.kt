@@ -14,9 +14,9 @@ object Bandwidth {
     /** Anything above this is treated as unlimited, so a bad setting can't hang. */
     const val MAX_MBPS = 10_000
 
-    fun clampMbps(mbps: Int): Int = mbps.coerceIn(0, MAX_MBPS)
+    fun clampMBps(mbps: Int): Int = mbps.coerceIn(0, MAX_MBPS)
 
-    fun bytesPerSecond(mbps: Int): Long = clampMbps(mbps).toLong() * 1024 * 1024
+    fun bytesPerSecond(mbps: Int): Long = clampMBps(mbps).toLong() * 1024 * 1024
 }
 
 /**
@@ -57,7 +57,7 @@ class RateThrottle(
 
     companion object {
         /** Builds a throttle for a MB/s setting; 0 or below yields [NoThrottle]. */
-        fun fromMbps(
+        fun fromMBps(
             mbps: Int,
             nanoTime: () -> Long = System::nanoTime,
             sleep: (Long) -> Unit = { ms -> Thread.sleep(ms) },

@@ -86,6 +86,7 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
     var confirmClear by remember { mutableStateOf(false) }
     var confirmCancel by remember { mutableStateOf(false) }
     var showLicenses by remember { mutableStateOf(false) }
+    var showTroubleshoot by remember { mutableStateOf(false) }
 
     val folderUri = settings.downloadFolder?.let(Uri::parse)
     val folderName = remember(folderUri) { folderUri?.let { DocumentFile.fromTreeUri(context, it)?.name } }
@@ -105,6 +106,10 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
 
     if (showLicenses) {
         LicensesScreen(padding) { showLicenses = false }
+        return
+    }
+    if (showTroubleshoot) {
+        TroubleshootScreen(padding, vm) { showTroubleshoot = false }
         return
     }
 
@@ -204,8 +209,8 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
                 Text(if (folderUri == null) "Choose" else "Change")
             }
         }
-        BandwidthRow(settings.bandwidthLimitMbps) { mbps ->
-            SettingsHolder.update { it.copy(bandwidthLimitMbps = mbps) }
+        BandwidthRow(settings.bandwidthLimitMBps) { mbps ->
+            SettingsHolder.update { it.copy(bandwidthLimitMBps = mbps) }
         }
         Spacer(Modifier.height(8.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -230,6 +235,7 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
         SectionLabel("About")
         AboutRow()
         Spacer(Modifier.height(8.dp))
+        TextButton(onClick = { showTroubleshoot = true }) { Text("Troubleshoot") }
         TextButton(onClick = { showLicenses = true }) { Text("Third-party licenses") }
     }
 
@@ -404,7 +410,7 @@ private fun BandwidthRow(current: Int, onChange: (Int) -> Unit) {
             onValueChange = { raw ->
                 val digits = raw.filter { it.isDigit() }.take(6)
                 text = digits
-                onChange(Bandwidth.clampMbps(digits.toIntOrNull() ?: 0))
+                onChange(Bandwidth.clampMBps(digits.toIntOrNull() ?: 0))
             },
             singleLine = true,
             suffix = { Text("MB/s") },

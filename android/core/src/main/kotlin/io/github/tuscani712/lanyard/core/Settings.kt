@@ -24,7 +24,7 @@ data class AppSettings(
     /** Persisted SAF tree URI for downloads, or null to ask each time. */
     val downloadFolder: String? = null,
     /** Bandwidth cap in MB/s; 0 means unlimited. */
-    val bandwidthLimitMbps: Int = 0,
+    val bandwidthLimitMBps: Int = 0,
 )
 
 /** Persists [AppSettings]. Implementations must never throw on read. */

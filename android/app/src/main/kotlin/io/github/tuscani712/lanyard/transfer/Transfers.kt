@@ -84,7 +84,7 @@ object TransferManager {
     fun refusal(): String? =
         TransferPolicy.wifiOnlyRefusal(SettingsHolder.settings.value.wifiOnly, meter.isMetered())
 
-    private fun throttle(): Throttle = RateThrottle.fromMbps(SettingsHolder.settings.value.bandwidthLimitMbps)
+    private fun throttle(): Throttle = RateThrottle.fromMBps(SettingsHolder.settings.value.bandwidthLimitMBps)
 
     /** Deletes share-spool files left behind by a crash, on app start. */
     private fun sweepSpool() {
