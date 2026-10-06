@@ -224,6 +224,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/approvals/{id}/reject", s.auth(s.handleApprovalDecide(false)))
 	mux.HandleFunc("GET /api/settings", s.auth(s.handleSettingsGet))
 	mux.HandleFunc("PUT /api/settings", s.auth(s.handleSettingsPut))
+	mux.HandleFunc("GET /api/diagnostics", s.auth(s.handleDiagnostics))
 	mux.HandleFunc("GET /api/update", s.auth(s.handleUpdateStatus))
 	mux.HandleFunc("POST /api/update/check", s.auth(s.handleUpdateCheck))
 	mux.HandleFunc("POST /api/update/download", s.auth(s.handleUpdateDownload))

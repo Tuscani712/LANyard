@@ -1101,6 +1101,7 @@ function renderSettings(s) {
   const msg = el("div", "msg err", ""); msg.hidden = true; msg.id = "set-msg"; box.appendChild(msg);
   const acts = el("div", "actions");
   acts.appendChild(btn("Save", saveSettings));
+  acts.appendChild(btn("Troubleshoot", () => openDiagnostics(), "ghost"));
   acts.appendChild(btn("Cancel all shares", cancelAllShares, "ghost"));
   box.appendChild(acts);
 
@@ -1634,6 +1635,56 @@ function connectEvents() {
   es.onerror = () => { };
 }
 
+// ---------- diagnostics ----------
+let diagReport = "";
+async function openDiagnostics(device) {
+  $("diag").hidden = false;
+  const body = $("diag-body");
+  clear(body); body.appendChild(el("div", "empty", "Running checks\u2026"));
+  const q = device ? "?device=" + encodeURIComponent(device) : "";
+  let j;
+  try {
+    const r = await fetch("/api/diagnostics" + q);
+    if (!r.ok) { clear(body); body.appendChild(el("div", "msg err", (await r.text()).trim())); return; }
+    j = await r.json();
+  } catch (e) { clear(body); body.appendChild(el("div", "msg err", String(e))); return; }
+  diagReport = j.report || "";
+  renderDiag(j.checks || [], device || "");
+}
+function renderDiag(checks, device) {
+  const body = $("diag-body"); clear(body);
+  const targets = shareTargets();
+  if (targets.length) {
+    const row = el("div", "form-row");
+    row.appendChild(el("span", "muted", "Check a device:"));
+    const sel = document.createElement("select"); sel.id = "diag-device";
+    const none = document.createElement("option"); none.value = ""; none.textContent = "Any (skip)"; sel.appendChild(none);
+    for (const t of targets) {
+      const o = document.createElement("option"); o.value = t.id; o.textContent = t.name;
+      if (t.id === device) o.selected = true;
+      sel.appendChild(o);
+    }
+    sel.addEventListener("change", () => openDiagnostics(sel.value));
+    row.appendChild(sel);
+    body.appendChild(row);
+  }
+  const icons = { ok: "\u2713", warn: "!", fail: "\u2715", skip: "\u2013" };
+  const stack = el("div", "stack");
+  for (const c of checks) {
+    const row = el("div", "row col");
+    const top = el("div", "row"); top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
+    top.appendChild(el("span", "badge " + diagClass(c.status), icons[c.status] || "?"));
+    top.appendChild(el("div", "grow name", c.title || c.id));
+    row.appendChild(top);
+    if (c.detail) row.appendChild(el("div", "meta", c.detail));
+    if (c.fix) row.appendChild(el("div", "muted", "Fix: " + c.fix));
+    stack.appendChild(row);
+  }
+  body.appendChild(stack);
+}
+function diagClass(status) { return status === "ok" ? "ok" : status === "warn" ? "warn" : status === "fail" ? "err" : ""; }
+function closeDiag() { $("diag").hidden = true; }
+
 // ---------- settings helpers ----------
 function applyTheme(theme) {
   settings.theme = theme || "dark";
@@ -1688,6 +1739,9 @@ $("stop-all").addEventListener("click", async () => { if (!confirm("Stop every s
 $("clear-finished").addEventListener("click", () => fetch("/api/transfers/clear-history", { method: "POST" }));
 $("pair-close").addEventListener("click", closePair);
 $("pair").addEventListener("click", (e) => { if (e.target === $("pair")) closePair(); });
+$("diag-close").addEventListener("click", closeDiag);
+$("diag").addEventListener("click", (e) => { if (e.target === $("diag")) closeDiag(); });
+$("diag-copy").addEventListener("click", () => copyText(diagReport || ""));
 
 async function submitShare(confirmFlag) {
   const lifetime = $("share-lifetime").value;

@@ -161,6 +161,7 @@ svg { display: block; }
 .badge { font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line-2); color: var(--muted); white-space: nowrap; }
 .badge.ok { color: var(--green); border-color: #1f5132; }
 .badge.warn { color: var(--amber); border-color: #5a4320; }
+.badge.err { color: var(--red); border-color: #6b2530; }
 .muted { color: var(--muted); }
 .section-title { font-size: 15px; font-weight: 600; margin: 4px 0 10px; }
 .form-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
