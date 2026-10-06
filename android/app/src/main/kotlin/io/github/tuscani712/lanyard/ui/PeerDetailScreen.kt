@@ -1,7 +1,10 @@
 package io.github.tuscani712.lanyard.ui
 
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -18,19 +21,30 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.InsertDriveFile
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.tuscani712.lanyard.DevicesViewModel
+import io.github.tuscani712.lanyard.PeerDetail
+import io.github.tuscani712.lanyard.PushUi
 import io.github.tuscani712.lanyard.ShareItem
 import io.github.tuscani712.lanyard.TreeItem
 
@@ -65,7 +79,7 @@ fun PeerDetailScreen(padding: PaddingValues, vm: DevicesViewModel) {
         when {
             detail.loading -> CenterMessage("Loading…", spinner = true)
             detail.error != null && detail.openShare == null -> CenterMessage(detail.error!!)
-            detail.openShare == null -> SharesList(detail.shares, onOpen = vm::openShare)
+            detail.openShare == null -> DevicePage(detail, vm)
             else -> TreeView(
                 share = detail.openShare!!,
                 path = detail.treePath,
@@ -75,6 +89,116 @@ fun PeerDetailScreen(padding: PaddingValues, vm: DevicesViewModel) {
                 onBack = vm::backToShares,
                 onOpenPath = vm::openPath,
             )
+        }
+    }
+}
+
+@Composable
+private fun DevicePage(detail: PeerDetail, vm: DevicesViewModel) {
+    Column(modifier = Modifier.fillMaxSize()) {
+        PeerActions(detail, vm)
+        detail.notice?.let { NoticeCard(it, onDismiss = vm::dismissNotice) }
+        detail.push?.let { PushCard(it, onCancel = vm::cancelPush, onDismiss = vm::dismissPush) }
+        Box(modifier = Modifier.weight(1f)) {
+            if (detail.loading) {
+                CenterMessage("Loading…", spinner = true)
+            } else if (detail.error != null) {
+                CenterMessage(detail.error)
+            } else {
+                SharesList(detail.shares, onOpen = vm::openShare)
+            }
+        }
+    }
+}
+
+@Composable
+private fun PeerActions(detail: PeerDetail, vm: DevicesViewModel) {
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+        if (uris.isNotEmpty()) vm.sendFiles(detail.peer, uris)
+    }
+    var text by rememberSaveable { mutableStateOf("") }
+
+    Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Button(onClick = { picker.launch(arrayOf("*/*")) }, modifier = Modifier.fillMaxWidth()) {
+            Text("Send files")
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                placeholder = { Text("Send text…") },
+                maxLines = 3,
+                modifier = Modifier.weight(1f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = {
+                    vm.sendText(detail.peer, text)
+                    text = ""
+                },
+                enabled = text.isNotBlank(),
+            ) { Text("Send") }
+        }
+    }
+}
+
+@Composable
+private fun NoticeCard(text: String, onDismiss: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(text, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+            TextButton(onClick = onDismiss) { Text("OK") }
+        }
+    }
+}
+
+@Composable
+private fun PushCard(push: PushUi, onCancel: () -> Unit, onDismiss: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Text(
+                when {
+                    push.running -> "Sending…"
+                    push.ok -> "Sent"
+                    else -> "Send failed"
+                },
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Spacer(Modifier.height(8.dp))
+            push.files.forEach { file ->
+                Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        Text(file.name, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "${humanSize(file.sent)} / ${humanSize(file.total)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    if (file.total > 0 && push.running) {
+                        LinearProgressIndicator(
+                            progress = { (file.sent.toFloat() / file.total).coerceIn(0f, 1f) },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+            }
+            push.message?.let {
+                Spacer(Modifier.height(8.dp))
+                Text(it, style = MaterialTheme.typography.bodyMedium)
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                if (push.running) {
+                    OutlinedButton(onClick = onCancel) { Text("Cancel") }
+                } else {
+                    TextButton(onClick = onDismiss) { Text("Dismiss") }
+                }
+            }
         }
     }
 }

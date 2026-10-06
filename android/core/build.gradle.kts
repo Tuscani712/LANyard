@@ -15,6 +15,7 @@ dependencies {
 
     testImplementation(libs.kotlin.test)
     testImplementation(libs.junit.jupiter)
+    testImplementation(libs.zxing.core)
     testRuntimeOnly(libs.junit.platform.launcher)
 }
 

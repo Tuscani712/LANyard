@@ -17,8 +17,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -57,10 +57,26 @@ fun shortFingerprint(fp: String): String =
 fun DevicesScreen(padding: PaddingValues, vm: DevicesViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
     var showAdd by rememberSaveable { mutableStateOf(false) }
+    var showScan by rememberSaveable { mutableStateOf(false) }
     var explain by remember { mutableStateOf<NearbyDevice?>(null) }
 
     if (state.detail != null) {
         PeerDetailScreen(padding, vm)
+        return
+    }
+
+    if (showScan) {
+        QrScanScreen(
+            onDecoded = { link ->
+                showScan = false
+                vm.pair(link)
+            },
+            onCancel = { showScan = false },
+            onPasteInstead = {
+                showScan = false
+                showAdd = true
+            },
+        )
         return
     }
 
@@ -85,10 +101,13 @@ fun DevicesScreen(padding: PaddingValues, vm: DevicesViewModel) {
             verticalAlignment = Alignment.CenterVertically,
         ) {
             SectionHeader("Paired")
-            Button(onClick = { showAdd = true }) {
-                Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(18.dp))
-                Spacer(Modifier.width(6.dp))
-                Text("Add device")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { showAdd = true }) { Text("Add device") }
+                Button(onClick = { showScan = true }) {
+                    Icon(Icons.Filled.QrCodeScanner, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Scan QR")
+                }
             }
         }
 

@@ -14,6 +14,9 @@ import javax.net.ssl.HttpsURLConnection
 class PeerStatusException(val code: Int, val body: String) :
     RuntimeException("HTTP $code: ${body.take(200)}")
 
+/** A local cancel aborted an in-flight push before completion. */
+class PushCancelledException : RuntimeException("the push was cancelled")
+
 /** One file in a push offer. */
 data class PushFileRequest(val relPath: String, val size: Long, val mtimeMillis: Long)
 
@@ -24,6 +27,9 @@ data class PushOffer(
     val maxBytes: Long,
     val offsets: Map<String, Long>,
 )
+
+/** A streamed upload's whole-file digest and the number of bytes sent. */
+data class StreamedFile(val sha256: String, val bytes: Long)
 
 /** The `/hello` response. */
 data class PeerHello(
@@ -131,6 +137,81 @@ class PeerClient(
 
     fun pushCompleteAll(pushId: String) {
         request("POST", "/push/${encode(pushId)}/complete", "{\"all\":true}".toByteArray(), emptyMap())
+    }
+
+    /**
+     * Streams one file's remaining bytes to the peer's inbox, hashing the whole
+     * file as it goes. The body is read with a fixed buffer, so a whole file is
+     * never held in memory. [onBytes] reports bytes written (after [offset]).
+     * Throws [PushCancelledException] if [isCancelled] returns true mid-stream.
+     */
+    fun pushFileStream(
+        pushId: String,
+        relPath: String,
+        offset: Long,
+        total: Long,
+        source: InputStream,
+        onBytes: (Long) -> Unit = {},
+        isCancelled: () -> Boolean = { false },
+    ): StreamedFile {
+        val conn = URL(base + "/push/${encode(pushId)}/file?path=${encodeQuery(relPath)}").openConnection()
+            as HttpsURLConnection
+        conn.sslSocketFactory = socketFactory
+        conn.hostnameVerifier = HostnameVerifier { _, _ -> true }
+        conn.requestMethod = "PUT"
+        conn.connectTimeout = 10_000
+        conn.readTimeout = 120_000
+        conn.setRequestProperty("Content-Type", "application/octet-stream")
+        val end = if (total == 0L) 0L else total - 1
+        conn.setRequestProperty("Content-Range", "bytes $offset-$end/$total")
+        conn.doOutput = true
+        conn.setFixedLengthStreamingMode(total - offset)
+
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buf = ByteArray(256 * 1024)
+        var sent = 0L
+        try {
+            conn.outputStream.use { out ->
+                // Hash the prefix already on the receiver so the digest covers the
+                // whole file, then stream the remainder.
+                var skip = offset
+                while (skip > 0) {
+                    val want = minOf(skip, buf.size.toLong()).toInt()
+                    val r = source.read(buf, 0, want)
+                    if (r < 0) throw PeerStatusException(-1, "the file ended before the resume offset")
+                    digest.update(buf, 0, r)
+                    skip -= r
+                }
+                while (true) {
+                    if (isCancelled()) {
+                        conn.disconnect()
+                        throw PushCancelledException()
+                    }
+                    val r = source.read(buf)
+                    if (r < 0) break
+                    out.write(buf, 0, r)
+                    digest.update(buf, 0, r)
+                    sent += r
+                    onBytes(sent)
+                }
+            }
+            val status = conn.responseCode
+            val text = (if (status in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.use { it.readText() } ?: ""
+            if (status !in 200..299) throw PeerStatusException(status, text)
+        } finally {
+            runCatching { source.close() }
+        }
+        return StreamedFile(digest.digest().joinToString("") { "%02x".format(it) }, sent)
+    }
+
+    /** Reports a finished file with its whole-file digest for verification. */
+    fun pushCompleteFile(pushId: String, relPath: String, sha256Hex: String) {
+        val body = JsonObject().apply {
+            addProperty("rel_path", relPath)
+            addProperty("sha256", sha256Hex)
+        }
+        request("POST", "/push/${encode(pushId)}/complete", body.toString().toByteArray(), emptyMap())
     }
 
     fun sendSnippet(text: String): JsonObject {

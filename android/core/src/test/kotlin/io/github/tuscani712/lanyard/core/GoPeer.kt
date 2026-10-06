@@ -47,7 +47,12 @@ internal class GoPeer(bin: String) : AutoCloseable {
         PairLink.build(PairLink.Payload(fingerprint = fingerprint, name = "desktop", addrs = addrs, nonce = nonce))
 
     /** Accepts the next pending session from [deviceFp] through the UI API. */
-    fun acceptPending(deviceFp: String, timeoutMs: Long = 20_000): Boolean {
+    fun acceptPending(
+        deviceFp: String,
+        browse: Boolean = true,
+        push: Boolean = true,
+        timeoutMs: Long = 20_000,
+    ): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             val pending = ui.get("/api/sessions").asJsonArray
@@ -56,7 +61,7 @@ internal class GoPeer(bin: String) : AutoCloseable {
             if (pending != null) {
                 ui.post(
                     "/api/sessions/${pending.str("id")}/accept",
-                    """{"permissions":{"browse":true,"push":true},"keep_connected":false}""",
+                    """{"permissions":{"browse":$browse,"push":$push},"keep_connected":false}""",
                 )
                 return true
             }
@@ -64,6 +69,9 @@ internal class GoPeer(bin: String) : AutoCloseable {
         }
         return false
     }
+
+    /** A file the receiver has finalized in its Inbox, or a not-yet-existing path. */
+    fun inboxFile(name: String): File = File(File(dataDir, "Inbox"), name)
 
     fun addShare(path: String, label: String): JsonObject =
         ui.post(
