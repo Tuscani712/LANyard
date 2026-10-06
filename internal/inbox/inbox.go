@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"lanyard/internal/shares"
 )
@@ -26,6 +27,42 @@ import (
 // The sender was allowed to push (paired with push permission, or accepted by a
 // person in a Connect session) and free space is still checked on every offer.
 const DefaultMaxBytes = int64(1) << 62
+
+// MaxSnippetBytes caps a text snippet (64 KB of UTF-8).
+const MaxSnippetBytes = 64 << 10
+
+// maxSnippets bounds how many received snippets are kept in memory.
+const maxSnippets = 100
+
+// Snippet is a short text message received from a peer. It is held in memory
+// (not written to disk) and shown with Copy and Dismiss.
+type Snippet struct {
+	ID         string    `json:"id"`
+	PeerFP     string    `json:"peer_fp"`
+	Text       string    `json:"text"`
+	ReceivedAt time.Time `json:"received_at"`
+}
+
+// ValidateSnippet enforces the snippet rules: non-empty, a whole number of
+// UTF-8 bytes, within the size cap, and free of control characters other than
+// newline and tab (so binary or terminal escapes cannot ride along).
+func ValidateSnippet(text string) error {
+	if text == "" {
+		return errors.New("snippet is empty")
+	}
+	if len(text) > MaxSnippetBytes {
+		return fmt.Errorf("snippet exceeds %d bytes", MaxSnippetBytes)
+	}
+	if !utf8.ValidString(text) {
+		return errors.New("snippet is not valid UTF-8")
+	}
+	for _, r := range text {
+		if unicode.IsControl(r) && r != '\n' && r != '\t' {
+			return errors.New("snippet contains control characters")
+		}
+	}
+	return nil
+}
 
 // syncMin is the size from which a received file is fsynced before it is renamed
 // into place. A smaller file lost to a crash is simply sent again.
@@ -159,14 +196,16 @@ func (m *Manager) WasCancelled(id string) bool {
 
 // Manager owns pushes for one process.
 type Manager struct {
-	dir      string
-	onChange func()
-	onOffer  func(peerFP string, files int, total int64)
-	onDone   func(peerFP string, files int, total int64)
+	dir       string
+	onChange  func()
+	onOffer   func(peerFP string, files int, total int64)
+	onDone    func(peerFP string, files int, total int64)
+	onSnippet func(peerFP, text string)
 
-	mu     sync.Mutex
-	pushes map[string]*Push
-	gone   map[string]struct{} // cancelled push ids
+	mu       sync.Mutex
+	pushes   map[string]*Push
+	gone     map[string]struct{} // cancelled push ids
+	snippets []*Snippet
 }
 
 // FreeSpace reports the bytes available to the current user on the volume
@@ -186,6 +225,61 @@ func (m *Manager) SetOnOffer(fn func(peerFP string, files int, total int64)) { m
 
 // SetOnDone registers a callback for each push that finishes being received.
 func (m *Manager) SetOnDone(fn func(peerFP string, files int, total int64)) { m.onDone = fn }
+
+// SetOnSnippet registers a callback for each text snippet that is received
+// (used to raise a desktop notification).
+func (m *Manager) SetOnSnippet(fn func(peerFP, text string)) { m.onSnippet = fn }
+
+// AddSnippet validates and stores a received text snippet.
+func (m *Manager) AddSnippet(peerFP, text string) (*Snippet, error) {
+	if err := ValidateSnippet(text); err != nil {
+		return nil, err
+	}
+	s := &Snippet{ID: "s_" + randHex(6), PeerFP: peerFP, Text: text, ReceivedAt: time.Now()}
+	m.mu.Lock()
+	m.snippets = append(m.snippets, s)
+	if len(m.snippets) > maxSnippets {
+		m.snippets = m.snippets[len(m.snippets)-maxSnippets:]
+	}
+	m.mu.Unlock()
+	m.onChange()
+	if m.onSnippet != nil {
+		m.onSnippet(peerFP, text)
+	}
+	return s, nil
+}
+
+// Snippets lists received snippets, oldest first.
+func (m *Manager) Snippets() []Snippet {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Snippet, 0, len(m.snippets))
+	for _, s := range m.snippets {
+		out = append(out, *s)
+	}
+	return out
+}
+
+// DismissSnippet removes a received snippet from the list.
+func (m *Manager) DismissSnippet(id string) bool {
+	m.mu.Lock()
+	idx := -1
+	for i, s := range m.snippets {
+		if s.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx >= 0 {
+		m.snippets = append(m.snippets[:idx], m.snippets[idx+1:]...)
+	}
+	m.mu.Unlock()
+	if idx < 0 {
+		return false
+	}
+	m.onChange()
+	return true
+}
 
 func (m *Manager) Dir() string { return m.dir }
 

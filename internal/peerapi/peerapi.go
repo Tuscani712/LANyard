@@ -102,6 +102,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/v1/session/{id}/close", s.handleSessionClose)
 	mux.HandleFunc("POST /api/v1/trust/revoke", s.handleTrustRevoke)
 	mux.HandleFunc("POST /api/v1/push/offer", s.handlePushOffer)
+	mux.HandleFunc("POST /api/v1/snippet", s.handleSnippet)
 	mux.HandleFunc("PUT /api/v1/push/{id}/file", s.handlePushFile)
 	mux.HandleFunc("POST /api/v1/push/{id}/complete", s.handlePushComplete)
 	mux.HandleFunc("GET /api/v1/shares", s.handleShareList)

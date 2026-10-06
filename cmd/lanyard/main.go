@@ -331,6 +331,11 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 			ui.NotifyUser(uiserver.Notice{Kind: "receive", Peer: resolvePeer(peerFP), Files: files, Total: total})
 		}
 	})
+	// A received text snippet is announced too; notify truncates and sanitizes
+	// the body before it reaches the desktop.
+	inboxMgr.SetOnSnippet(func(peerFP, text string) {
+		notifier.Notify(notify.Notice{Title: "LANyard text message", Body: resolvePeer(peerFP) + ": " + text})
+	})
 
 	// A device asking to Connect or Pair is shown even when the window is not
 	// focused; the request itself is still answered in the UI.

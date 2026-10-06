@@ -4,6 +4,7 @@
 
 const $ = (id) => document.getElementById(id);
 let incomingList = []; // pushes this device is receiving
+let snippetsList = []; // text snippets this device has received
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -197,7 +198,7 @@ function renderNav() {
     item.innerHTML = I[n.icon];
     item.appendChild(el("span", null, n.label));
     if (n.id === "transfers") {
-      const live = transfersList.filter((t) => t.state !== "Done").length + incomingList.length;
+      const live = transfersList.filter((t) => t.state !== "Done").length + incomingList.length + snippetsList.length;
       if (live) item.appendChild(el("span", "nav-badge", String(live)));
     }
     if (n.id === "paired" && S.actionable) {
@@ -558,6 +559,26 @@ function renderDevice(body, p) {
   head.appendChild(actions);
   body.appendChild(head);
 
+  if (paired || session) {
+    body.appendChild(el("div", "section-title", "Send text"));
+    const box = el("div", "form-row");
+    const ta = document.createElement("textarea");
+    ta.rows = 3; ta.maxLength = 65536;
+    ta.placeholder = "Type a short message or paste a link\u2026";
+    ta.style.flex = "1"; ta.style.minWidth = "280px";
+    const send = btn("Send text", async () => {
+      const text = ta.value;
+      if (!text.trim()) { toast("Type something to send.", "err"); return; }
+      const r = await fetch("/api/snippet", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: p.device, text }) });
+      if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
+      ta.value = "";
+      toast("Text sent to " + (peer.name || "the device") + ".", "ok");
+    });
+    if (!online) send.disabled = true;
+    box.appendChild(ta); box.appendChild(send);
+    body.appendChild(box);
+  }
+
   body.appendChild(el("div", "section-title", "Shared with you"));
   const listBox = el("div", "stack");
   listBox.appendChild(el("div", "empty", "Loading shares\u2026"));
@@ -879,7 +900,24 @@ function renderTransfersPage() {
   const anyDone = transfersList.some((t) => t.state === "Done");
   $("clear-finished").hidden = !anyDone;
   const stack = el("div", "stack");
-  if (!transfersList.length && !incomingList.length) stack.appendChild(el("div", "empty", "No transfers."));
+  for (const sp of snippetsList) {
+    const row = el("div", "row col");
+    const top = el("div", "row"); top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
+    top.appendChild(el("div", "grow name", "\u2709 Text from " + snippetPeer(sp)));
+    top.appendChild(el("span", "badge", "Text"));
+    row.appendChild(top);
+    const text = el("div", "meta"); text.textContent = sp.text; text.style.whiteSpace = "pre-wrap"; text.style.wordBreak = "break-word";
+    row.appendChild(text);
+    const acts = el("div", "actions");
+    acts.appendChild(btn("Copy", () => copyText(sp.text), "ghost"));
+    acts.appendChild(btn("Dismiss", async () => {
+      const r = await fetch(`/api/snippets/${encodeURIComponent(sp.id)}/dismiss`, { method: "POST" });
+      if (!r.ok) toast((await r.text()).trim(), "err");
+    }, "ghost"));
+    row.appendChild(acts);
+    stack.appendChild(row);
+  }
+  if (!transfersList.length && !incomingList.length && !snippetsList.length) stack.appendChild(el("div", "empty", "No transfers."));
   for (const inc of incomingList) {
     const row = el("div", "row col");
     const top = el("div", "row"); top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
@@ -1528,6 +1566,13 @@ function renderIncoming(list) {
   if (S.view === "transfers") renderTransfersPage();
   if (list.length !== had) renderNav();
 }
+function renderSnippets(list) {
+  const had = snippetsList.length;
+  snippetsList = list;
+  if (S.view === "transfers") renderTransfersPage();
+  if (list.length !== had) renderNav();
+}
+function snippetPeer(sp) { return sp.peer_name || prettyId(sp.peer_fp) || "a device"; }
 function connectEvents() {
   const es = new EventSource("/api/events");
   es.addEventListener("peers", (ev) => renderPeers(JSON.parse(ev.data)));
@@ -1537,6 +1582,7 @@ function connectEvents() {
   es.addEventListener("approvals", (ev) => renderApprovals(JSON.parse(ev.data)));
   es.addEventListener("sessions", (ev) => renderSessions(JSON.parse(ev.data)));
   es.addEventListener("incoming", (ev) => renderIncoming(JSON.parse(ev.data)));
+  es.addEventListener("snippets", (ev) => renderSnippets(JSON.parse(ev.data)));
   es.addEventListener("notice", (ev) => showNotice(JSON.parse(ev.data)));
   es.onerror = () => { };
 }

@@ -259,6 +259,13 @@ func (c *Client) RevokePairing(ctx context.Context, host string, port int, expec
 	return c.doJSON(ctx, http.MethodPost, u, nil, expectedFP, nil)
 }
 
+// SendSnippet delivers a short text message to a peer's Inbox.
+func (c *Client) SendSnippet(ctx context.Context, host string, port int, expectedFP, text string) error {
+	b, _ := json.Marshal(map[string]string{"text": text})
+	u := c.base(host, port) + "/snippet"
+	return c.doJSON(ctx, http.MethodPost, u, strings.NewReader(string(b)), expectedFP, nil)
+}
+
 // --- push client ---
 
 // PushOfferResult is the responder's answer to a push offer.

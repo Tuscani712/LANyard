@@ -201,6 +201,9 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/fs/pick", s.auth(s.handleFSPick))
 	mux.HandleFunc("GET /api/incoming", s.auth(s.handleIncoming))
 	mux.HandleFunc("POST /api/incoming/{id}/cancel", s.auth(s.handleIncomingCancel))
+	mux.HandleFunc("GET /api/snippets", s.auth(s.handleSnippets))
+	mux.HandleFunc("POST /api/snippet", s.auth(s.handleSendSnippet))
+	mux.HandleFunc("POST /api/snippets/{id}/dismiss", s.auth(s.handleSnippetDismiss))
 	mux.HandleFunc("GET /api/shares", s.auth(s.handleShares))
 	mux.HandleFunc("POST /api/shares", s.auth(s.handleShareAdd))
 	mux.HandleFunc("POST /api/shares/stop-all", s.auth(s.handleShareStopAll))
@@ -390,6 +393,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		if ib, err := json.Marshal(s.incoming()); err == nil {
 			fmt.Fprintf(w, "event: incoming\ndata: %s\n\n", ib)
+		}
+		if sb, err := json.Marshal(s.snippets()); err == nil {
+			fmt.Fprintf(w, "event: snippets\ndata: %s\n\n", sb)
 		}
 		if s.d.Transfers != nil {
 			if tb, err := json.Marshal(s.d.Transfers.List()); err == nil {

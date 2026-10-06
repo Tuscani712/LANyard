@@ -156,3 +156,57 @@ func TestNoHiddenSizeCap(t *testing.T) {
 		t.Error("an explicit 1 GiB limit must still be enforced")
 	}
 }
+
+func TestValidateSnippet(t *testing.T) {
+	ok := []string{"hello", "line one\nline two", "tab\there", "a link https://example.com/x", strings.Repeat("x", MaxSnippetBytes)}
+	for _, s := range ok {
+		if err := ValidateSnippet(s); err != nil {
+			t.Errorf("ValidateSnippet(%q) = %v, want nil", s[:min(len(s), 20)], err)
+		}
+	}
+	bad := []string{
+		"",
+		string(make([]byte, 0)),
+		"\x00binary",
+		"bell\x07",
+		"del\x7f",
+		"c1\x9b",
+		string([]byte{0xff, 0xfe}),
+		strings.Repeat("x", MaxSnippetBytes+1),
+	}
+	for _, s := range bad {
+		if err := ValidateSnippet(s); err == nil {
+			t.Errorf("ValidateSnippet(%q) = nil, want an error", s)
+		}
+	}
+}
+
+func TestAddDismissSnippet(t *testing.T) {
+	m := New(t.TempDir(), nil)
+	var gotPeer, gotText string
+	m.SetOnSnippet(func(peer, text string) { gotPeer, gotText = peer, text })
+
+	sp, err := m.AddSnippet("peer-fp", "<b>hi</b>\nhttps://example.com")
+	if err != nil {
+		t.Fatalf("AddSnippet: %v", err)
+	}
+	if gotPeer != "peer-fp" || gotText != sp.Text {
+		t.Fatalf("onSnippet got (%q,%q), want (peer-fp,%q)", gotPeer, gotText, sp.Text)
+	}
+	list := m.Snippets()
+	if len(list) != 1 || list[0].ID != sp.ID {
+		t.Fatalf("Snippets = %+v", list)
+	}
+	if list[0].Text != "<b>hi</b>\nhttps://example.com" {
+		t.Fatalf("markup must be stored as plain text, got %q", list[0].Text)
+	}
+	if !m.DismissSnippet(sp.ID) {
+		t.Fatal("DismissSnippet should find the snippet")
+	}
+	if len(m.Snippets()) != 0 {
+		t.Fatal("snippet should be gone after dismiss")
+	}
+	if m.DismissSnippet("nope") {
+		t.Fatal("dismissing an unknown snippet must fail")
+	}
+}
