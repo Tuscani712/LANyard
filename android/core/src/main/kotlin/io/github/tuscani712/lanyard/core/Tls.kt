@@ -67,6 +67,22 @@ object Tls {
         )
         return Tls13SocketFactory(context.socketFactory)
     }
+
+    /**
+     * A server context for the minimal `/api/v1/hello` responder: it presents
+     * our own certificate and requires a client certificate, but accepts any
+     * client (the caller decides trust, and `/hello` exposes nothing sensitive).
+     * Like the client context it is pinned to TLS 1.3.
+     */
+    fun serverContext(identity: Identity): SSLContext {
+        val context = SSLContext.getInstance("TLS", provider)
+        context.init(
+            arrayOf(ServerKeyManager(identity)),
+            arrayOf(AnyClientTrustManager),
+            SecureRandom(),
+        )
+        return context
+    }
 }
 
 /** Holds the fingerprint most recently presented during a probe handshake. */
@@ -194,4 +210,55 @@ private class RecordingTrustManager(private val recorder: FingerprintRecorder) :
     private fun record(chain: Array<X509Certificate>) {
         if (chain.isNotEmpty()) recorder.fingerprint = Identity.fingerprintOf(chain[0])
     }
+}
+
+/** Presents our own Ed25519 certificate as the server certificate. */
+private class ServerKeyManager(private val identity: Identity) : X509ExtendedKeyManager() {
+    override fun getServerAliases(keyType: String?, issuers: Array<out Principal>?): Array<String>? =
+        if (matches(keyType)) arrayOf(ALIAS) else null
+
+    override fun chooseServerAlias(keyType: String?, issuers: Array<out Principal>?, socket: Socket?): String? =
+        if (matches(keyType)) ALIAS else null
+
+    override fun chooseEngineServerAlias(keyType: String?, issuers: Array<out Principal>?, engine: SSLEngine?): String? =
+        if (matches(keyType)) ALIAS else null
+
+    override fun getClientAliases(keyType: String?, issuers: Array<out Principal>?): Array<String>? = null
+
+    override fun chooseClientAlias(keyType: Array<out String>?, issuers: Array<out Principal>?, socket: Socket?): String? = null
+
+    override fun chooseEngineClientAlias(keyType: Array<out String>?, issuers: Array<out Principal>?, engine: SSLEngine?): String? = null
+
+    override fun getCertificateChain(alias: String?): Array<X509Certificate>? =
+        if (alias == ALIAS) arrayOf(identity.certificate) else null
+
+    override fun getPrivateKey(alias: String?): PrivateKey? =
+        if (alias == ALIAS) identity.privateKey else null
+
+    private fun matches(keyType: String?): Boolean =
+        keyType != null && keyType.equals("Ed25519", ignoreCase = true)
+
+    private companion object {
+        const val ALIAS = "lanyard"
+    }
+}
+
+/** Accepts any client certificate (or none); `/hello` is not gated on trust. */
+private object AnyClientTrustManager : X509ExtendedTrustManager() {
+    override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String) = Unit
+
+    override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String, socket: Socket?) = Unit
+
+    override fun checkClientTrusted(chain: Array<X509Certificate>, authType: String, engine: SSLEngine?) = Unit
+
+    override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String): Unit =
+        throw CertificateException("this trust manager is for the server side only")
+
+    override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String, socket: Socket?): Unit =
+        throw CertificateException("this trust manager is for the server side only")
+
+    override fun checkServerTrusted(chain: Array<X509Certificate>, authType: String, engine: SSLEngine?): Unit =
+        throw CertificateException("this trust manager is for the server side only")
+
+    override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
 }

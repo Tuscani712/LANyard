@@ -6,14 +6,18 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.gson.JsonObject
 import io.github.tuscani712.lanyard.core.JsonFileTrustStore
+import io.github.tuscani712.lanyard.core.PairLink
 import io.github.tuscani712.lanyard.core.PairResult
 import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PairingFlow
 import io.github.tuscani712.lanyard.core.PeerClient
+import io.github.tuscani712.lanyard.core.PeerHelloServer
 import io.github.tuscani712.lanyard.core.PeerStatusException
 import io.github.tuscani712.lanyard.core.ProbeClient
 import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.net.NearbyDevice
+import io.github.tuscani712.lanyard.net.NetAddrs
+import io.github.tuscani712.lanyard.net.NsdAdvertiser
 import io.github.tuscani712.lanyard.net.NsdDiscovery
 import io.github.tuscani712.lanyard.share.SourceResult
 import io.github.tuscani712.lanyard.share.spoolShare
@@ -26,6 +30,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.security.SecureRandom
 
 /** A paired peer plus its last-known reachability. */
 data class PairedStatus(val peer: PairedPeer, val online: Boolean)
@@ -78,6 +83,22 @@ data class DevicesUiState(
 class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     private val store: TrustStore = JsonFileTrustStore(File(app.filesDir, "trust/peers.json"))
     private val discovery = NsdDiscovery(app)
+    private val advertiser = NsdAdvertiser(app)
+    private val helloServer = PeerHelloServer { boundPort ->
+        val id = IdentityHolder.identity
+        JsonObject().apply {
+            addProperty("device_id", id?.deviceId?.take(16) ?: "")
+            addProperty("fingerprint", id?.deviceId ?: "")
+            addProperty("name", IdentityHolder.deviceName)
+            addProperty("os", "android")
+            addProperty("version", "0.1.0-beta.3")
+            addProperty("port", boundPort)
+        }
+    }
+
+    // The port this device advertises and answers /hello on (0 when not serving).
+    @Volatile
+    private var advertisePort = 0
 
     private val _state = MutableStateFlow(DevicesUiState())
     val state: StateFlow<DevicesUiState> = _state.asStateFlow()
@@ -107,9 +128,67 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 _state.update { current -> current.copy(nearby = current.nearby.filterNot { it.shortId == shortId }) }
             },
         )
+        startAdvertise()
     }
 
-    fun stopNearby() = discovery.stop()
+    fun stopNearby() {
+        discovery.stop()
+        advertiser.stop()
+        helloServer.stop()
+        advertisePort = 0
+    }
+
+    // Advertises this device over mDNS and answers the desktop's /hello probe,
+    // so it is listed as a verified nearby device. Pairing and transfers are a
+    // later milestone; without the responder the peer is dropped as unverified.
+    private fun startAdvertise() {
+        val id = IdentityHolder.identity ?: return
+        val short = id.deviceId.take(16)
+        val port = try {
+            helloServer.start(id)
+        } catch (_: Exception) {
+            return
+        }
+        advertisePort = port
+        advertiser.start(
+            short,
+            mapOf(
+                "v" to "2",
+                "id" to short,
+                "did" to "",
+                "n" to IdentityHolder.deviceName,
+                "os" to "android",
+                "p" to port.toString(),
+            ),
+            port,
+        )
+    }
+
+    /**
+     * The `lanyard://pair?...` link for this device, to render as a QR code for
+     * another device to scan. Null until advertising has started.
+     */
+    fun pairingLink(): String? {
+        val id = IdentityHolder.identity ?: return null
+        val port = advertisePort
+        if (port == 0) return null
+        val addrs = NetAddrs.localIPv4().map { "$it:$port" }
+        if (addrs.isEmpty()) return null
+        return PairLink.build(
+            PairLink.Payload(
+                fingerprint = id.deviceId,
+                name = IdentityHolder.deviceName,
+                addrs = addrs,
+                nonce = randomHex(16),
+            ),
+        )
+    }
+
+    private fun randomHex(bytes: Int): String {
+        val buf = ByteArray(bytes)
+        SecureRandom().nextBytes(buf)
+        return buf.joinToString("") { "%02x".format(it) }
+    }
 
     fun pair(link: String) {
         if (link.isBlank()) {
@@ -332,6 +411,6 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         super.onCleared()
-        discovery.stop()
+        stopNearby()
     }
 }

@@ -21,6 +21,7 @@ class NsdDiscovery(context: Context) {
     private var lock: WifiManager.MulticastLock? = null
     private var listener: NsdManager.DiscoveryListener? = null
     private val resolving = HashSet<String>()
+    private val shortByService = HashMap<String, String>()
 
     fun start(onFound: (NearbyDevice) -> Unit, onLost: (String) -> Unit) {
         if (listener != null) return
@@ -36,7 +37,7 @@ class NsdDiscovery(context: Context) {
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = stop()
 
             override fun onServiceFound(info: NsdServiceInfo) {
-                if (info.serviceType != SERVICE_TYPE) return
+                if (!sameServiceType(info.serviceType, SERVICE_TYPE)) return
                 if (!resolving.add(info.serviceName)) return
                 try {
                     nsdManager.resolveService(info, resolver(onFound))
@@ -47,7 +48,7 @@ class NsdDiscovery(context: Context) {
 
             override fun onServiceLost(info: NsdServiceInfo) {
                 resolving.remove(info.serviceName)
-                onLost(info.serviceName)
+                onLost(shortByService.remove(info.serviceName) ?: info.serviceName)
             }
         }
         listener = discovery
@@ -86,9 +87,11 @@ class NsdDiscovery(context: Context) {
         override fun onServiceResolved(info: NsdServiceInfo) {
             val host = info.host?.hostAddress ?: return
             val attrs = info.attributes.mapValues { String(it.value) }
+            val shortId = attrs["id"] ?: info.serviceName
+            shortByService[info.serviceName] = shortId
             onFound(
                 NearbyDevice(
-                    shortId = attrs["id"] ?: info.serviceName,
+                    shortId = shortId,
                     deviceLabel = attrs["did"] ?: "",
                     name = attrs["n"] ?: info.serviceName,
                     host = host,
@@ -99,7 +102,18 @@ class NsdDiscovery(context: Context) {
         }
     }
 
+    /**
+     * Android reports the discovered service type inconsistently (with or
+     * without the trailing dot, and in mixed case), so match leniently rather
+     * than dropping every device on an exact comparison.
+     */
+    private fun sameServiceType(a: String?, b: String): Boolean {
+        if (a == null) return false
+        fun norm(s: String) = s.trim().trimEnd('.').lowercase()
+        return norm(a) == norm(b)
+    }
+
     private companion object {
-        const val SERVICE_TYPE = "_lanyard._tcp"
+        const val SERVICE_TYPE = "_lanyard._tcp."
     }
 }

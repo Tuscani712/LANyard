@@ -2,8 +2,10 @@ package io.github.tuscani712.lanyard.ui
 
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Bitmap
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -22,6 +24,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.QrCode2
 import androidx.compose.material.icons.filled.QrCodeScanner
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -43,11 +46,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.qrcode.QRCodeWriter
 import io.github.tuscani712.lanyard.DevicesViewModel
 import io.github.tuscani712.lanyard.PairedStatus
 import io.github.tuscani712.lanyard.PairingStatus
@@ -64,6 +71,7 @@ fun DevicesScreen(padding: PaddingValues, vm: DevicesViewModel) {
     val state by vm.state.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var showAdd by rememberSaveable { mutableStateOf(false) }
+    var showQr by remember { mutableStateOf(false) }
     var explain by remember { mutableStateOf<NearbyDevice?>(null) }
 
     val scanLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -111,6 +119,16 @@ fun DevicesScreen(padding: PaddingValues, vm: DevicesViewModel) {
         }
 
         Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = { showQr = true },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Icon(Icons.Filled.QrCode2, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text("Show my QR code")
+        }
+
+        Spacer(Modifier.height(8.dp))
         if (state.paired.isEmpty()) {
             Text(
                 "No connected devices",
@@ -145,6 +163,13 @@ fun DevicesScreen(padding: PaddingValues, vm: DevicesViewModel) {
                 showAdd = false
                 vm.pair(link)
             },
+        )
+    }
+
+    if (showQr) {
+        PairCodeDialog(
+            link = remember(showQr) { vm.pairingLink() },
+            onDismiss = { showQr = false },
         )
     }
 
@@ -292,3 +317,54 @@ private fun AddDeviceDialog(onDismiss: () -> Unit, onPair: (String) -> Unit) {
         dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
     )
 }
+
+/** Shows this device's own pairing link as a QR code for another device to scan. */
+@Composable
+private fun PairCodeDialog(link: String?, onDismiss: () -> Unit) {
+    val clipboard = LocalClipboardManager.current
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Pair this device") },
+        text = {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                if (link == null) {
+                    Text(
+                        "Starting discovery… make sure Wi-Fi is on, then try again in a moment.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                } else {
+                    val qr = remember(link) { qrImage(link, 512) }
+                    if (qr != null) {
+                        Image(
+                            bitmap = qr,
+                            contentDescription = "Pairing QR code",
+                            modifier = Modifier.size(240.dp),
+                        )
+                        Spacer(Modifier.height(12.dp))
+                    }
+                    Text(
+                        "On the other device, scan this code — or paste the link below.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(link, style = MaterialTheme.typography.bodySmall, maxLines = 5)
+                    Spacer(Modifier.height(8.dp))
+                    TextButton(onClick = { clipboard.setText(AnnotatedString(link)) }) { Text("Copy link") }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
+    )
+}
+
+/** Renders a pairing link to a black-and-white QR bitmap, or null on failure. */
+private fun qrImage(link: String, size: Int): androidx.compose.ui.graphics.ImageBitmap? = runCatching {
+    val matrix = QRCodeWriter().encode(link, BarcodeFormat.QR_CODE, size, size)
+    val bmp = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+    for (y in 0 until size) {
+        for (x in 0 until size) {
+            bmp.setPixel(x, y, if (matrix.get(x, y)) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+        }
+    }
+    bmp.asImageBitmap()
+}.getOrNull()
