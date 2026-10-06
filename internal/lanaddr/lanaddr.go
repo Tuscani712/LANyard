@@ -14,9 +14,25 @@ import (
 	"strings"
 )
 
-// Addrs returns the usable private and link-local addresses of the host, with
-// the default-route address first.
+// maxPairingAddrs caps how many addresses a pairing link carries: a scanner
+// tries them in order, and a shorter list keeps the QR code dense but scannable.
+const maxPairingAddrs = 4
+
+// Addrs returns the addresses for a pairing link: private and link-local IPv4,
+// plus routable IPv6, with the default-route address first and at most
+// maxPairingAddrs entries. IPv6 link-local (fe80::…) is excluded because it
+// cannot be dialed from another host without a zone id.
 func Addrs() []string {
+	return collect(false, maxPairingAddrs)
+}
+
+// AllAddrs is the fuller list for diagnostics: it also includes IPv6 link-local
+// addresses and is not capped.
+func AllAddrs() []string {
+	return collect(true, 0)
+}
+
+func collect(keepV6LinkLocal bool, limit int) []string {
 	primary := principalIP()
 	ifs, err := net.Interfaces()
 	if err != nil {
@@ -37,7 +53,7 @@ func Addrs() []string {
 			}
 		}
 	}
-	return chooseAddrs(primary, entries)
+	return chooseAddrs(primary, entries, keepV6LinkLocal, limit)
 }
 
 // principalIP returns the local IP the OS would use to reach the default route.
@@ -60,9 +76,9 @@ type ifaceAddr struct {
 	ip   net.IP
 }
 
-// chooseAddrs filters, orders and de-duplicates candidate addresses. Pure, so
-// the ordering rules can be tested without touching the network.
-func chooseAddrs(primary string, entries []ifaceAddr) []string {
+// chooseAddrs filters, orders, caps and de-duplicates candidate addresses.
+// Pure, so the ordering and filtering rules can be tested without the network.
+func chooseAddrs(primary string, entries []ifaceAddr, keepV6LinkLocal bool, limit int) []string {
 	seen := map[string]bool{}
 	var normal, virtual []string
 	hasPrimary := false
@@ -72,6 +88,10 @@ func chooseAddrs(primary string, entries []ifaceAddr) []string {
 			continue
 		}
 		if !(ip.IsPrivate() || ip.IsLinkLocalUnicast()) {
+			continue
+		}
+		// IPv6 link-local has no zone id here and is not dialable elsewhere.
+		if !keepV6LinkLocal && ip.To4() == nil && ip.IsLinkLocalUnicast() {
 			continue
 		}
 		s := ip.String()
@@ -100,6 +120,9 @@ func chooseAddrs(primary string, entries []ifaceAddr) []string {
 	if len(out) == 0 {
 		// Nothing real: fall back to virtual bridges rather than nothing.
 		out = append(out, virtual...)
+	}
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
 	}
 	return out
 }

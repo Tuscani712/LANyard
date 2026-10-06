@@ -1,6 +1,7 @@
 package pairlink
 
 import (
+	"net/url"
 	"strings"
 	"testing"
 )
@@ -89,5 +90,38 @@ func TestParseCapsName(t *testing.T) {
 	}
 	if len(out.Name) != maxNameLen {
 		t.Fatalf("name length = %d, want %d", len(out.Name), maxNameLen)
+	}
+}
+
+func TestBuildLeavesAddrUnescaped(t *testing.T) {
+	uri := Build(Payload{
+		Fingerprint: testFP, Name: "Kitchen PC",
+		Addrs: []string{"192.168.1.20:47800", "10.0.0.5:47800"}, Nonce: testNonce,
+	})
+	if strings.Contains(uri, "%3A") || strings.Contains(uri, "%3a") || strings.Contains(uri, "%2C") || strings.Contains(uri, "%2c") {
+		t.Fatalf("addr must keep ':' and ',' unescaped: %q", uri)
+	}
+	if !strings.Contains(uri, "addr=192.168.1.20:47800,10.0.0.5:47800") {
+		t.Fatalf("unexpected addr in link: %q", uri)
+	}
+	// The name is still escaped.
+	if strings.Contains(uri, "name=Kitchen PC") {
+		t.Fatalf("name must be escaped: %q", uri)
+	}
+}
+
+func TestParseAcceptsEncodedAndUnescapedAddr(t *testing.T) {
+	cases := map[string]string{
+		"unescaped": "lanyard://pair?fp=" + testFP + "&addr=192.168.1.20:47800&n=" + testNonce,
+		"encoded":   "lanyard://pair?fp=" + testFP + "&addr=" + url.QueryEscape("192.168.1.20:47800") + "&n=" + testNonce,
+	}
+	for name, raw := range cases {
+		p, err := Parse(raw)
+		if err != nil {
+			t.Fatalf("%s: Parse: %v", name, err)
+		}
+		if len(p.Addrs) != 1 || p.Addrs[0] != "192.168.1.20:47800" {
+			t.Fatalf("%s: addrs = %v, want [192.168.1.20:47800]", name, p.Addrs)
+		}
 	}
 }

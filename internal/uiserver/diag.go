@@ -42,7 +42,9 @@ func (e diagEnv) PeerPortFallback() bool {
 	return e.s.d.Self().PeerPortFallback
 }
 
-func (e diagEnv) LocalAddrs() []string { return lanaddr.Addrs() }
+// LocalAddrs for diagnostics includes IPv6 link-local (which the pairing link
+// drops) so the report is complete.
+func (e diagEnv) LocalAddrs() []string { return lanaddr.AllAddrs() }
 
 func (e diagEnv) Peers() []diag.Peer {
 	if e.s.d.Peers == nil {

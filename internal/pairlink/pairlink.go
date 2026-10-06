@@ -41,16 +41,19 @@ type Payload struct {
 	Nonce       string   // one-time invite token (hex)
 }
 
-// Build renders p as a pairing link.
+// Build renders p as a pairing link. The fingerprint and nonce are hex, so
+// only the name is escaped. The addr value is left unescaped — ':' and ',' are
+// legal in a query value and keep the link short enough to scan; Parse accepts
+// both this form and a percent-encoded one.
 func Build(p Payload) string {
-	q := url.Values{}
-	q.Set("fp", p.Fingerprint)
+	var b strings.Builder
+	b.WriteString(Scheme + "://" + Host + "?fp=" + p.Fingerprint)
 	if p.Name != "" {
-		q.Set("name", p.Name)
+		b.WriteString("&name=" + url.QueryEscape(p.Name))
 	}
-	q.Set("addr", strings.Join(p.Addrs, ","))
-	q.Set("n", p.Nonce)
-	return Scheme + "://" + Host + "?" + q.Encode()
+	b.WriteString("&addr=" + strings.Join(p.Addrs, ","))
+	b.WriteString("&n=" + p.Nonce)
+	return b.String()
 }
 
 // Parse decodes a pairing link. It rejects anything malformed, any unexpected

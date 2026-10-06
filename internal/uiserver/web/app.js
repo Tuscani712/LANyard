@@ -1081,22 +1081,24 @@ function renderSettings(s) {
   box.appendChild(settingsField("Bandwidth limit (MB/s, 0 = unlimited)", bw));
   box.appendChild(settingsField("Peer port (restart to apply)", port));
 
-  // Updates (release channel is not live yet; nothing is fetched until a URL
-  // is set below).
-  const updURL = textInput(s.update_url, "set-update-url");
-  updURL.placeholder = "https://\u2026/latest.json (not live yet)";
-  updURL.style.minWidth = "360px";
-  const auto = checkInput(s.auto_update, "set-auto-update");
-  const updResult = el("div", "msg", ""); updResult.hidden = true; updResult.id = "set-upd-result";
-  box.appendChild(el("div", "section-title", "Updates"));
-  box.appendChild(settingsField("Running version", el("div", "muted", s.version || "")));
-  box.appendChild(settingsField("Update manifest URL (https)", updURL));
-  box.appendChild(settingsField("Download new versions automatically", auto));
-  const updActions = el("div", "actions");
-  updActions.appendChild(btn("Check for updates", checkForUpdates, "ghost"));
-  updActions.appendChild(btn("Download update", downloadUpdate, "ghost"));
-  box.appendChild(updActions);
-  box.appendChild(updResult);
+  // Updates. The whole block is hidden until a release channel is configured
+  // (the compiled default has none), so no update control is ever offered that
+  // could make the app contact the internet by itself.
+  if (s.update_url && s.update_url.trim()) {
+    const updURL = textInput(s.update_url, "set-update-url");
+    updURL.style.minWidth = "360px";
+    const auto = checkInput(s.auto_update, "set-auto-update");
+    const updResult = el("div", "msg", ""); updResult.hidden = true; updResult.id = "set-upd-result";
+    box.appendChild(el("div", "section-title", "Updates"));
+    box.appendChild(settingsField("Running version", el("div", "muted", s.version || "")));
+    box.appendChild(settingsField("Update manifest URL (https)", updURL));
+    box.appendChild(settingsField("Download new versions automatically", auto));
+    const updActions = el("div", "actions");
+    updActions.appendChild(btn("Check for updates", checkForUpdates, "ghost"));
+    updActions.appendChild(btn("Download update", downloadUpdate, "ghost"));
+    box.appendChild(updActions);
+    box.appendChild(updResult);
+  }
 
   const msg = el("div", "msg err", ""); msg.hidden = true; msg.id = "set-msg"; box.appendChild(msg);
   const acts = el("div", "actions");

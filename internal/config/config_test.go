@@ -18,3 +18,15 @@ func TestNotificationsDefaultOn(t *testing.T) {
 		t.Fatal("an explicit on should enable notifications")
 	}
 }
+
+// Updates must be off and unconfigured by default, so a fresh install never
+// contacts the internet. The UI hides the whole Updates block until a URL is set.
+func TestUpdatesOffByDefault(t *testing.T) {
+	var s Settings
+	if s.AutoUpdate {
+		t.Fatal("AutoUpdate must default to off")
+	}
+	if s.UpdateURL != "" {
+		t.Fatal("UpdateURL must default to empty")
+	}
+}
