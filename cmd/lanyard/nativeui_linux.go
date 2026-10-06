@@ -7,6 +7,7 @@ package main
 #include <stdlib.h>
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
+#include <pthread.h>
 
 static GtkWidget *lan_win = NULL;
 static GtkWidget *lan_view = NULL;
@@ -59,6 +60,54 @@ static int lan_open(const char *title, const char *url, const char *datadir,
 
 static void lan_run(void) { gtk_main(); }
 
+typedef struct {
+	int folder;
+	const char *title, *start;
+	char *result; // newline-joined paths, g_malloc'd; NULL when cancelled
+	int done;
+	pthread_mutex_t mu;
+	pthread_cond_t cv;
+} lan_pick_t;
+
+static gboolean lan_idle_pick(gpointer data) {
+	lan_pick_t *p = (lan_pick_t *)data;
+	GtkWidget *dlg = gtk_file_chooser_dialog_new(
+		(p->title && p->title[0]) ? p->title : (p->folder ? "Choose a folder" : "Choose files"),
+		lan_win ? GTK_WINDOW(lan_win) : NULL,
+		p->folder ? GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER : GTK_FILE_CHOOSER_ACTION_OPEN,
+		"_Cancel", GTK_RESPONSE_CANCEL, "_Select", GTK_RESPONSE_ACCEPT, NULL);
+	gtk_file_chooser_set_local_only(GTK_FILE_CHOOSER(dlg), TRUE);
+	if (!p->folder) gtk_file_chooser_set_select_multiple(GTK_FILE_CHOOSER(dlg), TRUE);
+	if (p->start && p->start[0]) gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dlg), p->start);
+	if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+		GSList *l = gtk_file_chooser_get_filenames(GTK_FILE_CHOOSER(dlg));
+		GString *out = g_string_new("");
+		for (GSList *i = l; i; i = i->next) {
+			if (out->len) g_string_append_c(out, '\n');
+			g_string_append(out, (char *)i->data);
+			g_free(i->data);
+		}
+		g_slist_free(l);
+		p->result = g_string_free(out, FALSE);
+	}
+	gtk_widget_destroy(dlg);
+	pthread_mutex_lock(&p->mu);
+	p->done = 1;
+	pthread_cond_signal(&p->cv);
+	pthread_mutex_unlock(&p->mu);
+	return G_SOURCE_REMOVE;
+}
+
+// lan_pick runs the dialog on the GTK thread and blocks the caller until done.
+static char *lan_pick(int folder, const char *title, const char *start) {
+	lan_pick_t p = {folder, title, start, NULL, 0, PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER};
+	g_idle_add(lan_idle_pick, &p);
+	pthread_mutex_lock(&p.mu);
+	while (!p.done) pthread_cond_wait(&p.cv, &p.mu);
+	pthread_mutex_unlock(&p.mu);
+	return p.result;
+}
+
 static gboolean lan_idle_show(gpointer d) {
 	if (lan_win) { gtk_widget_show_all(lan_win); gtk_window_deiconify(GTK_WINDOW(lan_win)); gtk_window_present(GTK_WINDOW(lan_win)); }
 	return G_SOURCE_REMOVE;
@@ -76,8 +125,12 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"strings"
+	"sync"
 	"syscall"
 	"unsafe"
+
+	"lanyard/internal/uiserver"
 )
 
 //go:embed icon.ico
@@ -130,6 +183,8 @@ func runNativeUI(opts nativeUIOptions) error {
 		return errors.New("no display available for the native window")
 	}
 	nativeOpen = true
+	uiserver.PickHook = pickNative
+	defer func() { uiserver.PickHook = nil }()
 	C.lan_set_hide_on_close(boolToInt(minimizeToTray.Load() && currentTrayActive()))
 
 	sig := make(chan os.Signal, 1)
@@ -170,3 +225,29 @@ func boolToInt(b bool) C.int {
 
 // currentTrayActive is false until the Linux tray exists.
 func currentTrayActive() bool { return false }
+
+var pickMu sync.Mutex
+
+// pickNative shows GTK's own file chooser. It is called from HTTP handler
+// goroutines, so the dialog is marshalled onto the GTK thread by lan_pick.
+// No paths and no error means the person cancelled.
+func pickNative(kind, title, start string) ([]string, error) {
+	pickMu.Lock()
+	defer pickMu.Unlock()
+	if !nativeOpen {
+		return nil, errors.New("the file dialog needs the native window")
+	}
+	var folder C.int
+	if kind == "folder" {
+		folder = 1
+	}
+	cTitle, cStart := C.CString(title), C.CString(start)
+	defer C.free(unsafe.Pointer(cTitle))
+	defer C.free(unsafe.Pointer(cStart))
+	res := C.lan_pick(folder, cTitle, cStart)
+	if res == nil {
+		return nil, nil
+	}
+	defer C.g_free(C.gpointer(res))
+	return strings.Split(C.GoString(res), "\n"), nil
+}
