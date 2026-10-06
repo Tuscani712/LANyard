@@ -2,7 +2,6 @@ package io.github.tuscani712.lanyard
 
 import android.app.Application
 import android.net.Uri
-import android.provider.OpenableColumns
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.gson.JsonObject
@@ -13,10 +12,11 @@ import io.github.tuscani712.lanyard.core.PairingFlow
 import io.github.tuscani712.lanyard.core.PeerClient
 import io.github.tuscani712.lanyard.core.PeerStatusException
 import io.github.tuscani712.lanyard.core.ProbeClient
-import io.github.tuscani712.lanyard.core.PushSource
 import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.net.NearbyDevice
 import io.github.tuscani712.lanyard.net.NsdDiscovery
+import io.github.tuscani712.lanyard.share.SourceResult
+import io.github.tuscani712.lanyard.share.spoolShare
 import io.github.tuscani712.lanyard.transfer.TransferManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -26,7 +26,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.io.IOException
 
 /** A paired peer plus its last-known reachability. */
 data class PairedStatus(val peer: PairedPeer, val online: Boolean)
@@ -216,18 +215,23 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Streams the picked documents to the peer's Inbox (see Transfers). */
+    /** Spools the picked documents and pushes them to the peer's Inbox (see Transfers). */
     fun sendFiles(peer: PairedPeer, uris: List<Uri>) {
         if (uris.isEmpty()) return
         val app = getApplication<Application>()
         viewModelScope.launch {
-            val sources = withContext(Dispatchers.IO) { uris.mapNotNull { toSource(app, it) } }
+            val results = withContext(Dispatchers.IO) {
+                val used = HashSet<String>()
+                uris.map { spoolShare(app, it, used) }
+            }
+            val sources = results.mapNotNull { (it as? SourceResult.Ok)?.source }
+            val spools = results.mapNotNull { (it as? SourceResult.Ok)?.spool }
             if (sources.isEmpty()) {
                 setNotice("Those files could not be opened.")
                 return@launch
             }
             val label = sources.first().relPath + if (sources.size > 1) " +${sources.size - 1}" else ""
-            TransferManager.enqueuePush(peer, sources, label)
+            TransferManager.enqueuePush(peer, sources, label) { spools.forEach { it.delete() } }
             setNotice("Sending ${sources.size} file(s). See Transfers.")
         }
     }
@@ -242,24 +246,6 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     fun rememberTree(uri: Uri) = TransferManager.rememberTree(uri)
 
     fun rememberedTree(): Uri? = TransferManager.rememberedTree()
-
-    private fun toSource(app: Application, uri: Uri): PushSource? {
-        val resolver = app.contentResolver
-        var name = "file"
-        var size = 0L
-        resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE), null, null, null)?.use { c ->
-            if (c.moveToFirst()) {
-                val nameIdx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                if (nameIdx >= 0) name = c.getString(nameIdx) ?: name
-                val sizeIdx = c.getColumnIndex(OpenableColumns.SIZE)
-                if (sizeIdx >= 0 && !c.isNull(sizeIdx)) size = c.getLong(sizeIdx)
-            }
-        }
-        val safeName = name.substringAfterLast('/').ifEmpty { "file" }
-        return PushSource(safeName, size, System.currentTimeMillis()) {
-            resolver.openInputStream(uri) ?: throw IOException("cannot open $safeName")
-        }
-    }
 
     private fun setNotice(text: String) = _state.update { current ->
         val detail = current.detail ?: return@update current

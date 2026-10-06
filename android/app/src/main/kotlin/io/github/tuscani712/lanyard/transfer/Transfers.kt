@@ -16,6 +16,8 @@ import io.github.tuscani712.lanyard.core.PeerClient
 import io.github.tuscani712.lanyard.core.PushResult
 import io.github.tuscani712.lanyard.core.PushSession
 import io.github.tuscani712.lanyard.core.PushSource
+import io.github.tuscani712.lanyard.core.ShareValidation
+import io.github.tuscani712.lanyard.core.SpoolEntry
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -66,10 +68,22 @@ object TransferManager {
 
     private val cancels = HashMap<String, AtomicBoolean>()
     private val speedSamples = java.util.concurrent.ConcurrentHashMap<String, SpeedSample>()
+    private val cleanups = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
 
     fun init(application: Application) {
         app = application
         _state.value = loadHistory()
+        sweepSpool()
+    }
+
+    /** Deletes share-spool files left behind by a crash, on app start. */
+    private fun sweepSpool() {
+        scope.launch {
+            val dir = File(app.cacheDir, "share")
+            val entries = dir.listFiles()?.map { SpoolEntry(it.name, it.lastModified()) } ?: return@launch
+            ShareValidation.staleSpoolFiles(entries, System.currentTimeMillis())
+                .forEach { File(dir, it).delete() }
+        }
     }
 
     fun running(): List<TransferRecord> = _state.value.filter { it.state == TransferState.Running || it.state == TransferState.Queued }
@@ -105,8 +119,9 @@ object TransferManager {
 
     // --- enqueue ---
 
-    fun enqueuePush(peer: PairedPeer, sources: List<PushSource>, label: String): String {
+    fun enqueuePush(peer: PairedPeer, sources: List<PushSource>, label: String, onFinished: (() -> Unit)? = null): String {
         val id = newId()
+        if (onFinished != null) cleanups[id] = onFinished
         add(TransferRecord(id, "send", peer.name, peer.fingerprint, label, sources.sumOf { it.size }, 0, TransferState.Queued, null, 0.0, now()))
         TransferService.start(app)
         scope.launch { runPush(id, peer, sources) }
@@ -121,27 +136,55 @@ object TransferManager {
         return id
     }
 
-    private suspend fun runPush(id: String, peer: PairedPeer, sources: List<PushSource>) {
+    /**
+     * Sends a short text snippet. It shows as a transfer row so it is visible and
+     * its completion notification follows the same setting as files.
+     */
+    fun enqueueSnippet(peer: PairedPeer, text: String): String {
+        val id = newId()
+        val size = text.toByteArray(Charsets.UTF_8).size.toLong()
+        add(TransferRecord(id, "send", peer.name, peer.fingerprint, "Text", size, 0, TransferState.Queued, null, 0.0, now()))
+        scope.launch { runSnippet(id, peer, text) }
+        return id
+    }
+
+    private suspend fun runSnippet(id: String, peer: PairedPeer, text: String) {
         val identity = IdentityHolder.identity ?: return fail(id, "no identity on this device")
-        val cancel = AtomicBoolean(false)
-        cancels[id] = cancel
         setState(id, TransferState.Running)
-        val sent = LongArray(sources.size)
-        val result = try {
-            PushSession(PeerClient(peer.host, peer.port, identity, peer.fingerprint)).push(
-                sources = sources,
-                onProgress = { index, bytes, _ ->
-                    sent[index] = bytes
-                    val done = sent.sum()
-                    update(id) { it.copy(done = done, total = maxOf(it.total, done), speed = sampleSpeed(id, done)) }
-                },
-                isCancelled = { cancel.get() },
-            )
+        val failure = try {
+            PeerClient(peer.host, peer.port, identity, peer.fingerprint).sendSnippet(text)
+            null
         } catch (e: Exception) {
-            PushResult.Failed(e.message ?: "send failed")
+            e.message ?: "could not send text"
         }
-        cancels.remove(id)
-        finish(id, result)
+        if (failure == null) complete(id, "Text sent") else fail(id, failure)
+    }
+
+    private suspend fun runPush(id: String, peer: PairedPeer, sources: List<PushSource>) {
+        try {
+            val identity = IdentityHolder.identity ?: return fail(id, "no identity on this device")
+            val cancel = AtomicBoolean(false)
+            cancels[id] = cancel
+            setState(id, TransferState.Running)
+            val sent = LongArray(sources.size)
+            val result = try {
+                PushSession(PeerClient(peer.host, peer.port, identity, peer.fingerprint)).push(
+                    sources = sources,
+                    onProgress = { index, bytes, _ ->
+                        sent[index] = bytes
+                        val done = sent.sum()
+                        update(id) { it.copy(done = done, total = maxOf(it.total, done), speed = sampleSpeed(id, done)) }
+                    },
+                    isCancelled = { cancel.get() },
+                )
+            } catch (e: Exception) {
+                PushResult.Failed(e.message ?: "send failed")
+            }
+            cancels.remove(id)
+            finish(id, result)
+        } finally {
+            cleanups.remove(id)?.invoke()
+        }
     }
 
     private suspend fun runDownload(id: String, peer: PairedPeer, shareId: String, path: String, tree: Uri) {
