@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"lanyard/internal/approval"
@@ -59,8 +60,11 @@ type Server struct {
 	hashes    hashCache
 	rl        rateLimiter
 	log       *slog.Logger
-	srv       *http.Server
-	port      int
+	// mu guards srv and port, which Listen and Serve write while Shutdown and
+	// Port may read from other goroutines.
+	mu   sync.Mutex
+	srv  *http.Server
+	port int
 }
 
 func NewServer(id *identity.Identity, hello func() discovery.Hello, sh *shares.Manager, tr *trust.Store, auth Authorizer, log *slog.Logger) *Server {
@@ -87,11 +91,17 @@ func (s *Server) Listen(preferred int) (net.Listener, error) {
 			return nil, err
 		}
 	}
+	s.mu.Lock()
 	s.port = ln.Addr().(*net.TCPAddr).Port
+	s.mu.Unlock()
 	return ln, nil
 }
 
-func (s *Server) Port() int { return s.port }
+func (s *Server) Port() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.port
+}
 
 func (s *Server) Serve(ln net.Listener) error {
 	mux := http.NewServeMux()
@@ -113,14 +123,17 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/v1/shares/{id}/complete", s.handleComplete)
 	mux.HandleFunc("HEAD /api/v1/shares/{id}/file", s.handleFile)
 
-	s.srv = &http.Server{
+	srv := &http.Server{
 		Handler:           s.withPeer(mux),
 		TLSConfig:         s.tlsConfig(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelDebug),
 	}
-	err := s.srv.ServeTLS(ln, "", "")
+	s.mu.Lock()
+	s.srv = srv
+	s.mu.Unlock()
+	err := srv.ServeTLS(ln, "", "")
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -128,10 +141,13 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.srv == nil {
+	s.mu.Lock()
+	srv := s.srv
+	s.mu.Unlock()
+	if srv == nil {
 		return nil
 	}
-	return s.srv.Shutdown(ctx)
+	return srv.Shutdown(ctx)
 }
 
 // withPeer attaches the caller's certificate fingerprint to the request context.

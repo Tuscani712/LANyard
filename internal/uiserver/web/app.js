@@ -818,8 +818,55 @@ function renderPairedPage() {
       row.appendChild(acts);
       stack.appendChild(row);
     }
-    box.appendChild(stack);
+  if (history.length) {
+    const hf = S.historyFilter || "all";
+    box.appendChild(el("div", "section-title", "History"));
+    const filters = el("div", "form-row");
+    for (const [key, label] of [["all", "All"], ["sent", "Sent"], ["received", "Received"], ["failed", "Failed"]]) {
+      const b = el("button", "btn ghost" + (hf === key ? " active" : ""), label);
+      b.addEventListener("click", () => { S.historyFilter = key; renderTransfersPage(); });
+      filters.appendChild(b);
+    }
+    box.appendChild(filters);
+    const list = history.filter((t) => {
+      if (hf === "sent") return t.direction === "push";
+      if (hf === "received") return t.direction === "download";
+      if (hf === "failed") return t.state === "Failed";
+      return true;
+    });
+    const hstack = el("div", "stack");
+    if (!list.length) hstack.appendChild(el("div", "empty", "Nothing here."));
+    for (const t of list) {
+      const row = el("div", "row col");
+      const top = el("div", "row"); top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
+      const dir = t.direction === "push" ? "\u2191 Sent" : "\u2193 Received";
+      const name = t.share_label || (t.files && t.files[0] && t.files[0].local) || t.share_id || "transfer";
+      top.appendChild(el("div", "grow name", dir + " \u00b7 " + name));
+      top.appendChild(el("span", "badge " + stateClass(t.state), t.state));
+      row.appendChild(top);
+      const n = t.files_total || (t.files || []).length;
+      const meta = el("div", "meta");
+      meta.textContent = `${fmtBytes(t.total)} \u00b7 ${n} file${n === 1 ? "" : "s"}` +
+        (t.peer_name ? ` \u00b7 ${t.direction === "push" ? "to " : "from "}${t.peer_name}` : "") +
+        (t.finished_at ? ` \u00b7 ${fmtWhen(t.finished_at)}` : "");
+      row.appendChild(meta);
+      if (t.error) row.appendChild(el("div", "msg err", t.error));
+      const acts = el("div", "actions");
+      acts.appendChild(btn("Resend", async () => {
+        const r = await fetch(`/api/transfers/${encodeURIComponent(t.id)}/retry`, { method: "POST" });
+        if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
+        toast("Resent.", "ok");
+      }));
+      acts.appendChild(btn("Remove", async () => {
+        await fetch(`/api/transfers/${encodeURIComponent(t.id)}/cancel`, { method: "POST" });
+      }, "ghost"));
+      row.appendChild(acts);
+      hstack.appendChild(row);
+    }
+    box.appendChild(hstack);
   }
+  box.appendChild(stack);
+}
   box.appendChild(el("div", "section-title", "Paired devices"));
   const stack = el("div", "stack");
   if (!trustList.length) stack.appendChild(el("div", "empty", "No paired devices yet. Pair with a device from View Devices."));
@@ -897,8 +944,9 @@ function shareLifetimeText(s) {
 function renderTransfersPage() {
   const box = $("transfers-body");
   clear(box);
-  const anyDone = transfersList.some((t) => t.state === "Done");
-  $("clear-finished").hidden = !anyDone;
+  const history = transfersList.filter((t) => t.state === "Done" || t.state === "Failed");
+  const activeTransfers = transfersList.filter((t) => t.state !== "Done" && t.state !== "Failed");
+  $("clear-finished").hidden = !history.length;
   const stack = el("div", "stack");
   for (const sp of snippetsList) {
     const row = el("div", "row col");
@@ -917,8 +965,7 @@ function renderTransfersPage() {
     row.appendChild(acts);
     stack.appendChild(row);
   }
-  if (!transfersList.length && !incomingList.length && !snippetsList.length) stack.appendChild(el("div", "empty", "No transfers."));
-  for (const inc of incomingList) {
+  if (!transfersList.length && !incomingList.length && !snippetsList.length) stack.appendChild(el("div", "empty", "No transfers."));  for (const inc of incomingList) {
     const row = el("div", "row col");
     const top = el("div", "row"); top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
     top.appendChild(el("div", "grow name", "\u2193 Receiving from " + (inc.peer_name || prettyId(inc.peer_fp) || "a device")));
@@ -937,7 +984,7 @@ function renderTransfersPage() {
     row.appendChild(acts);
     stack.appendChild(row);
   }
-  for (const t of transfersList) {
+  for (const t of activeTransfers) {
     const row = el("div", "row col");
     const files = t.files || [];
     const cur = files[t.current_index] || null;
@@ -1638,7 +1685,7 @@ $("view-mode").addEventListener("click", () => { S.mode = S.mode === "grid" ? "l
 $("share-add").addEventListener("click", () => submitShare(false));
 $("share-path").addEventListener("keydown", (e) => { if (e.key === "Enter") submitShare(false); });
 $("stop-all").addEventListener("click", async () => { if (!confirm("Stop every share now?")) return; await fetch("/api/shares/stop-all", { method: "POST" }); });
-$("clear-finished").addEventListener("click", () => fetch("/api/transfers/clear-finished", { method: "POST" }));
+$("clear-finished").addEventListener("click", () => fetch("/api/transfers/clear-history", { method: "POST" }));
 $("pair-close").addEventListener("click", closePair);
 $("pair").addEventListener("click", (e) => { if (e.target === $("pair")) closePair(); });
 

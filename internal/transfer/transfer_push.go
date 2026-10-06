@@ -75,7 +75,8 @@ func (m *Manager) Push(ctx context.Context, p PushParams) (*View, error) {
 	job := &Job{
 		ID: "j_" + randHex(6), Direction: "push",
 		PeerID: p.PeerID, PeerName: p.PeerName, Host: p.Host, Port: p.Port,
-		ShareLabel: "Inbox", Files: files, Total: total,
+		ShareLabel: "Inbox", Sources: append([]string(nil), p.Paths...),
+		Files: files, Total: total,
 		State: StateQueued, StartedAt: time.Now(),
 	}
 	m.mu.Lock()
@@ -249,6 +250,7 @@ func (m *Manager) pushFail(job *Job, err error) {
 	job.State = StateFailed
 	job.Error = err.Error()
 	job.UpdatedAt = time.Now()
+	job.FinishedAt = job.UpdatedAt
 	job.mu.Unlock()
 	m.persist()
 	m.onChange()

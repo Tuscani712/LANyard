@@ -69,7 +69,7 @@ const (
 	spaceMargin = 64 << 20
 	// viewWindow caps how many per-file rows a job sends to the UI.
 	viewWindow         = 200
-	historyKeep        = 20
+	historyKeep        = 500
 	maxRestartsPerFile = 3
 )
 
@@ -118,16 +118,23 @@ func (f *FileJob) localRel() string {
 
 // Job is one download (or later, push).
 type Job struct {
-	ID         string     `json:"id"`
-	Direction  string     `json:"direction"`
-	PeerID     string     `json:"peer_id"`
-	PeerName   string     `json:"peer_name"`
-	Host       string     `json:"host"`
-	Port       int        `json:"port"`
-	ShareID    string     `json:"share_id"`
-	ShareLabel string     `json:"share_label"`
-	Root       string     `json:"root"`
-	Dest       string     `json:"dest"`
+	ID         string `json:"id"`
+	Direction  string `json:"direction"`
+	PeerID     string `json:"peer_id"`
+	PeerName   string `json:"peer_name"`
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	ShareID    string `json:"share_id"`
+	ShareLabel string `json:"share_label"`
+	Root       string `json:"root"`
+	Dest       string `json:"dest"`
+	// RemotePaths are the share-relative paths this download asked for. They are
+	// kept as a slice (not joined) because a path may contain a comma, and a
+	// retry must request exactly the same paths.
+	RemotePaths []string `json:"remote_paths,omitempty"`
+	// Sources are the local paths a push was started from, kept so a retry can
+	// re-offer the same files (or folders).
+	Sources    []string   `json:"sources,omitempty"`
 	Files      []*FileJob `json:"files"`
 	Total      int64      `json:"total"`
 	Done       int64      `json:"done"`
@@ -137,6 +144,11 @@ type Job struct {
 	StartedAt  time.Time  `json:"started_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
 	FinishedAt time.Time  `json:"finished_at,omitempty"`
+	// FilesTotalStored / FilesDoneStored are only set in the compact on-disk
+	// form of a finished or failed job, where Files is omitted to keep the
+	// saved history small. They are read back when Files is empty.
+	FilesTotalStored int `json:"files_total,omitempty"`
+	FilesDoneStored  int `json:"files_done,omitempty"`
 	// OneTime is set when the share is a one-time share: a finished, verified
 	// download is reported to the sender so it can retire the share.
 	OneTime           bool `json:"one_time,omitempty"`
@@ -268,30 +280,94 @@ func (m *Manager) Load() error {
 	return nil
 }
 
+// jobArchive is the compact on-disk form of a finished or failed job: it keeps
+// everything the history list needs (peer, direction, state, times, sizes and
+// file counts) but drops the per-file list, which can be thousands of entries.
+// It marshals under the same JSON keys as Job so Load reads it back unchanged.
+type jobArchive struct {
+	ID          string    `json:"id"`
+	Direction   string    `json:"direction"`
+	PeerID      string    `json:"peer_id"`
+	PeerName    string    `json:"peer_name"`
+	Host        string    `json:"host"`
+	Port        int       `json:"port"`
+	ShareID     string    `json:"share_id"`
+	ShareLabel  string    `json:"share_label"`
+	Root        string    `json:"root"`
+	Dest        string    `json:"dest"`
+	RemotePaths []string  `json:"remote_paths,omitempty"`
+	Sources     []string  `json:"sources,omitempty"`
+	Total       int64     `json:"total"`
+	Done        int64     `json:"done"`
+	State       string    `json:"state"`
+	Error       string    `json:"error"`
+	StartedAt   time.Time `json:"started_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	FinishedAt  time.Time `json:"finished_at,omitempty"`
+	FilesTotal  int       `json:"files_total,omitempty"`
+	FilesDone   int       `json:"files_done,omitempty"`
+	OneTime     bool      `json:"one_time,omitempty"`
+}
+
+// archiveJob builds the compact form. Caller holds job.mu.
+func archiveJob(j *Job) jobArchive {
+	done := 0
+	for _, f := range j.Files {
+		if f.State == FileDone {
+			done++
+		}
+	}
+	return jobArchive{
+		ID: j.ID, Direction: j.Direction, PeerID: j.PeerID, PeerName: j.PeerName,
+		Host: j.Host, Port: j.Port, ShareID: j.ShareID, ShareLabel: j.ShareLabel,
+		Root: j.Root, Dest: j.Dest,
+		RemotePaths: append([]string(nil), j.RemotePaths...),
+		Sources:     append([]string(nil), j.Sources...),
+		Total:       j.Total, Done: j.Done, State: j.State, Error: j.Error,
+		StartedAt: j.StartedAt, UpdatedAt: j.UpdatedAt, FinishedAt: j.FinishedAt,
+		FilesTotal: len(j.Files), FilesDone: done, OneTime: j.OneTime,
+	}
+}
+
 func (m *Manager) persist() {
 	m.mu.Lock()
 	jobs := make([]*Job, 0, len(m.jobs))
 	var finished []*Job
 	for _, j := range m.jobs {
-		if j.State == StateDone {
+		if j.State == StateDone || j.State == StateFailed {
 			finished = append(finished, j)
 		} else {
 			jobs = append(jobs, j)
 		}
 	}
-	m.mu.Unlock()
-	// Keep a short history of finished jobs (without their per-file detail).
-	sort.Slice(finished, func(a, b int) bool { return finished[a].FinishedAt.After(finished[b].FinishedAt) })
+	// Keep only the newest history entries; older ones are dropped from memory
+	// and from the saved list, so neither grows without bound.
+	sort.Slice(finished, func(a, b int) bool {
+		ta, tb := finished[a].FinishedAt, finished[b].FinishedAt
+		if ta.Equal(tb) {
+			return finished[a].UpdatedAt.After(finished[b].UpdatedAt)
+		}
+		return ta.After(tb)
+	})
 	if len(finished) > historyKeep {
+		for _, j := range finished[historyKeep:] {
+			delete(m.jobs, j.ID)
+		}
 		finished = finished[:historyKeep]
 	}
+	m.mu.Unlock()
+
 	jobs = append(jobs, finished...)
 
 	var buf bytes.Buffer
 	buf.WriteByte('[')
 	for i, j := range jobs {
 		j.mu.Lock()
-		b, err := json.Marshal(j)
+		var payload any = j
+		if j.State == StateDone || j.State == StateFailed {
+			payload = archiveJob(j)
+		}
+		b, err := json.Marshal(payload)
 		j.mu.Unlock()
 		if err != nil {
 			continue
@@ -327,19 +403,20 @@ func (m *Manager) Create(ctx context.Context, p CreateParams) (*View, error) {
 		p.Paths = []string{""}
 	}
 	job := &Job{
-		ID:         "j_" + randHex(6),
-		Direction:  "download",
-		PeerID:     p.PeerID,
-		PeerName:   p.PeerName,
-		Host:       p.Host,
-		Port:       p.Port,
-		ShareID:    p.ShareID,
-		ShareLabel: p.ShareLabel,
-		Root:       strings.Join(p.Paths, ","),
-		Dest:       p.Dest,
-		State:      StateQueued,
-		StartedAt:  time.Now(),
-		wake:       make(chan struct{}, 1),
+		ID:          "j_" + randHex(6),
+		Direction:   "download",
+		PeerID:      p.PeerID,
+		PeerName:    p.PeerName,
+		Host:        p.Host,
+		Port:        p.Port,
+		ShareID:     p.ShareID,
+		ShareLabel:  p.ShareLabel,
+		Root:        strings.Join(p.Paths, ","),
+		RemotePaths: append([]string(nil), p.Paths...),
+		Dest:        p.Dest,
+		State:       StateQueued,
+		StartedAt:   time.Now(),
+		wake:        make(chan struct{}, 1),
 	}
 	seen := map[string]bool{}
 	for _, pth := range p.Paths {
@@ -535,6 +612,78 @@ func (m *Manager) ClearFinished() int {
 	return n
 }
 
+// ClearHistory forgets every finished and failed job (the whole history list).
+func (m *Manager) ClearHistory() int {
+	m.mu.Lock()
+	n := 0
+	for id, j := range m.jobs {
+		j.mu.Lock()
+		terminal := j.State == StateDone || j.State == StateFailed
+		j.mu.Unlock()
+		if terminal {
+			delete(m.jobs, id)
+			n++
+		}
+	}
+	m.mu.Unlock()
+	if n > 0 {
+		m.persist()
+		m.onChange()
+	}
+	return n
+}
+
+// Retry re-creates a failed or finished job with the same peer, sources and
+// destination, and returns the new job. The old job is left untouched. A retry
+// fails cleanly when a push source is gone or the peer's share cannot be read.
+func (m *Manager) Retry(ctx context.Context, id string) (*View, error) {
+	m.mu.Lock()
+	old, ok := m.jobs[id]
+	m.mu.Unlock()
+	if !ok {
+		return nil, errors.New("no such job")
+	}
+	old.mu.Lock()
+	if old.State != StateDone && old.State != StateFailed {
+		old.mu.Unlock()
+		return nil, errors.New("only finished or failed transfers can be resent")
+	}
+	direction := old.Direction
+	dl := CreateParams{
+		PeerID: old.PeerID, PeerName: old.PeerName, Host: old.Host, Port: old.Port,
+		ShareID: old.ShareID, ShareLabel: old.ShareLabel, Dest: old.Dest,
+	}
+	pu := PushParams{PeerID: old.PeerID, PeerName: old.PeerName, Host: old.Host, Port: old.Port}
+	if len(old.Sources) > 0 {
+		pu.Paths = append([]string(nil), old.Sources...)
+	} else {
+		for _, f := range old.Files {
+			pu.Paths = append(pu.Paths, f.Local)
+		}
+	}
+	root := old.Root
+	remotePaths := append([]string(nil), old.RemotePaths...)
+	old.mu.Unlock()
+
+	switch direction {
+	case "push":
+		return m.Push(ctx, pu)
+	case "download":
+		switch {
+		case len(remotePaths) > 0:
+			dl.Paths = remotePaths
+		case root == "":
+			dl.Paths = []string{""}
+		default:
+			// Older saved jobs predate RemotePaths; fall back to splitting Root.
+			dl.Paths = strings.Split(root, ",")
+		}
+		return m.Create(ctx, dl)
+	default:
+		return nil, errors.New("this transfer cannot be resent")
+	}
+}
+
 // PeerAvailable is called when discovery sees a verified peer. It refreshes
 // the address of that peer's jobs, nudges retrying workers to try immediately,
 // and restarts jobs that were waiting for the peer (spec §8.2).
@@ -671,7 +820,13 @@ func (m *Manager) view(j *Job) *View {
 	for _, f := range j.Files[start:end] {
 		v.Files = append(v.Files, FileView{Rel: f.Rel, Local: f.localRel(), Size: f.Size, Done: f.Done, State: f.State})
 	}
-	v.CurrentIdx, v.FilesStart, v.FilesTotal = cur-start, start, len(j.Files)
+	// A compactly persisted terminal job carries counts but no per-file list.
+	filesTotal, filesDone := len(j.Files), v.FilesDone
+	if filesTotal == 0 {
+		filesTotal, filesDone = j.FilesTotalStored, j.FilesDoneStored
+	}
+	v.CurrentIdx, v.FilesStart, v.FilesTotal = cur-start, start, filesTotal
+	v.FilesDone = filesDone
 	if j.State == StateTransferring && verifying > 0 && downloading == 0 {
 		v.State = StateVerifying
 	}
@@ -960,6 +1115,7 @@ func (m *Manager) fail(job *Job, msg string) {
 	job.State = StateFailed
 	job.Error = msg
 	job.UpdatedAt = time.Now()
+	job.FinishedAt = job.UpdatedAt
 	job.mu.Unlock()
 	m.persist()
 	m.onChange()

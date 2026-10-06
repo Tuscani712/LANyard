@@ -252,6 +252,30 @@ func (s *Server) handleTransfersClear(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]int{"cleared": s.d.Transfers.ClearFinished()})
 }
 
+// handleTransfersClearHistory forgets every finished and failed job.
+func (s *Server) handleTransfersClearHistory(w http.ResponseWriter, r *http.Request) {
+	if s.d.Transfers == nil {
+		http.Error(w, "transfers unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, map[string]int{"cleared": s.d.Transfers.ClearHistory()})
+}
+
+// handleTransferRetry re-creates a finished or failed job with the same peer,
+// sources and destination, leaving the old one in the history.
+func (s *Server) handleTransferRetry(w http.ResponseWriter, r *http.Request) {
+	if s.d.Transfers == nil {
+		http.Error(w, "transfers unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	view, err := s.d.Transfers.Retry(r.Context(), r.PathValue("id"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	writeJSON(w, view)
+}
+
 func firstNonEmpty(a, b string) string {
 	if a != "" {
 		return a

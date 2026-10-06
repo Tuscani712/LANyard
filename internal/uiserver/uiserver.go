@@ -229,6 +229,8 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/update/download", s.auth(s.handleUpdateDownload))
 	mux.HandleFunc("POST /api/cancel-all", s.auth(s.handleCancelAll))
 	mux.HandleFunc("POST /api/transfers/clear-finished", s.auth(s.handleTransfersClear))
+	mux.HandleFunc("POST /api/transfers/clear-history", s.auth(s.handleTransfersClearHistory))
+	mux.HandleFunc("POST /api/transfers/{id}/retry", s.auth(s.handleTransferRetry))
 	mux.HandleFunc("GET /api/trust", s.auth(s.handleTrust))
 	mux.HandleFunc("POST /api/trust/{fp}/unpair", s.auth(s.handleUnpair))
 	mux.HandleFunc("POST /api/trust/{fp}/permissions", s.auth(s.handleTrustPermissions))
