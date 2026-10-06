@@ -1144,6 +1144,7 @@ function startPair(deviceId, name, mode) {
   if (mode === "pair") { pairView = { setup: true, mode, peer_fp: deviceId, peer_name: name }; $("pair").hidden = false; renderPair(); return; }
   sendPairRequest(deviceId, name, mode);
 }
+function openQRPanel() { pairView = { qr: true }; $("pair").hidden = false; renderPair(); }
 async function sendPairRequest(deviceId, name, mode) {
   const r = await fetch("/api/sessions/request", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: deviceId, mode, permissions: pairPerms, keep_connected: pairKeep }) });
   if (!r.ok) { pairView = { setup: true, mode, peer_fp: deviceId, peer_name: name, error: (await r.text()).trim() }; $("pair").hidden = false; renderPair(); return; }
@@ -1166,6 +1167,7 @@ function renderPair() {
   const body = $("pair-body"); clear(body);
   if (!pairView) return;
   const v = pairView;
+  if (v.qr) { $("pair-title").textContent = "Pair with a QR code"; renderQRPanel(body); return; }
   const who = whoOf(v);
   $("pair-title").textContent = (v.mode === "pair" ? "Pair with " : "Connect to ") + who;
   if (v.setup) {
@@ -1176,24 +1178,36 @@ function renderPair() {
     body.appendChild(el("div", "actions", "")).appendChild(btn("Send request", () => sendPairRequest(v.peer_fp, who, v.mode)));
     return;
   }
-  const sasBox = el("div", "sasbox");
-  sasBox.appendChild(el("div", "muted", "Both devices must show the same code:"));
-  sasBox.appendChild(el("div", "sas", sasText(v.sas)));
-  body.appendChild(sasBox);
+  if (v.via_qr) {
+    const box = el("div", "sasbox");
+    box.appendChild(el("div", "muted", "Paired via QR code \u2014 the fingerprint was pinned when the code was scanned, so there is no code to compare."));
+    if (v.peer_fp) box.appendChild(el("div", "muted", "Device fingerprint: " + v.peer_fp.slice(0, 16) + "\u2026"));
+    body.appendChild(box);
+  } else {
+    const sasBox = el("div", "sasbox");
+    sasBox.appendChild(el("div", "muted", "Both devices must show the same code:"));
+    sasBox.appendChild(el("div", "sas", sasText(v.sas)));
+    body.appendChild(sasBox);
+  }
   const status = el("p", "muted", ""); body.appendChild(status);
   const actions = el("div", "actions");
   const action = v.mode === "pair" ? "pair" : "connect";
 
   if (v.incoming && v.status === "pending") {
-    status.textContent = who + " wants to " + action + ". Confirm the code matches before accepting.";
+    status.textContent = v.via_qr
+      ? who + " wants to pair via QR code. Their fingerprint was pinned when they scanned your code."
+      : who + " wants to " + action + ". Confirm the code matches before accepting.";
     if (v.mode === "pair") { body.appendChild(permToggle("browse", "Let them browse and pull my shares", pairPerms.browse)); body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push)); }
     actions.appendChild(btn("Accept", () => acceptSession(v.id)));
     actions.appendChild(btn("Reject", () => sessionAction(v.id, "reject"), "ghost"));
   } else if (v.incoming && v.status === "accepted") {
-    status.textContent = "Accepted. Waiting for " + who + " to confirm the code\u2026";
+    status.textContent = v.via_qr ? "Accepted. Waiting for " + who + " to finish\u2026" : "Accepted. Waiting for " + who + " to confirm the code\u2026";
     actions.appendChild(btn("Cancel", () => sessionAction(v.id, "close"), "ghost"));
   } else if (!v.incoming && v.status === "pending") {
     status.textContent = "Waiting for " + who + " to accept\u2026";
+    actions.appendChild(btn("Cancel", () => sessionAction(v.id, "close"), "ghost"));
+  } else if (!v.incoming && v.status === "accepted" && v.via_qr) {
+    status.textContent = who + " accepted. Finishing the pairing\u2026";
     actions.appendChild(btn("Cancel", () => sessionAction(v.id, "close"), "ghost"));
   } else if (!v.incoming && v.status === "accepted") {
     status.textContent = who + " accepted. Check the code, then confirm.";
@@ -1210,6 +1224,88 @@ function renderPair() {
   }
   body.appendChild(actions);
 }
+async function renderQRPanel(body) {
+  body.appendChild(el("p", "muted", "Show this code to the other device, or paste their pairing link below. The code pins this device's fingerprint."));
+  const holder = el("div", "qrbox"); holder.id = "qr-holder";
+  holder.appendChild(el("div", "muted", "Loading\u2026"));
+  body.appendChild(holder);
+
+  const row = el("div", "form-row");
+  const inp = el("input"); inp.id = "pair-link-in"; inp.placeholder = "Paste a pairing link (lanyard://pair?\u2026)"; inp.style.flex = "1"; inp.style.minWidth = "260px";
+  const b = el("button", "btn", "Pair");
+  b.addEventListener("click", () => pairWithLink(inp.value));
+  inp.addEventListener("keydown", (e) => { if (e.key === "Enter") pairWithLink(inp.value); });
+  row.appendChild(inp); row.appendChild(b);
+  body.appendChild(row);
+
+  try {
+    const r = await fetch("/api/pair/payload");
+    if (!pairView || !pairView.qr) return; // panel closed while loading
+    if (!r.ok) { clear(holder); holder.appendChild(el("div", "msg err", (await r.text()).trim())); return; }
+    const p = await r.json();
+    clear(holder);
+    holder.appendChild(renderQR(p.uri));
+    const link = el("div", "muted", p.uri); link.style.wordBreak = "break-all"; link.style.fontSize = "11px";
+    holder.appendChild(link);
+    const exp = el("div", "muted", "Expires " + new Date(p.expires_at).toLocaleTimeString() + " and works once.");
+    holder.appendChild(exp);
+  } catch (e) {
+    clear(holder); holder.appendChild(el("div", "msg err", String(e)));
+  }
+}
+
+// renderQR draws a pairing link as a QR code onto a canvas, entirely offline.
+function renderQR(text) {
+  const canvas = document.createElement("canvas");
+  if (typeof qrcodegen === "undefined") return el("div", "msg err", "QR generator unavailable.");
+  const qr = qrcodegen.QrCode.encodeText(text, qrcodegen.QrCode.Ecc.MEDIUM);
+  const border = 4, scale = 6, dim = (qr.size + border * 2) * scale;
+  canvas.width = dim; canvas.height = dim; canvas.className = "qrcanvas";
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, dim, dim);
+  ctx.fillStyle = "#000";
+  for (let y = 0; y < qr.size; y++) for (let x = 0; x < qr.size; x++) {
+    if (qr.getModule(x, y)) ctx.fillRect((x + border) * scale, (y + border) * scale, scale, scale);
+  }
+  return canvas;
+}
+
+// parsePairLink is a light client-side read; the server validates the fields.
+function parsePairLink(uri) {
+  const m = /^lanyard:\/\/pair\?(.*)$/i.exec((uri || "").trim());
+  if (!m) return null;
+  const q = new URLSearchParams(m[1]);
+  return {
+    fp: q.get("fp") || "",
+    name: q.get("name") || "",
+    addrs: (q.get("addr") || "").split(",").map((s) => s.trim()).filter(Boolean),
+    n: q.get("n") || "",
+  };
+}
+
+// pairWithLink pairs with a device from a pasted (or scanned) link: add the
+// peer pinned to the link's fingerprint, then start a pairing session carrying
+// the one-time invite nonce.
+async function pairWithLink(uri) {
+  const p = parsePairLink(uri);
+  if (!p || !p.fp || !p.n || !p.addrs.length) { toast("That is not a valid pairing link.", "err"); return; }
+  pairPerms = { browse: true, push: false }; pairKeep = false;
+  let ok = false, lastErr = "";
+  for (const a of p.addrs) {
+    const r = await fetch("/api/peers/add", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: a, fingerprint: p.fp }) });
+    if (r.ok) { ok = true; break; }
+    lastErr = (await r.text()).trim();
+  }
+  if (!ok) { toast("Could not reach the device: " + lastErr, "err"); return; }
+  const name = p.name || p.fp.slice(0, 8);
+  const r = await fetch("/api/sessions/request", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: p.fp, mode: "pair", permissions: pairPerms, keep_connected: false, invite: p.n }) });
+  if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
+  pairView = await r.json();
+  renderPair();
+  toast("Pairing request sent to " + name + ".", "info");
+  pollSessions();
+}
+
 function permToggle(key, label, checked) {
   const w = el("label", "toggle");
   const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = !!checked;
@@ -1275,6 +1371,10 @@ setInterval(pollSessions, 1500);
 
 function onSessionTransition(s, before) {
   const who = whoOf(s);
+  if (!s.incoming && s.status === "accepted" && s.via_qr) {
+    confirmSession(s.id); // QR pairing: the fingerprint is already pinned, so no code to compare
+    return;
+  }
   if (!s.incoming && s.status === "accepted" && before === "pending") {
     toast(who + " accepted \u2014 confirm the code to finish.", "ok");
   }
@@ -1478,6 +1578,7 @@ function initWindowChrome() {
 $("user-menu").addEventListener("click", () => showView("settings"));
 $("device-search").addEventListener("input", (e) => { S.search = e.target.value.trim().toLowerCase(); if (S.view === "devices" && place().kind === "home") renderBody(); });
 $("refresh-btn").addEventListener("click", () => fetch("/api/peers").then((r) => r.json()).then(renderPeers).catch(() => { }));
+$("pair-qr-btn").addEventListener("click", openQRPanel);
 $("refresh-paired").addEventListener("click", () => { renderPairedPage(); });
 $("nav-back").addEventListener("click", () => { if (S.ex.hi > 0) { S.ex.hi--; renderExplorer(); } });
 $("nav-fwd").addEventListener("click", () => { if (S.ex.hi < S.ex.hist.length - 1) { S.ex.hi++; renderExplorer(); } });

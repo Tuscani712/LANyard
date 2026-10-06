@@ -178,6 +178,8 @@ input::placeholder { color: var(--muted-2); }
 .set-row input, .set-row select { flex: 1; min-width: 0; }
 .sasbox { text-align: center; margin: 8px 0; }
 .sas { font-family: ui-monospace, Consolas, monospace; font-size: 42px; font-weight: 700; letter-spacing: 7px; margin-top: 6px; }
+.qrbox { text-align: center; margin: 10px 0; }
+.qrcanvas { width: 264px; height: 264px; border-radius: 10px; background: #fff; padding: 6px; }
 
 /* ---- overlays ---- */
 .overlay { position: fixed; inset: 0; background: rgba(3, 6, 10, .55); display: flex; align-items: flex-start; justify-content: center; padding: 48px 16px; z-index: 50; }

@@ -64,7 +64,7 @@ type Deps struct {
 	Self      func() SelfInfo
 	Peers     func() []discovery.Peer
 	Subscribe func() (<-chan struct{}, func())
-	AddPeer   func(ctx context.Context, host string, port int) (*discovery.Peer, error)
+	AddPeer   func(ctx context.Context, host string, port int, expectedFP string) (*discovery.Peer, error)
 	Log       *slog.Logger
 
 	// M2: local shares, remote pull, and transfer jobs.
@@ -230,6 +230,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/trust/{fp}/unpair", s.auth(s.handleUnpair))
 	mux.HandleFunc("POST /api/trust/{fp}/permissions", s.auth(s.handleTrustPermissions))
 	mux.HandleFunc("GET /api/sessions", s.auth(s.handleSessions))
+	mux.HandleFunc("GET /api/pair/payload", s.auth(s.handlePairPayload))
 	mux.HandleFunc("POST /api/sessions/request", s.auth(s.handleSessionStart))
 	mux.HandleFunc("POST /api/sessions/{id}/accept", s.auth(s.handleSessionAccept))
 	mux.HandleFunc("POST /api/sessions/{id}/reject", s.auth(s.handleSessionReject))
@@ -325,7 +326,8 @@ func writeJSON(w http.ResponseWriter, v any) {
 
 func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Address string `json:"address"`
+		Address     string `json:"address"`
+		Fingerprint string `json:"fingerprint"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -343,7 +345,7 @@ func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	p, err := s.d.AddPeer(ctx, host, port)
+	p, err := s.d.AddPeer(ctx, host, port, strings.TrimSpace(req.Fingerprint))
 	if err != nil {
 		http.Error(w, "could not reach device: "+err.Error(), http.StatusBadGateway)
 		return

@@ -153,3 +153,59 @@ func TestOutgoingSessionDoesNotFireCallback(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+func TestPairInviteMintConsume(t *testing.T) {
+	st := newStore(t)
+	tok, exp := st.MintPairInvite()
+	if len(tok) < 32 {
+		t.Fatalf("token too short: %q", tok)
+	}
+	if !exp.After(time.Now()) {
+		t.Fatal("invite should expire in the future")
+	}
+	if !st.ConsumePairInvite(tok) {
+		t.Fatal("the first consume of a fresh invite should succeed")
+	}
+	if st.ConsumePairInvite(tok) {
+		t.Fatal("a reused invite must be rejected")
+	}
+}
+
+func TestPairInviteExpiry(t *testing.T) {
+	st := newStore(t)
+	st.SetPairInviteTTL(-time.Second) // already expired
+	tok, _ := st.MintPairInvite()
+	if st.ConsumePairInvite(tok) {
+		t.Fatal("an expired invite must be rejected")
+	}
+	if st.ConsumePairInvite(tok) {
+		t.Fatal("an expired invite must stay consumed")
+	}
+}
+
+func TestPairInviteUnknownRejected(t *testing.T) {
+	st := newStore(t)
+	if st.ConsumePairInvite("deadbeefdeadbeefdeadbeefdeadbeef") {
+		t.Fatal("an unknown invite must be rejected")
+	}
+	if st.ConsumePairInvite("") {
+		t.Fatal("an empty invite must be rejected")
+	}
+}
+
+func TestMarkViaQR(t *testing.T) {
+	st := newStore(t)
+	in, err := st.CreateIncoming(ModePair, "peer-fp", "Bob", "bob-dev", "nonceA", Permissions{})
+	if err != nil {
+		t.Fatalf("CreateIncoming: %v", err)
+	}
+	if v, _ := st.View(in.ID); v.ViaQR {
+		t.Fatal("a session must not start marked as QR")
+	}
+	if !st.MarkViaQR(in.ID) {
+		t.Fatal("MarkViaQR should find the session")
+	}
+	if v, _ := st.View(in.ID); !v.ViaQR {
+		t.Fatal("ViaQR should be set after MarkViaQR")
+	}
+}

@@ -152,13 +152,18 @@ func (m *Manager) tryAddrs(addrs []string, port int) (string, *Hello, error) {
 }
 
 // AddManual dials host:port directly (VPNs, other subnets, blocked multicast).
-func (m *Manager) AddManual(ctx context.Context, host string, port int) (*Peer, error) {
+// When expectedFP is set the presented certificate must match it exactly before
+// the peer is recorded, so a pairing link can pin a fingerprint (fail closed).
+func (m *Manager) AddManual(ctx context.Context, host string, port int, expectedFP string) (*Peer, error) {
 	certID, h, err := m.probe(ctx, host, port)
 	if err != nil {
 		return nil, err
 	}
 	if certID == m.selfID {
 		return nil, errors.New("that is this device")
+	}
+	if expectedFP != "" && certID != expectedFP {
+		return nil, errors.New("the device's certificate does not match the pairing link")
 	}
 	name, osName, label := host, "", ""
 	if h != nil {

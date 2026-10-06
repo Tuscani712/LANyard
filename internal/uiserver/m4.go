@@ -4,13 +4,49 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
+	"lanyard/internal/lanaddr"
+	"lanyard/internal/pairlink"
 	"lanyard/internal/peerapi"
 	"lanyard/internal/trust"
 )
+
+// handlePairPayload returns this device's QR pairing link: a one-time invite
+// the scanning device uses to pin our fingerprint and pair without the SAS
+// compare. The endpoint is token-gated like the others; the nonce is returned
+// in the JSON body (the scanning side never puts it in a request URL).
+func (s *Server) handlePairPayload(w http.ResponseWriter, r *http.Request) {
+	if s.d.Trust == nil {
+		http.Error(w, "pairing unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	self := s.d.Self()
+	nonce, exp := s.d.Trust.MintPairInvite()
+	port := self.PeerPort
+	addrs := make([]string, 0, 8)
+	for _, a := range lanaddr.Addrs() {
+		addrs = append(addrs, net.JoinHostPort(a, strconv.Itoa(port)))
+	}
+	uri := pairlink.Build(pairlink.Payload{
+		Fingerprint: self.DeviceID,
+		Name:        self.Name,
+		Addrs:       addrs,
+		Nonce:       nonce,
+	})
+	writeJSON(w, map[string]any{
+		"uri":        uri,
+		"fp":         self.DeviceID,
+		"name":       self.Name,
+		"addrs":      addrs,
+		"nonce":      nonce,
+		"expires_at": exp,
+	})
+}
 
 func (s *Server) handleTrust(w http.ResponseWriter, r *http.Request) {
 	if s.d.Trust == nil {
@@ -110,6 +146,8 @@ func (s *Server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 		Mode          string            `json:"mode"`
 		Permissions   trust.Permissions `json:"permissions"`
 		KeepConnected bool              `json:"keep_connected"`
+		// Invite is a one-time QR pairing nonce, if this pair came from a link.
+		Invite string `json:"invite"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -134,7 +172,7 @@ func (s *Server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 	nonce, _ := s.d.Trust.SelfNonce(sess.ID)
 	resp, err := s.d.Client.StartSession(r.Context(), host, port, p.DeviceID, peerapi.SessionRequestPayload{
 		Mode: req.Mode, Name: self.Name, DeviceID: self.Name,
-		Nonce: nonce, Requested: req.Permissions,
+		Nonce: nonce, Requested: req.Permissions, Invite: req.Invite,
 	})
 	if err != nil {
 		s.d.Trust.Close(sess.ID)
@@ -142,6 +180,9 @@ func (s *Server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.d.Trust.SetRemote(sess.ID, resp.SessionID, resp.Nonce)
+	if req.Invite != "" {
+		s.d.Trust.MarkViaQR(sess.ID) // QR pairing: skip the SAS compare on our side
+	}
 	if req.KeepConnected {
 		s.d.Trust.SetKeepConnected(sess.ID, true)
 	}

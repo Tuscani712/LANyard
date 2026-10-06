@@ -5,6 +5,7 @@ package trust
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -40,6 +41,8 @@ const (
 	MaxPendingPerPeer = 1
 	// MaxSessions is a global cap on live/pending sessions.
 	MaxSessions = 64
+	// PairInviteTTL is how long a QR pairing invite nonce stays valid.
+	PairInviteTTL = 2 * time.Minute
 )
 
 // Permissions are what one side allows the other to do (per direction).
@@ -89,7 +92,10 @@ type Session struct {
 	Granted       Permissions `json:"granted"`   // what we allow the peer
 	Requested     Permissions `json:"requested"` // what the peer allows us
 	KeepConnected bool        `json:"keep_connected"`
-	Offers        []string    `json:"offers,omitempty"`
+	// ViaQR is set when pairing was authenticated by a QR invite nonce rather
+	// than the SAS compare; the UI then skips the code check for that session.
+	ViaQR  bool     `json:"via_qr,omitempty"`
+	Offers []string `json:"offers,omitempty"`
 
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
@@ -110,6 +116,7 @@ type View struct {
 	Granted       Permissions `json:"granted"`
 	Requested     Permissions `json:"requested"`
 	KeepConnected bool        `json:"keep_connected"`
+	ViaQR         bool        `json:"via_qr,omitempty"`
 	Offers        []string    `json:"offers"`
 	CreatedAt     time.Time   `json:"created_at"`
 	UpdatedAt     time.Time   `json:"updated_at"`
@@ -128,6 +135,9 @@ type Store struct {
 	mu       sync.RWMutex
 	paired   map[string]*Entry // key: peer fingerprint
 	sessions map[string]*Session
+	// invites maps one-time QR pairing nonces to their expiry.
+	invites   map[string]time.Time
+	inviteTTL time.Duration
 }
 
 func New(cfg *config.Store, selfFP string, onChange func()) *Store {
@@ -135,7 +145,74 @@ func New(cfg *config.Store, selfFP string, onChange func()) *Store {
 		onChange = func() {}
 	}
 	return &Store{cfg: cfg, selfFP: selfFP, onChange: onChange,
-		paired: map[string]*Entry{}, sessions: map[string]*Session{}}
+		paired: map[string]*Entry{}, sessions: map[string]*Session{},
+		invites: map[string]time.Time{}, inviteTTL: PairInviteTTL}
+}
+
+// SetPairInviteTTL changes how long a pairing invite lives (tests).
+func (s *Store) SetPairInviteTTL(d time.Duration) {
+	s.mu.Lock()
+	s.inviteTTL = d
+	s.mu.Unlock()
+}
+
+// MintPairInvite creates a one-time pairing nonce (128 bits, hex) that expires
+// after the invite TTL, and returns it with its expiry.
+func (s *Store) MintPairInvite() (string, time.Time) {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	token := hex.EncodeToString(b)
+	now := time.Now()
+	s.mu.Lock()
+	exp := now.Add(s.inviteTTL)
+	for t, e := range s.invites {
+		if now.After(e) {
+			delete(s.invites, t)
+		}
+	}
+	s.invites[token] = exp
+	s.mu.Unlock()
+	return token, exp
+}
+
+// ConsumePairInvite reports whether token is a valid, unexpired invite. A token
+// that matches a stored invite is removed on this first attempt whether or not
+// it is still valid, so a reused or expired invite can never be retried or
+// downgraded. Comparison is constant time.
+func (s *Store) ConsumePairInvite(token string) bool {
+	if token == "" {
+		return false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var found string
+	var exp time.Time
+	for t, e := range s.invites {
+		if subtle.ConstantTimeCompare([]byte(t), []byte(token)) == 1 {
+			found, exp = t, e
+		}
+	}
+	if found == "" {
+		return false
+	}
+	delete(s.invites, found)
+	return now.Before(exp)
+}
+
+// MarkViaQR records that a session was authenticated by a QR invite nonce.
+func (s *Store) MarkViaQR(id string) bool {
+	s.mu.Lock()
+	sess := s.sessions[id]
+	if sess != nil {
+		sess.ViaQR = true
+		sess.UpdatedAt = time.Now()
+	}
+	s.mu.Unlock()
+	if sess != nil {
+		s.onChange()
+	}
+	return sess != nil
 }
 
 // SetOnIncoming registers a callback invoked for each incoming Connect/Pair
@@ -611,7 +688,7 @@ func (s *Store) viewLocked(sess *Session) View {
 		ID: sess.ID, RemoteID: sess.RemoteID, Mode: sess.Mode, Incoming: sess.Incoming,
 		PeerFP: sess.PeerFP, PeerName: sess.PeerName, PeerDevice: sess.PeerDevice,
 		Status: sess.Status, Error: sess.Error, Granted: sess.Granted, Requested: sess.Requested,
-		KeepConnected: sess.KeepConnected, Offers: append([]string(nil), sess.Offers...),
+		KeepConnected: sess.KeepConnected, ViaQR: sess.ViaQR, Offers: append([]string(nil), sess.Offers...),
 		CreatedAt: sess.CreatedAt, UpdatedAt: sess.UpdatedAt,
 	}
 	if sess.PeerNonce != "" && sess.selfNonce != "" {

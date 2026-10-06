@@ -178,6 +178,8 @@ type SessionRequestPayload struct {
 	DeviceID  string            `json:"device_id"`
 	Nonce     string            `json:"nonce"`
 	Requested trust.Permissions `json:"requested_permissions"`
+	// Invite is a one-time QR pairing nonce (body only; never a URL).
+	Invite string `json:"invite,omitempty"`
 }
 
 // SessionResponse is what the responder returns.
