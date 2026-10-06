@@ -252,6 +252,7 @@ func (m *Manager) pushFail(job *Job, err error) {
 	job.mu.Unlock()
 	m.persist()
 	m.onChange()
+	m.fireFail(job)
 }
 
 // pushSmall sends a small file and its digest in one request; the receiver

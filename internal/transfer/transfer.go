@@ -196,6 +196,7 @@ type FileView struct {
 // Manager owns all jobs and their worker execution.
 type Manager struct {
 	onDone     func(JobInfo)
+	onFail     func(JobInfo)
 	cfg        *config.Store
 	client     *peerapi.Client
 	log        *slog.Logger
@@ -850,6 +851,7 @@ func (m *Manager) run(job *Job) {
 	job.UpdatedAt = time.Now()
 	report := job.State == StateDone && job.CompletionPending
 	finished := job.State == StateDone
+	failed := job.State == StateFailed
 	job.mu.Unlock()
 	m.persist()
 	m.onChange()
@@ -859,6 +861,9 @@ func (m *Manager) run(job *Job) {
 	if finished {
 		m.fireDone(job) // after the completion report: closing a Connect session first would cut it off
 	}
+	if failed {
+		m.fireFail(job)
+	}
 }
 
 // JobInfo is what the app needs to know about a job that just finished.
@@ -867,20 +872,43 @@ type JobInfo struct {
 	Host      string
 	Port      int
 	Direction string
+	PeerName  string
+	Label     string
+	Files     int
+	Total     int64
+	Error     string // set for a failed job
 }
 
 // SetOnDone registers a callback for every job that finishes successfully
-// (used to end Connect sessions after their single transfer).
+// (used to end Connect sessions after their single transfer, and to notify the
+// person that a download or send completed).
 func (m *Manager) SetOnDone(fn func(JobInfo)) { m.onDone = fn }
+
+// SetOnFail registers a callback for every job that fails.
+func (m *Manager) SetOnFail(fn func(JobInfo)) { m.onFail = fn }
+
+func jobInfo(job *Job) JobInfo {
+	job.mu.Lock()
+	defer job.mu.Unlock()
+	return JobInfo{
+		PeerID: job.PeerID, Host: job.Host, Port: job.Port, Direction: job.Direction,
+		PeerName: job.PeerName, Label: job.ShareLabel, Files: len(job.Files),
+		Total: job.Total, Error: job.Error,
+	}
+}
 
 func (m *Manager) fireDone(job *Job) {
 	if m.onDone == nil {
 		return
 	}
-	job.mu.Lock()
-	ji := JobInfo{PeerID: job.PeerID, Host: job.Host, Port: job.Port, Direction: job.Direction}
-	job.mu.Unlock()
-	m.onDone(ji)
+	m.onDone(jobInfo(job))
+}
+
+func (m *Manager) fireFail(job *Job) {
+	if m.onFail == nil {
+		return
+	}
+	m.onFail(jobInfo(job))
 }
 
 // reportCompletion tells the sender that a one-time share was downloaded and
@@ -935,6 +963,7 @@ func (m *Manager) fail(job *Job, msg string) {
 	job.mu.Unlock()
 	m.persist()
 	m.onChange()
+	m.fireFail(job)
 }
 
 // transferWithRetry runs downloadFile with back-off for transient failures

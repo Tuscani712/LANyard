@@ -184,6 +184,9 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	// Local UI event hub is referenced by the managers so any change pushes an
 	// SSE update; ui is assigned below.
 	var ui *uiserver.Server
+	// resolvePeer turns a certificate fingerprint into a friendly device name;
+	// assigned once discovery exists, and read from the notification callbacks.
+	var resolvePeer func(fp string) string
 	notify := func() {
 		if ui != nil {
 			ui.Notify()
@@ -237,11 +240,38 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	peerSrv.SetApprovals(approvals)
 
 	// A Connect session is for a single transfer: when one finishes, end the
-	// session on both sides unless "Keep connected" was chosen.
+	// session on both sides unless "Keep connected" was chosen. The same event
+	// tells the person their download or send finished (or failed).
 	trMgr.SetOnDone(func(ji transfer.JobInfo) {
+		if ui == nil {
+			return
+		}
+		peer := ji.PeerName
+		if peer == "" && resolvePeer != nil {
+			peer = resolvePeer(ji.PeerID)
+		}
+		kind := "download"
+		if ji.Direction == "push" {
+			kind = "send"
+		}
+		ui.NotifyUser(uiserver.Notice{Kind: kind, Peer: peer, Files: ji.Files, Total: ji.Total, Label: ji.Label})
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		client.EndConnectAfterTransfer(ctx, trustStore, ji.PeerID, ji.Host, ji.Port)
+	})
+	trMgr.SetOnFail(func(ji transfer.JobInfo) {
+		if ui == nil {
+			return
+		}
+		peer := ji.PeerName
+		if peer == "" && resolvePeer != nil {
+			peer = resolvePeer(ji.PeerID)
+		}
+		kind := "download-failed"
+		if ji.Direction == "push" {
+			kind = "send-failed"
+		}
+		ui.NotifyUser(uiserver.Notice{Kind: kind, Peer: peer, Files: ji.Files, Total: ji.Total, Label: ji.Label, Error: ji.Error})
 	})
 	want := st.PeerPort
 	if peerPortFlag != 0 {
@@ -263,6 +293,36 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		Name: st.DeviceName, OS: runtime.GOOS, Port: peerSrv.Port(), DeviceLabel: st.DeviceIDLabel,
 	}, id.DeviceID, client.Probe, log)
 	disc.Start(ctx)
+
+	// Notify the person on the receiving side when files start arriving and
+	// when they have all landed in the Inbox. Names come from the trust store
+	// first, then discovery.
+	resolvePeer = func(fp string) string {
+		if trustStore != nil {
+			if e, ok := trustStore.Entry(fp); ok && e.Name != "" {
+				return e.Name
+			}
+		}
+		for _, p := range disc.Peers() {
+			if p.DeviceID == fp && p.Name != "" {
+				return p.Name
+			}
+		}
+		if fp == "" {
+			return "a device"
+		}
+		return identity.ShortID(fp)
+	}
+	inboxMgr.SetOnOffer(func(peerFP string, files int, total int64) {
+		if ui != nil {
+			ui.NotifyUser(uiserver.Notice{Kind: "receive-start", Peer: resolvePeer(peerFP), Files: files, Total: total})
+		}
+	})
+	inboxMgr.SetOnDone(func(peerFP string, files int, total int64) {
+		if ui != nil {
+			ui.NotifyUser(uiserver.Notice{Kind: "receive", Peer: resolvePeer(peerFP), Files: files, Total: total})
+		}
+	})
 
 	// When a peer (re)appears, refresh its jobs' address and retry at once.
 	go func() {

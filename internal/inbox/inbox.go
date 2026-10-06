@@ -161,6 +161,8 @@ func (m *Manager) WasCancelled(id string) bool {
 type Manager struct {
 	dir      string
 	onChange func()
+	onOffer  func(peerFP string, files int, total int64)
+	onDone   func(peerFP string, files int, total int64)
 
 	mu     sync.Mutex
 	pushes map[string]*Push
@@ -177,6 +179,13 @@ func New(dir string, onChange func()) *Manager {
 	}
 	return &Manager{dir: dir, onChange: onChange, pushes: map[string]*Push{}, gone: map[string]struct{}{}}
 }
+
+// SetOnOffer registers a callback for each push that starts being received
+// (used to notify the person that files are arriving).
+func (m *Manager) SetOnOffer(fn func(peerFP string, files int, total int64)) { m.onOffer = fn }
+
+// SetOnDone registers a callback for each push that finishes being received.
+func (m *Manager) SetOnDone(fn func(peerFP string, files int, total int64)) { m.onDone = fn }
 
 func (m *Manager) Dir() string { return m.dir }
 
@@ -267,6 +276,9 @@ func (m *Manager) Offer(peerFP, mode string, files []FileReq, maxBytes int64) (*
 	m.mu.Lock()
 	m.pushes[p.ID] = p
 	m.mu.Unlock()
+	if m.onOffer != nil {
+		m.onOffer(peerFP, len(p.Files), p.Total)
+	}
 	return p, nil
 }
 
@@ -425,14 +437,20 @@ func (m *Manager) Complete(id, peerFP, rel, wantSHA string) (*FileState, error) 
 
 // Finish removes a completed push.
 func (m *Manager) Finish(id, peerFP string) bool {
+	var files int
+	var total int64
 	m.mu.Lock()
 	p, ok := m.pushes[id]
 	if ok && p.PeerFP == peerFP {
 		delete(m.pushes, id)
+		files, total = len(p.Files), p.Total
 	}
 	m.mu.Unlock()
 	if ok {
 		m.onChange()
+		if m.onDone != nil {
+			m.onDone(peerFP, files, total)
+		}
 	}
 	return ok
 }

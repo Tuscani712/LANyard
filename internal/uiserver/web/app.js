@@ -254,6 +254,26 @@ function pruneSticky(prefix, live) {
   for (const k of [...stickyToasts.keys()]) if (k.startsWith(prefix) && !live.has(k)) dropSticky(k, false);
 }
 
+// A one-off notification from the app (download/send/receive started or
+// finished, or failed). Sizes and names are formatted here.
+function showNotice(n) {
+  const who = n.peer || "a device";
+  const count = n.files || 0;
+  const files = count === 1 ? "1 file" : (count > 1 ? count + " files" : "files");
+  const size = n.total ? " (" + fmtBytes(n.total) + ")" : "";
+  switch (n.kind) {
+    case "download": toast("Download complete: " + files + size + " from " + who + ".", "ok"); break;
+    case "send": toast("Sent " + files + size + " to " + who + ".", "ok"); break;
+    case "download-start": toast("Downloading " + files + size + " from " + who + "\u2026", "info"); break;
+    case "send-start": toast("Sending " + files + size + " to " + who + "\u2026", "info"); break;
+    case "receive-start": toast("Receiving " + files + size + " from " + who + "\u2026", "info"); break;
+    case "receive": toast("Received " + files + size + " from " + who + ". Saved to your Inbox.", "ok"); break;
+    case "download-failed": toast("Download failed" + (n.error ? ": " + n.error : "."), "err"); break;
+    case "send-failed": toast("Send failed" + (n.error ? ": " + n.error : "."), "err"); break;
+    default: return;
+  }
+}
+
 // ---------- native file / folder dialog ----------
 // Opens the operating system's own Explorer-style dialog (via the app) and
 // returns the chosen paths, or [] if cancelled. Falls back to typing a path
@@ -1414,6 +1434,7 @@ function connectEvents() {
   es.addEventListener("approvals", (ev) => renderApprovals(JSON.parse(ev.data)));
   es.addEventListener("sessions", (ev) => renderSessions(JSON.parse(ev.data)));
   es.addEventListener("incoming", (ev) => renderIncoming(JSON.parse(ev.data)));
+  es.addEventListener("notice", (ev) => showNotice(JSON.parse(ev.data)));
   es.onerror = () => { };
 }
 

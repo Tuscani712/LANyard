@@ -46,6 +46,20 @@ type SelfInfo struct {
 	Version        string `json:"version"`
 }
 
+// Notice is a user-facing notification pushed to every open UI as an SSE
+// "notice" event, e.g. a completed push or download. The UI turns it into a
+// toast; the fields are structured so the client can format sizes and names.
+type Notice struct {
+	// Kind is one of: download, send, receive, download-start, send-start,
+	// receive-start, download-failed, send-failed.
+	Kind  string `json:"kind"`
+	Peer  string `json:"peer,omitempty"`
+	Files int    `json:"files,omitempty"`
+	Total int64  `json:"total,omitempty"`
+	Label string `json:"label,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
 type Deps struct {
 	Self      func() SelfInfo
 	Peers     func() []discovery.Peer
@@ -86,12 +100,16 @@ type Server struct {
 
 	subMu sync.Mutex
 	subs  map[chan struct{}]struct{}
+
+	noticeMu   sync.Mutex
+	noticeSubs map[chan Notice]struct{}
 }
 
 func New(d Deps) *Server {
 	b := make([]byte, 24)
 	_, _ = rand.Read(b)
-	return &Server{d: d, token: hex.EncodeToString(b), subs: map[chan struct{}]struct{}{}}
+	return &Server{d: d, token: hex.EncodeToString(b),
+		subs: map[chan struct{}]struct{}{}, noticeSubs: map[chan Notice]struct{}{}}
 }
 
 // Notify wakes every event stream (shares/transfers changed).
@@ -103,6 +121,32 @@ func (s *Server) Notify() {
 		case ch <- struct{}{}:
 		default:
 		}
+	}
+}
+
+// NotifyUser delivers a one-off notification to every open UI. It is dropped
+// for a connection whose buffer is full rather than blocking the caller (an
+// SSE stream makes no progress while the window is closed).
+func (s *Server) NotifyUser(n Notice) {
+	s.noticeMu.Lock()
+	defer s.noticeMu.Unlock()
+	for ch := range s.noticeSubs {
+		select {
+		case ch <- n:
+		default:
+		}
+	}
+}
+
+func (s *Server) notices() (<-chan Notice, func()) {
+	ch := make(chan Notice, 16)
+	s.noticeMu.Lock()
+	s.noticeSubs[ch] = struct{}{}
+	s.noticeMu.Unlock()
+	return ch, func() {
+		s.noticeMu.Lock()
+		delete(s.noticeSubs, ch)
+		s.noticeMu.Unlock()
 	}
 }
 
@@ -321,6 +365,8 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	defer cancelPeers()
 	changeCh, cancelChanges := s.changes()
 	defer cancelChanges()
+	noticeCh, cancelNotices := s.notices()
+	defer cancelNotices()
 
 	send := func() {
 		b, _ := json.Marshal(s.d.Peers())
@@ -371,6 +417,12 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-peerCh:
 			pending = true
+		case n := <-noticeCh:
+			if nb, err := json.Marshal(n); err == nil {
+				fmt.Fprintf(w, "event: notice\ndata: %s\n\n", nb)
+				fl.Flush()
+			}
+			continue
 		case <-changeCh:
 			pending = true
 		case <-keep.C:
