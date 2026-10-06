@@ -1005,6 +1005,7 @@ func (m *Manager) transferWithRetry(ctx context.Context, job *Job, f *FileJob) e
 		case isShareEnded(err):
 			var se *peerapi.StatusError
 			errors.As(err, &se)
+			//lint:ignore ST1005 shown to the user verbatim as a full sentence
 			return fmt.Errorf("%s Files already downloaded are kept, and so are partial files.", se.Msg)
 		case !retryable(err):
 			return err

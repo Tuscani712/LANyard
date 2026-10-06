@@ -627,17 +627,6 @@ func (s *Store) SelfNonce(id string) (string, bool) {
 	return sess.selfNonce, true
 }
 
-// peerNonceFor is used by the responder to learn the initiator's nonce.
-func (s *Store) peerNonceFor(id string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	sess, ok := s.sessions[id]
-	if !ok {
-		return "", false
-	}
-	return sess.PeerNonce, true
-}
-
 // Sweep expires stale sessions.
 func (s *Store) Sweep() bool {
 	s.mu.Lock()
