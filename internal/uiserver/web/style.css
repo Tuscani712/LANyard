@@ -165,8 +165,8 @@ svg { display: block; }
 .muted { color: var(--muted); }
 .section-title { font-size: 15px; font-weight: 600; margin: 4px 0 10px; }
 .form-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
-input, select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 8px; padding: 8px 11px; font: inherit; outline: none; }
-input:focus, select:focus { border-color: var(--accent); }
+input, select, textarea { background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 8px; padding: 8px 11px; font: inherit; outline: none; }
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 input::placeholder { color: var(--muted-2); }
 .bar { height: 7px; border-radius: 999px; background: var(--line); overflow: hidden; margin: 9px 0 5px; }
 .fill { height: 100%; background: var(--accent); transition: width .2s linear; }
@@ -236,3 +236,10 @@ input::placeholder { color: var(--muted-2); }
 .device-card.offline .dc-art, .device-card.offline .dc-name, .device-card.offline .dc-sub:not(:last-child) { opacity: .5; }
 .dot.sm { width: 7px; height: 7px; margin-left: auto; flex: 0 0 auto; }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+/* Native form controls follow the theme: dark popups and a themed checkbox
+   (WebKitGTK otherwise draws light selects and stretched checkboxes). */
+:root { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
+select option { background: var(--panel-2); color: var(--text); }
+input[type="checkbox"], .set-row input[type="checkbox"] { flex: 0 0 auto; width: 18px; height: 18px; min-width: 0; padding: 0; accent-color: var(--accent); }

@@ -527,7 +527,13 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	if b, err := json.Marshal(ri); err == nil {
 		_ = config.WriteFileAtomic(runPath, b, 0o600)
 	}
-	defer os.Remove(runPath)
+	// Only remove run.json if it is still ours: a restart can start the new
+	// process before this one finishes exiting, and its file must survive.
+	defer func() {
+		if cur := readRunInfo(runPath); cur != nil && cur.PID == os.Getpid() {
+			_ = os.Remove(runPath)
+		}
+	}()
 
 	fmt.Printf("\nLANyard File Transfer %s\n  Device : %s\n  ID     : %s\n  Peers  : port %d\n  UI     : %s\n\n",
 		version, st.DeviceName, identity.Pretty(id.DeviceID), peerSrv.Port(), ui.URL())

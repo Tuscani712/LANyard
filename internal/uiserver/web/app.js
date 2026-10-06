@@ -1481,7 +1481,7 @@ function handleSessions(list) {
     if (before !== s.status) { onSessionTransition(s, before); sessionMemo[s.id] = s.status; }
   }
   for (const id of Object.keys(sessionMemo)) if (!list.some((s) => s.id === id)) delete sessionMemo[id];
-  if (pairView && !pairView.setup) {
+  if (pairView && !pairView.setup && !pairView.qr) { // setup and QR panels have no session yet
     const fresh = list.find((s) => s.id === pairView.id);
     if (fresh) { pairView = fresh; renderPair(); } else { closePair(); }
   }
