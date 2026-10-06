@@ -94,6 +94,37 @@ class DownloadSessionTest {
     }
 
     @Test
+    @Timeout(120)
+    fun resumesFromExistingHalf() {
+        assumeTrue(bin != null)
+        GoPeer(bin!!).use { peer ->
+            val (identity, fingerprint) = pairPeer(peer)
+            val shareDir = Files.createTempDirectory("share").toFile()
+            val bytes = ByteArray(6 * 1024 * 1024 + 3).also { java.util.Random(9).nextBytes(it) }
+            File(shareDir, "half.bin").writeBytes(bytes)
+            val shareId = peer.addShare(shareDir.absolutePath, "resume").str("share_id")
+
+            val out = File(Files.createTempDirectory("dl").toFile(), "half.bin")
+            out.writeBytes(bytes.copyOfRange(0, bytes.size / 2)) // the first half is already on disk
+
+            val client = PeerClient("127.0.0.1", peer.peerPort, identity, fingerprint)
+            val result = DownloadSession(client).download(
+                shareId, "",
+                targetFor = {
+                    DownloadTarget(
+                        existingSize = out.length(),
+                        openAt = { FileOutputStream(out, true) },        // append the remainder
+                        openExisting = { java.io.FileInputStream(out) }, // hash the present prefix
+                    )
+                },
+            )
+
+            assertTrue(result is DownloadResult.Done, "expected Done, got $result")
+            assertEquals(sha256Hex(bytes), sha256Hex(out.readBytes()), "the resumed file must match")
+        }
+    }
+
+    @Test
     fun rejectsPathTraversalFromManifest() {
         val reader = FakeReader(
             manifest = jsonManifest(listOf(Triple("../evil.txt", "evil.txt", 1L))),

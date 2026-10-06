@@ -13,6 +13,7 @@ import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -38,7 +39,18 @@ class QrScanActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(buildLayout())
+        enableEdgeToEdge()
+        val root = buildLayout()
+        // Keep the hint and buttons clear of the status bar and gesture bar.
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(root) { view, insets ->
+            val bars = insets.getInsets(
+                androidx.core.view.WindowInsetsCompat.Type.systemBars() or
+                    androidx.core.view.WindowInsetsCompat.Type.ime(),
+            )
+            view.setPadding(PAD + bars.left, PAD + bars.top, PAD + bars.right, PAD + bars.bottom)
+            androidx.core.view.WindowInsetsCompat.CONSUMED
+        }
+        setContentView(root)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             bindCamera()
         } else {
@@ -46,12 +58,13 @@ class QrScanActivity : ComponentActivity() {
         }
     }
 
+    private val PAD: Int get() = (resources.displayMetrics.density * 16).toInt()
+
     private fun buildLayout(): LinearLayout {
-        val pad = (resources.displayMetrics.density * 16).toInt()
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(Color.parseColor("#0A0E14"))
-            setPadding(pad, pad * 3, pad, pad) // top inset clears the status bar
+            setPadding(PAD, PAD, PAD, PAD) // replaced by the insets listener
         }
         root.addView(TextView(this).apply {
             text = "Point the camera at the QR code on the other device."
@@ -65,8 +78,8 @@ class QrScanActivity : ComponentActivity() {
         }
         previewView = preview
         root.addView(preview, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f).apply {
-            topMargin = pad
-            bottomMargin = pad
+            topMargin = PAD
+            bottomMargin = PAD
         })
 
         root.addView(button("Paste a link instead") { finishPaste() }, squareParams())
