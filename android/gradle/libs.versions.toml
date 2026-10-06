@@ -1,0 +1,20 @@
+[versions]
+kotlin = "2.0.21"
+conscrypt = "2.6.3"
+bouncycastle = "1.83"
+gson = "2.11.0"
+junit = "5.11.4"
+junitPlatform = "1.11.4"
+
+[libraries]
+conscrypt-uber = { module = "org.conscrypt:conscrypt-openjdk-uber", version.ref = "conscrypt" }
+bouncycastle-bcprov = { module = "org.bouncycastle:bcprov-jdk18on", version.ref = "bouncycastle" }
+bouncycastle-bcpkix = { module = "org.bouncycastle:bcpkix-jdk18on", version.ref = "bouncycastle" }
+bouncycastle-bctls = { module = "org.bouncycastle:bctls-jdk18on", version.ref = "bouncycastle" }
+gson = { module = "com.google.code.gson:gson", version.ref = "gson" }
+kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+junit-jupiter = { module = "org.junit.jupiter:junit-jupiter", version.ref = "junit" }
+junit-platform-launcher = { module = "org.junit.platform:junit-platform-launcher", version.ref = "junitPlatform" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
