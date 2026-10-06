@@ -13,7 +13,7 @@
 
 ## Environment
 - Go 1.27.0 (default install in Program Files\Go\bin; `build.ps1` finds it even if it is not on PATH. For plain `go` in a non-interactive shell: `$env:Path += ";$env:ProgramFiles\Go\bin"`).
-- Git repo: github.com/Tuscani712/LANyard (main). Module `lanyard`, entry `cmd/lanyard`, version `1.0.0`. CGO off for release builds; the Linux window build uses cgo. Working folder is `LANyard` (renamed from `EZ-Share`).
+- Git repo: github.com/Tuscani712/LANyard (main). Module `lanyard`, entry `cmd/lanyard`, version `1.1.0-beta.1`. CGO off for release builds; the Linux window build uses cgo. Working folder is `LANyard` (renamed from `EZ-Share`).
 - **Build:** `.\build.ps1` -> `dist\lanyard.exe` (windowless app) + `dist\lanyard-console.exe` (console, used by the `dist\itest*.ps1` scripts); `.\build.ps1 -Release` -> `dist\release\` (windowless + console Windows, mac arm64/x64, linux x64/arm64). All build clean.
 - `go vet ./...`, `gofmt -l .`, `go test ./...` clean (race detector needs cgo).
 - **Traps:** PowerShell alias `RI` = `Remove-Item`; Windows PowerShell 5.1 `Invoke-WebRequest` cannot send PROPFIND (use `HttpClient`, see `dist/itest_mount.ps1`); a background browser tab has `document.hidden === true`.
