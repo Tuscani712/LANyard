@@ -20,6 +20,7 @@ class MainActivity : ComponentActivity() {
         IdentityHolder.init(applicationContext)
         SettingsHolder.init(applicationContext)
         TransferManager.init(application, AndroidMeteredNetwork(applicationContext))
+        PeerService.init(applicationContext)
         setContent {
             val settings by SettingsHolder.settings.collectAsStateWithLifecycle()
             val systemDark = isSystemInDarkTheme()
@@ -32,5 +33,17 @@ class MainActivity : ComponentActivity() {
                 LanyardApp()
             }
         }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        // The phone-side peer server runs while the app is in the foreground on
+        // any screen; there is no background service in this milestone.
+        PeerService.start(applicationContext)
+    }
+
+    override fun onStop() {
+        PeerService.stop()
+        super.onStop()
     }
 }

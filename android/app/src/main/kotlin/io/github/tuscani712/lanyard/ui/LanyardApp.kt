@@ -1,25 +1,39 @@
 package io.github.tuscani712.lanyard.ui
 
+import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.height
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SwapVert
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import io.github.tuscani712.lanyard.DevicesViewModel
+import io.github.tuscani712.lanyard.PeerService
+import io.github.tuscani712.lanyard.core.Display
+import io.github.tuscani712.lanyard.core.IncomingRequest
+import io.github.tuscani712.lanyard.core.PairingSessions
 
 private data class Tab(val label: String, val icon: ImageVector)
 
@@ -33,6 +47,16 @@ private val TABS = listOf(
 @Composable
 fun LanyardApp(viewModel: DevicesViewModel = viewModel()) {
     var selected by rememberSaveable { mutableIntStateOf(0) }
+    val pending by PeerService.pending.collectAsStateWithLifecycle()
+
+    // One prompt at a time, on any screen: a desktop asking to connect or pair.
+    pending.firstOrNull()?.let { request ->
+        IncomingPairDialog(
+            request = request,
+            onAccept = { PeerService.accept(request.id) },
+            onDecline = { PeerService.decline(request.id) },
+        )
+    }
 
     Scaffold(
         topBar = {
@@ -57,4 +81,36 @@ fun LanyardApp(viewModel: DevicesViewModel = viewModel()) {
             else -> SettingsScreen(inner, viewModel)
         }
     }
+}
+
+/** The accept/decline prompt for an incoming Connect/Pair request, on any screen. */
+@Composable
+private fun IncomingPairDialog(request: IncomingRequest, onAccept: () -> Unit, onDecline: () -> Unit) {
+    val pairing = request.mode == PairingSessions.MODE_PAIR
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text(if (pairing) "Pair request" else "Connect request") },
+        text = {
+            Column {
+                Text(request.peerName.ifEmpty { "A device" }, style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    Display.groupedHex(request.peerFp),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+                if (request.sas.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Text("Both devices must show the same code:", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        request.sas.chunked(3).joinToString(" "),
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onAccept) { Text("Accept") } },
+        dismissButton = { TextButton(onClick = onDecline) { Text("Decline") } },
+    )
 }

@@ -5,20 +5,17 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.gson.JsonObject
-import io.github.tuscani712.lanyard.core.JsonFileTrustStore
-import io.github.tuscani712.lanyard.core.PairLink
 import io.github.tuscani712.lanyard.core.PairResult
 import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PairingFlow
+import io.github.tuscani712.lanyard.core.PeerAddresses
+import io.github.tuscani712.lanyard.core.DiscoveredAddr
 import io.github.tuscani712.lanyard.core.PeerClient
-import io.github.tuscani712.lanyard.core.PeerHelloServer
 import io.github.tuscani712.lanyard.core.PeerStatusException
 import io.github.tuscani712.lanyard.core.ProbeClient
 import io.github.tuscani712.lanyard.core.SelfFilter
 import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.net.NearbyDevice
-import io.github.tuscani712.lanyard.net.NetAddrs
-import io.github.tuscani712.lanyard.net.NsdAdvertiser
 import io.github.tuscani712.lanyard.net.NsdDiscovery
 import io.github.tuscani712.lanyard.share.SourceResult
 import io.github.tuscani712.lanyard.share.spoolShare
@@ -30,8 +27,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import java.io.File
-import java.security.SecureRandom
 
 /** A paired peer plus its last-known reachability. */
 data class PairedStatus(val peer: PairedPeer, val online: Boolean)
@@ -80,39 +75,15 @@ data class DevicesUiState(
  * State and network work for the Devices tab. All blocking IO and TLS runs on
  * [Dispatchers.IO]; cancellation is tied to the ViewModel's lifetime.
  *
- * Discovery lifecycle: mDNS browsing ([discovery]), mDNS advertising
- * ([advertiser]) and the `/hello` responder ([helloServer]) all run only while
- * the Devices screen is showing — they are started together in [startNearby]
- * (from the screen entering composition) and stopped together in [stopNearby]
- * (the screen leaving composition, or [onCleared]). Nothing advertises or
- * listens in the background, so the port is free whenever this screen is not
- * visible. [stopNearby] stops all three and resets [advertisePort], which frees
- * the ephemeral port the server had bound.
+ * Discovery lifecycle: mDNS browsing ([discovery]) runs only while the Devices
+ * screen is showing. Advertising and the phone-side peer server live in
+ * [PeerService] for the whole foreground (any screen), so the phone stays
+ * discoverable and online until the app is backgrounded.
  */
 class DevicesViewModel(app: Application) : AndroidViewModel(app) {
-    private val store: TrustStore = JsonFileTrustStore(File(app.filesDir, "trust/peers.json"))
+    // The same trust store the peer server writes to when a desktop pairs to us.
+    private val store: TrustStore get() = PeerService.trust
     private val discovery = NsdDiscovery(app)
-    private val advertiser = NsdAdvertiser(app)
-    // Read the app version rather than hardcoding it: the About screen was fixed
-    // to do the same, so /hello must not drift when the version bumps.
-    private val appVersion: String = runCatching {
-        app.packageManager.getPackageInfo(app.packageName, 0).versionName
-    }.getOrNull().orEmpty()
-    private val helloServer = PeerHelloServer(hello = { boundPort ->
-        val id = IdentityHolder.identity
-        JsonObject().apply {
-            addProperty("device_id", id?.deviceId?.take(16) ?: "")
-            addProperty("fingerprint", id?.deviceId ?: "")
-            addProperty("name", IdentityHolder.deviceName)
-            addProperty("os", "android")
-            addProperty("version", appVersion)
-            addProperty("port", boundPort)
-        }
-    })
-
-    // The port this device advertises and answers /hello on (0 when not serving).
-    @Volatile
-    private var advertisePort = 0
 
     private val _state = MutableStateFlow(DevicesUiState())
     val state: StateFlow<DevicesUiState> = _state.asStateFlow()
@@ -124,6 +95,10 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
             val own = SelfFilter.ownShortId(identity?.deviceId.orEmpty())
             val paired = withContext(Dispatchers.IO) {
                 if (identity == null) return@withContext emptyList()
+                // A desktop that paired *to* this phone is stored without a port
+                // (the request carries none). Fill it from mDNS once discovered.
+                val discovered = _state.value.nearby.map { DiscoveredAddr(it.shortId, it.host, it.port) }
+                PeerAddresses.fillFromDiscovery(store.list(), discovered).forEach { store.save(it) }
                 store.list()
                     // Never list this device as one of its own paired peers.
                     .filterNot { SelfFilter.isSelf(SelfFilter.ownShortId(it.fingerprint), own) }
@@ -145,75 +120,27 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                     _state.update { current ->
                         current.copy(nearby = (current.nearby.filterNot { it.shortId == device.shortId } + device))
                     }
+                    // A newly seen device may supply the address of a paired peer.
+                    refreshPaired()
                 }
             },
             onLost = { shortId ->
                 _state.update { current -> current.copy(nearby = current.nearby.filterNot { it.shortId == shortId }) }
             },
         )
-        startAdvertise()
     }
 
-    /** Stops mDNS browsing, mDNS advertising and the `/hello` server, freeing the port. */
+    /** Stops mDNS browsing (advertising and the peer server are app-scoped). */
     fun stopNearby() {
         discovery.stop()
-        advertiser.stop()
-        helloServer.stop()
-        advertisePort = 0
-    }
-
-    // Advertises this device over mDNS and answers the desktop's /hello probe,
-    // so it is listed as a verified nearby device. Pairing and transfers are a
-    // later milestone; without the responder the peer is dropped as unverified.
-    // Only called while the Devices screen is showing (see the class KDoc).
-    private fun startAdvertise() {
-        val id = IdentityHolder.identity ?: return
-        val short = id.deviceId.take(16)
-        val port = try {
-            helloServer.start(id)
-        } catch (_: Exception) {
-            return
-        }
-        advertisePort = port
-        advertiser.start(
-            short,
-            mapOf(
-                "v" to "2",
-                "id" to short,
-                "did" to "",
-                "n" to IdentityHolder.deviceName,
-                "os" to "android",
-                "p" to port.toString(),
-            ),
-            port,
-        )
     }
 
     /**
      * The `lanyard://pair?...` link for this device, to render as a QR code for
-     * another device to scan. Null until advertising has started.
+     * another device to scan. Comes from [PeerService], which owns the server
+     * port and mints the one-time invite.
      */
-    fun pairingLink(): String? {
-        val id = IdentityHolder.identity ?: return null
-        val port = advertisePort
-        if (port == 0) return null
-        val addrs = NetAddrs.localIPv4().map { "$it:$port" }
-        if (addrs.isEmpty()) return null
-        return PairLink.build(
-            PairLink.Payload(
-                fingerprint = id.deviceId,
-                name = IdentityHolder.deviceName,
-                addrs = addrs,
-                nonce = randomHex(16),
-            ),
-        )
-    }
-
-    private fun randomHex(bytes: Int): String {
-        val buf = ByteArray(bytes)
-        SecureRandom().nextBytes(buf)
-        return buf.joinToString("") { "%02x".format(it) }
-    }
+    fun pairingLink(): String? = PeerService.pairingLink()
 
     fun pair(link: String) {
         if (link.isBlank()) {

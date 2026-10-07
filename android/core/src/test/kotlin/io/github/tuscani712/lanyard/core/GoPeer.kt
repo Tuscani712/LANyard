@@ -54,8 +54,7 @@ internal class GoPeer(bin: String) : AutoCloseable {
         PairLink.build(PairLink.Payload(fingerprint = fingerprint, name = "desktop", addrs = addrs, nonce = nonce))
 
     /** Accepts the next pending session from [deviceFp] through the UI API. */
-    fun acceptPending(
-        deviceFp: String,
+    fun acceptPending(        deviceFp: String,
         browse: Boolean = true,
         push: Boolean = true,
         timeoutMs: Long = 20_000,
@@ -79,6 +78,22 @@ internal class GoPeer(bin: String) : AutoCloseable {
 
     /** A file the receiver has finalized in its Inbox, or a not-yet-existing path. */
     fun inboxFile(name: String): File = File(File(dataDir, "Inbox"), name)
+
+    /** This desktop's fingerprint. */
+    fun fingerprint(): String = pairPayload().str("fp")
+
+    /** Starts Connect/Pair toward [deviceFp] through the UI (no invite: SAS path). */
+    fun startSessionTo(deviceFp: String, mode: String = "pair"): JsonObject =
+        ui.post(
+            "/api/sessions/request",
+            """{"device":${quote(deviceFp)},"mode":"$mode","permissions":{"browse":true,"push":true}}""",
+        ).asJsonObject
+
+    /** Polls the desktop's view of an outgoing session. */
+    fun refreshSession(id: String): JsonObject = ui.post("/api/sessions/${id}/refresh", "{}").asJsonObject
+
+    /** Confirms the SAS on the desktop, which activates the session. */
+    fun confirmSession(id: String): JsonObject = ui.post("/api/sessions/${id}/confirm", "{}").asJsonObject
 
     /**
      * Adds a peer by address through the UI API (the manual "add device" path).
