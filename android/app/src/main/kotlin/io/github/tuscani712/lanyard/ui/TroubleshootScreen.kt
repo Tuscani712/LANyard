@@ -126,7 +126,11 @@ fun TroubleshootScreen(padding: PaddingValues, vm: DevicesViewModel, onBack: () 
                 results.forEach { CheckRow(it) }
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                     TextButton(onClick = {
-                        copyToClipboard(context, "LANyard diagnostics", Diagnostics.copyReport(results))
+                        copyToClipboard(
+                            context,
+                            "LANyard diagnostics",
+                            Diagnostics.copyReport(results, io.github.tuscani712.lanyard.PeerService.diagnostics.snapshot()),
+                        )
                     }) { Text("Copy report") }
                 }
             }

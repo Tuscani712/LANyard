@@ -70,7 +70,10 @@ class PeerServer(
     private val maxSessionRequestsPerMinute: Int = 10,
     private val maxBodyBytes: Int = 64 * 1024,
     private val clock: () -> Long = System::currentTimeMillis,
+    private val diagnostics: ServerDiagnostics? = null,
 ) {
+    private fun diag(event: String) = diagnostics?.record(event)
+
     private var server: SSLServerSocket? = null
     private var pool: ThreadPoolExecutor? = null
     private val live: MutableSet<Socket> = ConcurrentHashMap.newKeySet()
@@ -145,27 +148,38 @@ class PeerServer(
 
     private fun handleConnection(socket: Socket) {
         val ssl = socket as SSLSocket
+        var acquired = false
         var paired = false
+        var reason = "error"
+        diag("conn open")
         try {
             ssl.startHandshake()
             handshakes.incrementAndGet()
-            val fp = peerFingerprint(ssl) ?: return
+            val fp = peerFingerprint(ssl) ?: run { reason = "no-cert"; return }
             val peer = isPaired(fp)
             paired = peer != null
-            if (!acquireConnection(paired)) return
-            requestLoop(ssl, fp, peer)
-        } catch (_: Exception) {
+            diag("handshake ok peer=${fp.take(8)} paired=${if (paired) "yes" else "no"}")
+            val counter = if (paired) pairedActive else unpairedActive
+            val cap = if (paired) maxPairedConnections else maxUnpairedConnections
+            if (!acquireConnection(counter, cap)) { reason = "budget"; return }
+            acquired = true
+            reason = requestLoop(ssl, fp)
+        } catch (e: Exception) {
             // handshake/read failure or a timeout: drop
+            reason = "error:" + e.javaClass.simpleName
         } finally {
-            if (paired) pairedActive.decrementAndGet() else unpairedActive.decrementAndGet()
+            if (acquired) {
+                diag("conn close $reason")
+                if (paired) pairedActive.decrementAndGet() else unpairedActive.decrementAndGet()
+            } else {
+                diag("conn close $reason")
+            }
             live.remove(socket)
             runCatching { socket.close() }
         }
     }
 
-    private fun acquireConnection(paired: Boolean): Boolean {
-        val counter = if (paired) pairedActive else unpairedActive
-        val cap = if (paired) maxPairedConnections else maxUnpairedConnections
+    private fun acquireConnection(counter: AtomicInteger, cap: Int): Boolean {
         while (true) {
             val cur = counter.get()
             if (cur >= cap) return false
@@ -177,7 +191,7 @@ class PeerServer(
 
     private class Head(val method: String, val path: String, val query: String, val headers: Map<String, String>, val close: Boolean)
 
-    private fun requestLoop(ssl: SSLSocket, fp: String, peer: PairedPeer?) {
+    private fun requestLoop(ssl: SSLSocket, fp: String): String {
         val input = BufferedInputStream(ssl.getInputStream())
         val out = BufferedOutputStream(ssl.getOutputStream())
         var requests = 0
@@ -186,22 +200,30 @@ class PeerServer(
             val first = try {
                 input.read()
             } catch (_: java.net.SocketTimeoutException) {
-                return // idle keep-alive expired
+                return "idle" // idle keep-alive expired
             }
-            if (first < 0) return
+            if (first < 0) return "peer-closed"
             requests++
             val started = clock()
             val head = try {
-                readHead(ssl, input, first) ?: return
+                readHead(ssl, input, first) ?: return "peer-closed"
             } catch (_: java.net.SocketTimeoutException) {
-                return
+                return "header-timeout"
             } catch (_: PeerHttpException) {
                 respond(out, 400, errorJson("bad request"))
-                return
+                diag("resp 400 malformed-head")
+                return "client-error"
             }
+            // Authorization is evaluated per request, at the moment it is read,
+            // not once per connection: a keep-alive connection opened before
+            // this peer paired (or after an unpair) must not carry a stale trust
+            // decision. That stale classification made a just-paired desktop's
+            // uploads fail on a reused connection (Task 30).
+            val peer = isPaired(fp)
+            diag("req ${head.method} ${reqLabel(head)}")
             if (head.path == "/api/v1/shares" || head.path.startsWith("/api/v1/shares/")) {
                 handleShares(out, head, peer, ssl, input, started)
-                if (head.close || requests >= maxRequestsPerConnection) return
+                if (head.close || requests >= maxRequestsPerConnection) return "close-requested"
                 continue
             }
             val fileBody = head.method == "PUT" && isFileBodyPath(head.path)
@@ -215,16 +237,46 @@ class PeerServer(
                     val body = readSmallBody(ssl, input, head, cap, started)
                     val (code, text) = route(head, body, fp, peer, ssl)
                     respond(out, code, text, closing)
+                    diag("resp $code ${head.method} ${reqLabel(head)}")
                 }
             } catch (e: PeerHttpException) {
                 // If a file body was being read, the rest of it is still on the
                 // wire, so the connection cannot be reused: close it.
                 val mustClose = closing || fileBody
                 respond(out, e.code, errorJson(e.message), mustClose)
-                if (mustClose) return
+                diag("resp ${e.code} ${head.method} ${reqLabel(head)} (${e.message})")
+                if (mustClose) return "body-error"
+            } catch (e: Exception) {
+                // An unexpected failure while handling the request (for example
+                // the save location could not be written). Never drop the
+                // connection silently: a bare EOF tells the sender nothing. A
+                // file body may be half-read, so that connection cannot be
+                // reused; a small request can.
+                val mustClose = closing || fileBody
+                respond(out, 500, errorJson("could not save the file on this device"), mustClose)
+                diag("resp 500 ${head.method} ${reqLabel(head)} (${e.javaClass.simpleName})")
+                if (mustClose) return "handler-error"
             }
-            if (closing) return
+            if (closing) return "close-requested"
         }
+        return "max-requests"
+    }
+
+    /** A request label for diagnostics: method path, query dropped, never a value. */
+    private fun reqLabel(head: Head): String {
+        val base = if (head.headers["content-range"] != null) {
+            head.path + "?" + head.query.split('&').joinToString("&") { it.substringBefore('=') }
+        } else {
+            head.path
+        }
+        val te = head.headers["transfer-encoding"]
+        val cl = head.headers["content-length"]
+        val len = when {
+            te != null -> " ch=$te"
+            cl != null -> " len=$cl"
+            else -> ""
+        }
+        return base + len
     }
 
     private fun readHead(ssl: SSLSocket, input: InputStream, first: Int): Head? {
@@ -389,9 +441,11 @@ class PeerServer(
         if (!sha.isNullOrEmpty() && offset == 0L) {
             val written = receiver.receiveWhole(id, fp, rel, sha, body)
             respond(out, 200, """{"written":$written,"offset":$written,"done":true}""", closing)
+            diag("resp 200 ${head.method} ${reqLabel(head)}")
         } else {
             val written = receiver.writeChunk(id, fp, rel, offset, body)
             respond(out, 200, """{"written":$written,"offset":${offset + written}}""", closing)
+            diag("resp 200 ${head.method} ${reqLabel(head)} (wrote $written)")
         }
     }
 
@@ -572,9 +626,9 @@ class PeerServer(
     }
 
     private fun handleShares(out: OutputStream, head: Head, peer: PairedPeer?, ssl: SSLSocket, input: InputStream, started: Long) {
-        if (shares == null) { respond(out, 404, errorJson("not found")); return }
-        if (peer == null) { respond(out, 403, errorJson("not paired")); return }
-        if (!peer.browse) { respond(out, 403, errorJson("pull not permitted")); return }
+        if (shares == null) { respond(out, 404, errorJson("not found")); diag("resp 404 shares unavailable"); return }
+        if (peer == null) { respond(out, 403, errorJson("not paired")); diag("resp 403 share not paired"); return }
+        if (!peer.browse) { respond(out, 403, errorJson("pull not permitted")); diag("resp 403 share no-browse"); return }
         val body = if (head.method == "POST") readSmallBody(ssl, input, head, maxBodyBytes, started) else ByteArray(0)
         val isFileGet = (head.method == "GET" || head.method == "HEAD") && head.path.endsWith("/file")
         val guard = if (isFileGet) StallGuard(ssl, stallTimeoutMillis.toLong(), stallScheduler) else null
@@ -585,6 +639,10 @@ class PeerServer(
             ) { guard?.kick() }
         } catch (e: PeerHttpException) {
             respond(out, e.code, errorJson(e.message))
+            diag("resp ${e.code} ${head.method} ${reqLabel(head)} (${e.message})")
+        } catch (e: Exception) {
+            respond(out, 500, errorJson("could not read the shared file"))
+            diag("resp 500 ${head.method} ${reqLabel(head)} (${e.javaClass.simpleName})")
         } finally {
             guard?.stop()
         }

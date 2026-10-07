@@ -14,6 +14,7 @@ import io.github.tuscani712.lanyard.core.PairLink
 import io.github.tuscani712.lanyard.core.PairingSessions
 import io.github.tuscani712.lanyard.core.PeerServer
 import io.github.tuscani712.lanyard.core.PushApproval
+import io.github.tuscani712.lanyard.core.ServerDiagnostics
 import io.github.tuscani712.lanyard.core.ShareServer
 import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.net.AndroidMeteredNetwork
@@ -75,6 +76,15 @@ object PeerService {
     private val approvalLock = Any()
     private var approvalWaiter: CompletableDeferred<Boolean>? = null
 
+    /**
+     * Recent server events (connection, handshake, request, response, close),
+     * surfaced in the troubleshoot report so a person can paste what the phone
+     * saw. Never contains file contents, full fingerprints or secrets.
+     */
+    val diagnostics = ServerDiagnostics().apply {
+        onRecord = { line -> android.util.Log.d("lanyard-diag", line) }
+    }
+
     /** The shared paired-peer store (also used by the Devices screen). */
     val trust: TrustStore get() = trustStore
 
@@ -127,6 +137,7 @@ object PeerService {
             approval = pushApproval,
             onUnpair = { trustStore.remove(it) },
             shares = ShareServer(shareSource).also { shareServer = it },
+            diagnostics = diagnostics,
         )
         val port = try {
             srv.start(id) { boundPort -> hello(id, boundPort) }

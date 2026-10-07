@@ -205,12 +205,18 @@ object Diagnostics {
         }
 
     /** A plain-text report with secrets redacted. */
-    fun copyReport(results: List<CheckResult>): String = Redaction.redact(
-        results.joinToString("\n\n") { r ->
+    fun copyReport(results: List<CheckResult>, serverEvents: List<String> = emptyList()): String {
+        val checks = results.joinToString("\n\n") { r ->
             val fix = if (r.fix.isNotEmpty()) "\nFix: ${r.fix}" else ""
             "[${r.status.name.uppercase()}] ${r.title}\n${r.detail}$fix"
-        },
-    )
+        }
+        val events = if (serverEvents.isEmpty()) {
+            ""
+        } else {
+            "\n\nServer events (most recent last):\n" + serverEvents.joinToString("\n")
+        }
+        return Redaction.redact(checks + events)
+    }
 }
 
 /** Removes secrets from report text: tokens, invites and full fingerprints. */

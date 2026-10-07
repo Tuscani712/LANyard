@@ -190,4 +190,34 @@ class DiagnosticsTest {
         assertFalse(report.contains("192.168.1.9"))
         assertFalse(report.contains("fa".repeat(32)))
     }
+
+    @Test
+    fun serverEventsAppearInReportAndAreRedacted() {
+        val fp = "ab12cd34".repeat(8)
+        val out = Diagnostics.copyReport(
+            emptyList(),
+            listOf(
+                "00:00:01.000 conn open",
+                "00:00:01.020 handshake ok peer=${fp.take(8)} paired=yes",
+                "00:00:01.100 req POST /api/v1/push/offer len=90",
+                "00:00:01.120 resp 200 POST /api/v1/push/offer",
+                "00:00:01.200 req PUT /api/v1/push/p_1/file?path ch=chunked",
+                "00:00:01.650 resp 200 PUT /api/v1/push/p_1/file?path (wrote 2097152)",
+                "00:00:01.660 conn close peer-closed",
+            ),
+        )
+        assertTrue(out.contains("Server events"))
+        assertTrue(out.contains("push/offer"))
+        assertTrue(out.contains("conn close peer-closed"))
+        assertFalse(out.contains(fp))
+    }
+
+    @Test
+    fun serverDiagnosticsRingIsBounded() {
+        val d = ServerDiagnostics(capacity = 3, clock = { 0 })
+        repeat(5) { d.record("event-$it") }
+        assertEquals(3, d.snapshot().size)
+        assertTrue(d.snapshot().last().endsWith("event-4"))
+        assertFalse(d.snapshot().any { it.endsWith("event-1") })
+    }
 }
