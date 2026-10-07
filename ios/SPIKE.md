@@ -37,6 +37,11 @@ guesses; they are facts about the current repository snapshot.
    throwaway `Sources/spike/main.swift` and an `executableTarget(name: "spike",
    dependencies: ["LanyardNet", "LanyardCore"])` to `Package.swift` **on the
    Mac only** to drive the steps below. Do not commit it to the real repo.
+6. **Invite QR port — resolved in core, wire it on the Mac.** `PairFlow` now
+   takes a `PortProvider` and stays `.starting` (no QR) until the bound listener
+   port is known, so the invite can never carry `addr=host:0`. The app must feed
+   the real `PeerListener` port into a `ClosurePortProvider` (see
+   `LanyardApp/PairingServices.swift`) once the listener is bound on the Mac.
 
 ---
 

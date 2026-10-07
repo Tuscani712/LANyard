@@ -3,7 +3,7 @@ import Crypto
 
 /// One file in a share's manifest, with a path relative to the share root.
 /// Ported from the Kotlin `ManifestFile`.
-struct ManifestFile: Equatable {
+package struct ManifestFile: Equatable {
     let path: String
     let name: String
     let size: Int64
@@ -24,7 +24,7 @@ package protocol ByteSink: AnyObject {
 /// bytes so a resumed file's digest still covers the whole file.
 ///
 /// Ported from the Kotlin `DownloadTarget`.
-struct DownloadTarget {
+package struct DownloadTarget {
     let existingSize: Int64
     let openAt: (Int64) -> ByteSink
     let openExisting: (() -> ByteSource)?
@@ -41,7 +41,7 @@ struct DownloadTarget {
 }
 
 /// The outcome of a download. Ported from the Kotlin `DownloadResult`.
-enum DownloadResult: Equatable {
+package enum DownloadResult: Equatable {
     case done(files: Int, bytes: Int64)
 
     /// We cancelled it locally.
@@ -109,7 +109,26 @@ final class DownloadSession {
             return .peerUnreachable
         }
 
-        let files = parseManifest(manifest)
+        return downloadFiles(
+            shareId: shareId,
+            files: Self.parseManifest(manifest),
+            targetFor: targetFor,
+            onProgress: onProgress,
+            isCancelled: isCancelled
+        )
+    }
+
+    /// Downloads an explicit file list (already parsed from a manifest). The
+    /// public `download(shareId:path:...)` parses the manifest and delegates
+    /// here; `PullBrowse` uses this to download a chosen subset. Same resume,
+    /// SHA-256 verification and cancel rules.
+    func downloadFiles(
+        shareId: String,
+        files: [ManifestFile],
+        targetFor: (ManifestFile) -> DownloadTarget,
+        onProgress: (_ index: Int, _ file: ManifestFile, _ received: Int64, _ total: Int64) -> Void = { _, _, _, _ in },
+        isCancelled: () -> Bool = { false }
+    ) -> DownloadResult {
         for file in files {
             if !Self.isSafeRelPath(file.path) { return .unsafePath }
         }
@@ -216,7 +235,7 @@ final class DownloadSession {
         }
     }
 
-    private func parseManifest(_ data: Data) -> [ManifestFile] {
+    static func parseManifest(_ data: Data) -> [ManifestFile] {
         guard let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               let arr = obj["files"] as? [Any] else {
             return []

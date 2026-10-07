@@ -153,7 +153,20 @@ the rest is behind `LanyardNet` and is written, not compiled, until a Mac exists
     (SAS grouped, permissions toggles, the invite **QR with a live countdown**),
     the AVFoundation QR scanner, the Local Network permission screen, and the
     `NWBrowser`/beacon wiring into `DevicesModel`.
-- **Phase 5 — push send + share/serve + Transfers screen.**
+- **Phase 5 — send + share/serve + Transfers (and the QR port fix).** *(delivered)*
+  - **Linux-tested:** `SendFlow` (destination pick, offer, per-file progress,
+    cancel, resend a Failed send, 403/410/else status mapping), `ShareList`
+    (share lifetimes, stop/stop-all, the 4-concurrency cap with 503 +
+    `Retry-After`, the digest LRU), `PullBrowse` over the `DownloadSession`
+    seams, and the **invite QR port gate** — `PairFlow` takes a `PortProvider`
+    and stays `.starting` (no QR) until the bound listener port is known.
+    354 tests, 0 failures.
+  - **Written, not compiled (iOS-only):** the SwiftUI Send / Share / Browse
+    screens, the `UIDocumentPicker` file & folder pickers, the `NWListener`
+    `ShareServer` adapter, the background `URLSession` downloader, and the
+    matching `ObservableObject` adapters. (Background pulls over our custom
+    mTLS are flagged as the headline Mac risk — `URLSession` background tasks
+    run out-of-process and cannot reuse the in-process verify block.)
 - **Phase 6 — Settings + Troubleshoot log + Share extension.**
 
 Each phase is independently reviewable. Phases 2–6 will be labelled

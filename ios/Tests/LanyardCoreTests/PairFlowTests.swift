@@ -20,8 +20,16 @@ final class PairFlowTests: XCTestCase {
         return JsonFileTrustStore(file: dir.appendingPathComponent("peers.json"))
     }()
 
-    private func flow() -> PairFlow {
-        PairFlow(trust: trust, selfFingerprint: { self.selfFp }, clock: { self.now })
+    private func flow(port: PortProvider = FixedPortProvider(47800)) -> PairFlow {
+        PairFlow(trust: trust, selfFingerprint: { self.selfFp }, clock: { self.now }, portProvider: port)
+    }
+
+    /// A `PortProvider` whose value can change, to exercise the port becoming
+    /// known after `start()`.
+    private final class MutablePortProvider: PortProvider {
+        var port: Int?
+        init(_ port: Int?) { self.port = port }
+        func currentPort() -> Int? { port }
     }
 
     private func offer(receivedAt: Int64? = nil) -> PairOffer {
@@ -47,6 +55,60 @@ final class PairFlowTests: XCTestCase {
         XCTAssertEqual(now + PairFlow.inviteTTLMillis, expiresAt)
         guard case .generating = f.state else { return XCTFail("expected generating") }
         XCTAssertEqual(token, f.currentInvite?.token)
+    }
+
+    // MARK: - Port gating (ITEM 0)
+
+    func testStartWithKnownPortGeneratesInviteWithThatPort() {
+        let f = flow(port: FixedPortProvider(47800))
+        XCTAssertFalse(f.readyToInvite)
+        let (token, _) = f.start()
+        guard case .generating = f.state else { return XCTFail("expected generating") }
+        XCTAssertTrue(f.readyToInvite)
+        XCTAssertEqual(token, f.currentInvite?.token)
+        XCTAssertEqual(
+            ["192.168.1.20:47800", "[fe80::1]:47800"],
+            f.inviteAddresses(localAddresses: ["192.168.1.20", "fe80::1"])
+        )
+    }
+
+    func testStartWithUnknownPortIsStarting() {
+        let f = flow(port: FixedPortProvider(nil))
+        f.start()
+        XCTAssertEqual(.starting, f.state)
+        XCTAssertFalse(f.readyToInvite)
+        XCTAssertNil(f.currentInvite, "starting exposes no invite/QR")
+        XCTAssertTrue(f.inviteAddresses(localAddresses: ["192.168.1.20"]).isEmpty)
+    }
+
+    func testStartWithZeroPortIsStarting() {
+        let f = flow(port: FixedPortProvider(0))
+        f.start()
+        XCTAssertEqual(.starting, f.state)
+        XCTAssertFalse(f.readyToInvite)
+        XCTAssertTrue(f.inviteAddresses(localAddresses: ["192.168.1.20"]).isEmpty)
+    }
+
+    func testTickPromotesStartingWhenPortBecomesKnown() {
+        let port = MutablePortProvider(nil)
+        let f = flow(port: port)
+        let (token, expiresAt) = f.start()
+        XCTAssertEqual(.starting, f.state)
+        f.tick(now: now)
+        XCTAssertEqual(.starting, f.state, "still no port; stays starting")
+        port.port = 51234
+        f.tick(now: now)
+        guard case let .generating(invite, exp) = f.state else { return XCTFail("expected generating") }
+        XCTAssertEqual(token, invite, "the pending token is promoted, not re-minted")
+        XCTAssertEqual(expiresAt, exp)
+        XCTAssertEqual(["10.0.0.9:51234"], f.inviteAddresses(localAddresses: ["10.0.0.9"]))
+    }
+
+    func testStartingInviteExpiresAfterTheWindow() {
+        let f = flow(port: FixedPortProvider(nil))
+        f.start()
+        f.tick(now: now + PairFlow.inviteTTLMillis)
+        XCTAssertEqual(.expired, f.state)
     }
 
     func testCountdownRoundsUpAndStopsAtZero() {

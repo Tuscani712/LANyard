@@ -1,5 +1,37 @@
 import Foundation
 
+/// Supplies the TCP port the peer server is currently listening on, or nil
+/// while it is unknown. The invite QR/link must advertise a dialable
+/// `host:port`, so the pairing screen gates the QR on a valid port; without
+/// this seam the invite carries port 0 and cannot be dialed.
+public protocol PortProvider {
+    func currentPort() -> Int?
+}
+
+/// A `PortProvider` returning a fixed port (nil = unknown). For tests and for
+/// callers that already hold the listener port.
+public struct FixedPortProvider: PortProvider {
+    public let port: Int?
+
+    public init(_ port: Int?) {
+        self.port = port
+    }
+
+    public func currentPort() -> Int? { port }
+}
+
+/// A closure-backed `PortProvider`, so the app can read the live listener's
+/// port (which changes across restarts) instead of freezing it at init.
+public struct ClosurePortProvider: PortProvider {
+    private let provider: () -> Int?
+
+    public init(_ provider: @escaping () -> Int?) {
+        self.provider = provider
+    }
+
+    public func currentPort() -> Int? { provider() }
+}
+
 /// The pairing screen's states.
 ///
 /// This is the local UI state machine around pairing, distinct from the
@@ -8,6 +40,9 @@ import Foundation
 /// person sees:
 ///
 ///  - `idle` — nothing in progress;
+///  - `starting` — an invite has been requested but the listener port is still
+///    unknown (or 0), so no QR/link is shown yet; `tick(now:)` promotes it to
+///    `generating` once the port is known;
 ///  - `generating(invite:expiresAt:)` — this device showed its QR/link and is
 ///    waiting for someone to use it (2-minute validity);
 ///  - `awaitingConfirmation(offer:sas:)` — a peer used the invite and the person
@@ -16,6 +51,7 @@ import Foundation
 ///  - `declined` / `expired` — terminal outcomes.
 public enum PairFlowState: Equatable {
     case idle
+    case starting
     case generating(invite: String, expiresAt: Int64)
     case awaitingConfirmation(offer: PairOffer, sas: String)
     case paired(PairedPeer)
@@ -88,25 +124,40 @@ public final class PairFlow {
     /// toggle them on the permission screen before accepting.
     public private(set) var permissions = Permissions(browse: true, push: true)
 
-    /// The token/expiry this device advertised, while generating.
+    /// The token/expiry this device advertised, while generating. Nil while
+    /// `starting` (no dialable port yet) and outside a live invite window.
     public var currentInvite: (token: String, expiresAt: Int64)? {
         if case let .generating(invite, expiresAt) = state { return (invite, expiresAt) }
         return nil
+    }
+
+    /// Whether a dialable invite is currently shown: true only in `generating`,
+    /// i.e. once the listener port is known and valid. The QR/link UI must not
+    /// render anything until this is true.
+    public var readyToInvite: Bool {
+        if case .generating = state { return true }
+        return false
     }
 
     private let trust: TrustStore
     private let selfFingerprint: () -> String
     private let clock: () -> Int64
     private let invites: PairInvites
+    private let portProvider: PortProvider
+    /// The invite minted at `start()`; kept so a `starting` flow that later
+    /// learns its port promotes to `generating` with the same token.
+    private var pendingInvite: PairInvites.Invite?
 
     public init(
         trust: TrustStore,
         selfFingerprint: @escaping () -> String,
-        clock: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
+        clock: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) },
+        portProvider: PortProvider = FixedPortProvider(nil)
     ) {
         self.trust = trust
         self.selfFingerprint = selfFingerprint
         self.clock = clock
+        self.portProvider = portProvider
         // The invite store must share this flow's clock, so expiry is consistent.
         self.invites = PairInvites(clock: clock)
     }
@@ -115,12 +166,43 @@ public final class PairFlow {
 
     /// Begins generating a fresh invite. Allowed from `idle`, `declined`,
     /// `expired`, or `paired` (re-pairing). Resets the permission toggles.
+    ///
+    /// The invite is only advertised once `portProvider.currentPort()` returns a
+    /// valid 1...65535 port; until then the flow is `starting` and exposes no
+    /// token/addresses, so the QR is never built with port 0.
     @discardableResult
     public func start() -> (token: String, expiresAt: Int64) {
         permissions = Permissions(browse: true, push: true)
         let invite = invites.mint()
-        state = .generating(invite: invite.token, expiresAt: invite.expiresAt)
+        pendingInvite = invite
+        if Self.validPort(portProvider.currentPort()) {
+            state = .generating(invite: invite.token, expiresAt: invite.expiresAt)
+        } else {
+            state = .starting
+        }
         return (invite.token, invite.expiresAt)
+    }
+
+    /// The dialable `host:port` invite addresses, composed from the given local
+    /// host strings and the current listener port. Returns `[]` until the flow is
+    /// `generating` (so the app renders no QR). A bare IPv6 host is bracketed.
+    public func inviteAddresses(localAddresses: [String]) -> [String] {
+        guard case .generating = state,
+              let port = portProvider.currentPort(),
+              Self.validPort(port) else { return [] }
+        return localAddresses.compactMap { host in
+            let trimmed = host.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return nil }
+            if trimmed.contains(":") && !trimmed.hasPrefix("[") {
+                return "[\(trimmed)]:\(port)"
+            }
+            return "\(trimmed):\(port)"
+        }
+    }
+
+    private static func validPort(_ port: Int?) -> Bool {
+        guard let port else { return false }
+        return (1...65535).contains(port)
     }
 
     /// Records an incoming request against the still-valid invite and computes
@@ -179,10 +261,28 @@ public final class PairFlow {
     // MARK: - Clock-driven expiry
 
     /// Expires a stale `generating` invite or an unconfirmed `awaitingConfirmation`
-    /// prompt after the 2-minute window. `now` defaults to the injected clock.
+    /// prompt after the 2-minute window, and promotes `starting` to `generating`
+    /// once the listener port becomes known. `now` defaults to the injected clock.
     public func tick(now: Int64? = nil) {
         let now = now ?? clock()
         switch state {
+        case .starting:
+            guard let pending = pendingInvite else {
+                // No invite was ever minted (e.g. an externally driven start);
+                // mint one now that a port may be available.
+                if Self.validPort(portProvider.currentPort()) {
+                    let invite = invites.mint()
+                    pendingInvite = invite
+                    state = .generating(invite: invite.token, expiresAt: invite.expiresAt)
+                }
+                return
+            }
+            if now >= pending.expiresAt {
+                pendingInvite = nil
+                state = .expired
+            } else if Self.validPort(portProvider.currentPort()) {
+                state = .generating(invite: pending.token, expiresAt: pending.expiresAt)
+            }
         case let .generating(_, expiresAt):
             if now >= expiresAt { state = .expired }
         case let .awaitingConfirmation(offer, _):

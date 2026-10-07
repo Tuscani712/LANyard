@@ -27,6 +27,9 @@ struct LanyardApp: App {
                 .environmentObject(services.inbox)
                 .environmentObject(services.server)
                 .environmentObject(services.approval)
+                .environmentObject(services.send)
+                .environmentObject(services.shares)
+                .environmentObject(services.browse)
         }
     }
 }
@@ -37,6 +40,12 @@ final class AppServices: ObservableObject {
     let inbox: InboxModel
     let server: ServerModel
     let approval: ReceiveApprovalModel
+
+    // Phase 5: push send, share/serve and pull/browse.
+    let send: SendModel
+    let shares: SharesModel
+    let browse: BrowseModel
+    let shareServices: ShareServices
 
     let authorizer: Authorizer
 
@@ -62,11 +71,42 @@ final class AppServices: ObservableObject {
         let transport = AppServerTransport()
         let lifecycle = ServerLifecycle(transport: transport)
 
+        // The device identity is needed by the send and pull clients. It is
+        // created on first launch and stored in the Keychain.
+        let identity: DeviceIdentity
+        do {
+            identity = try DeviceIdentity.load()
+        } catch {
+            fatalError("LANyard could not load or create its device identity: \(error)")
+        }
+        let trust = LanyardTrustStore.applicationSupportStore()
+
+        // MAC-SPIKE: the online set is fed by the Devices tab's discovery; until
+        // that is wired here, every paired peer reads as offline in the send
+        // picker (`SendTarget.reason == "Offline"`), though the send itself is
+        // enqueue-able. Wire `DevicesModel`'s registry through a shared object.
+        let online: () -> Set<String> = { [] }
+
+        let shareServices = ShareServices(
+            identity: identity,
+            bookmarksFile: AppServices.sharesFile,
+            selfName: ProcessInfo.processInfo.hostName
+        )
+
         self.transfers = TransfersModel(manager: manager)
         self.inbox = InboxModel(destination: destination, adapter: adapter)
         self.server = ServerModel(lifecycle: lifecycle)
         self.approval = ReceiveApprovalModel()
         self.authorizer = authorizer
+        self.send = SendModel.make(
+            identity: identity,
+            queueFile: AppServices.sendQueueFile,
+            peers: { trust.list() },
+            onlineFingerprints: online
+        )
+        self.browse = BrowseModel.make(identity: identity, peers: { trust.list() })
+        self.shareServices = shareServices
+        self.shares = shareServices.model
         self.lifecycle = lifecycle
 
         // A push cannot continue once the listener stops (the app was
@@ -100,6 +140,16 @@ final class AppServices: ObservableObject {
 
     static var historyFile: URL {
         applicationSupport.appendingPathComponent("transfers.json")
+    }
+
+    /// The persisted send queue.
+    static var sendQueueFile: URL {
+        applicationSupport.appendingPathComponent("send-queue.json")
+    }
+
+    /// The persisted share catalog (security-scoped bookmarks).
+    static var sharesFile: URL {
+        applicationSupport.appendingPathComponent("shares.json")
     }
 
     static func freeBytes() -> Int64 {

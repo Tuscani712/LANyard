@@ -1,12 +1,12 @@
 import Foundation
 
 /// One receiver row in the share picker, with a reason when it can't be chosen.
-struct ShareTarget: Equatable {
-    let peer: PairedPeer
-    let enabled: Bool
-    let reason: String?
+public struct ShareTarget: Equatable {
+    public let peer: PairedPeer
+    public let enabled: Bool
+    public let reason: String?
 
-    init(peer: PairedPeer, enabled: Bool, reason: String? = nil) {
+    public init(peer: PairedPeer, enabled: Bool, reason: String? = nil) {
         self.peer = peer
         self.enabled = enabled
         self.reason = reason

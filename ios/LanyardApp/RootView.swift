@@ -25,6 +25,15 @@ struct RootView: View {
                 .environmentObject(pairing.pairFlow)
                 .tabItem { Label("Devices", systemImage: "laptopcomputer.and.iphone") }
 
+            SendView()
+                .tabItem { Label("Send", systemImage: "paperplane") }
+
+            ShareView()
+                .tabItem { Label("Share", systemImage: "square.and.arrow.up") }
+
+            BrowseView()
+                .tabItem { Label("Browse", systemImage: "folder") }
+
             TransfersView()
                 .tabItem { Label("Transfers", systemImage: "arrow.left.arrow.right") }
 

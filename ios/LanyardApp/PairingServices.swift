@@ -25,16 +25,24 @@ final class PairingServices: ObservableObject {
         let identity = try? DeviceIdentity.load()
         let fingerprint = identity?.fingerprint ?? ""
 
-        // MAC-SPIKE: the advertised invite port must be the bound PeerListener
-        // port, which `AppServices.ServerLifecycle` owns. 0 means the invite QR
-        // carries no dialable address until this is wired to the live listener.
-        let advertisedPort = 0
+        // The advertised invite port must be the bound PeerListener port, which
+        // `AppServices.ServerLifecycle` owns. Until that is wired, the provider
+        // returns nil and `PairFlow` stays `.starting`: it shows no invite/QR,
+        // so the link can never carry a dialable-less `addr=` at port 0.
+        let advertisedPort: () -> Int? = {
+            // TODO: return AppServices.ServerLifecycle.shared.listenerPort
+            nil
+        }
 
         self.devices = DevicesModel(trust: trust, selfFingerprint: { fingerprint })
 
-        let flow = PairFlow(trust: trust, selfFingerprint: { fingerprint })
+        let flow = PairFlow(
+            trust: trust,
+            selfFingerprint: { fingerprint },
+            portProvider: ClosurePortProvider(advertisedPort)
+        )
         self.pairFlow = PairFlowModel(flow: flow, linkBuilder: { token in
-            let addresses = DeviceIdentity.localAddresses().map { "\($0):\(advertisedPort)" }
+            let addresses = flow.inviteAddresses(localAddresses: DeviceIdentity.localAddresses())
             return PairLinkBuilder.build(
                 fingerprint: fingerprint,
                 name: ProcessInfo.processInfo.hostName,
