@@ -14,6 +14,7 @@ import io.github.tuscani712.lanyard.core.PairLink
 import io.github.tuscani712.lanyard.core.PairingSessions
 import io.github.tuscani712.lanyard.core.PeerServer
 import io.github.tuscani712.lanyard.core.PushApproval
+import io.github.tuscani712.lanyard.core.ShareServer
 import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.net.AndroidMeteredNetwork
 import io.github.tuscani712.lanyard.net.NetAddrs
@@ -49,8 +50,11 @@ object PeerService {
     private lateinit var sessionStore: PairingSessions
     private lateinit var inviteStore: PairInvites
     private lateinit var receiver: InboxReceiver
+    private lateinit var shareStore: ShareStore
+    private lateinit var shareSource: SafShareSource
     private lateinit var spoolDir: File
     private var server: PeerServer? = null
+    private var shareServer: ShareServer? = null
     private var advertiser: NsdAdvertiser? = null
     private var appVersion: String = ""
     private var currentInvite: PairInvites.Invite? = null
@@ -64,6 +68,9 @@ object PeerService {
 
     private val _interrupted = MutableStateFlow(false)
     val interrupted: StateFlow<Boolean> = _interrupted.asStateFlow()
+
+    private val _shares = MutableStateFlow<List<AppShare>>(emptyList())
+    val shares: StateFlow<List<AppShare>> = _shares.asStateFlow()
 
     private val approvalLock = Any()
     private var approvalWaiter: CompletableDeferred<Boolean>? = null
@@ -91,6 +98,9 @@ object PeerService {
             freeBytes = { spoolDir.usableSpace },
             onChange = { publish() },
         )
+        shareStore = ShareStore(app)
+        shareSource = SafShareSource(app, shareStore)
+        _shares.value = shareStore.list()
         metered = AndroidMeteredNetwork(app)
         appVersion = runCatching {
             app.packageManager.getPackageInfo(app.packageName, 0).versionName
@@ -116,6 +126,7 @@ object PeerService {
             wifiOnly = { SettingsHolder.settings.value.wifiOnly },
             approval = pushApproval,
             onUnpair = { trustStore.remove(it) },
+            shares = ShareServer(shareSource).also { shareServer = it },
         )
         val port = try {
             srv.start(id) { boundPort -> hello(id, boundPort) }
@@ -200,6 +211,19 @@ object PeerService {
         }
         if (accepted) ApprovalOutcome.ACCEPTED else ApprovalOutcome.DECLINED
     }
+
+    fun addFolderShare(label: String, uri: android.net.Uri) {
+        shareSource.addFolder(label, uri)
+        _shares.value = shareStore.list()
+    }
+
+    fun stopShare(id: String) {
+        shareServer?.cancel(id)
+        shareSource.stop(id)
+        _shares.value = shareStore.list()
+    }
+
+    fun shareSource(): io.github.tuscani712.lanyard.core.ShareSource = shareSource
 
     private fun hello(id: Identity, port: Int): JsonObject = JsonObject().apply {
         addProperty("device_id", id.deviceId.take(16))

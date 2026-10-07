@@ -58,6 +58,7 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
+import io.github.tuscani712.lanyard.PeerService
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -237,6 +238,9 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
         Spacer(Modifier.height(8.dp))
         TextButton(onClick = { showTroubleshoot = true }) { Text("Troubleshoot") }
         TextButton(onClick = { showLicenses = true }) { Text("Third-party licenses") }
+
+        SectionLabel("Shared with paired devices")
+        ShareSection()
     }
 
     if (confirmClear) {
@@ -528,4 +532,44 @@ private fun copyToClipboard(context: Context, label: String, value: String) {
 private fun shareText(context: Context, title: String, text: String) {
     val intent = Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text)
     runCatching { context.startActivity(Intent.createChooser(intent, title)) }
+}
+
+/** Minimal share list: pick a folder, see what is shared, stop sharing. */
+@Composable
+private fun ShareSection() {
+    val context = LocalContext.current
+    val shares by PeerService.shares.collectAsStateWithLifecycle()
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val label = DocumentFile.fromTreeUri(context, uri)?.name ?: "Shared folder"
+            PeerService.addFolderShare(label, uri)
+        }
+    }
+    Text(
+        "Folders paired devices can pull into their own folder.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(8.dp))
+    OutlinedButton(onClick = { picker.launch(null) }) { Text("Share a folder…") }
+    if (shares.isEmpty()) {
+        Spacer(Modifier.height(8.dp))
+        Text("Nothing is shared.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+    } else {
+        shares.forEach { s ->
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(Modifier.weight(1f)) {
+                    Text(s.label, style = MaterialTheme.typography.bodyLarge)
+                    Text("until stopped", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                TextButton(onClick = { PeerService.stopShare(s.id) }) { Text("Stop") }
+            }
+        }
+    }
 }

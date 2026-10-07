@@ -60,6 +60,7 @@ class PeerServer(
     private val wifiOnly: () -> Boolean = { true },
     private val approval: PushApproval? = null,
     private val onUnpair: (String) -> Unit = {},
+    private val shares: ShareServer? = null,
     private val headerTimeoutMillis: Int = 15_000,
     private val stallTimeoutMillis: Int = 30_000,
     private val idleTimeoutMillis: Int = 10_000,
@@ -77,6 +78,7 @@ class PeerServer(
     private var hello: ((Int) -> JsonObject)? = null
     private val unpairedActive = AtomicInteger()
     private val pairedActive = AtomicInteger()
+    private var stallScheduler: java.util.concurrent.ScheduledExecutorService? = null
 
     /** Count of accepted TLS connections (used by the handshake-reuse test). */
     val handshakes = AtomicLong()
@@ -101,6 +103,7 @@ class PeerServer(
         }
         val poolSize = maxUnpairedConnections + maxPairedConnections
         val executor = ThreadPoolExecutor(poolSize, poolSize, 30L, TimeUnit.SECONDS, SynchronousQueue(), factory)
+        stallScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r -> Thread(r, "lanyard-stall").apply { isDaemon = true } }
 
         server = ss
         pool = executor
@@ -114,6 +117,8 @@ class PeerServer(
         server = null
         pool?.shutdownNow()
         pool = null
+        stallScheduler?.shutdownNow()
+        stallScheduler = null
         hello = null
         for (socket in live) runCatching { socket.close() }
         live.clear()
@@ -193,6 +198,11 @@ class PeerServer(
             } catch (_: PeerHttpException) {
                 respond(out, 400, errorJson("bad request"))
                 return
+            }
+            if (head.path == "/api/v1/shares" || head.path.startsWith("/api/v1/shares/")) {
+                handleShares(out, head, peer, ssl, input, started)
+                if (head.close || requests >= maxRequestsPerConnection) return
+                continue
             }
             val fileBody = head.method == "PUT" && isFileBodyPath(head.path)
             val closing = head.close || requests >= maxRequestsPerConnection
@@ -545,6 +555,53 @@ class PeerServer(
         }
     }
 
+
+    private class StallGuard(socket: Socket, timeoutMs: Long, sched: java.util.concurrent.ScheduledExecutorService?) {
+        private val last = AtomicLong(System.currentTimeMillis())
+        @Volatile private var stopped = false
+        private val task = sched?.scheduleWithFixedDelay({
+            if (!stopped && System.currentTimeMillis() - last.get() > timeoutMs) {
+                runCatching { socket.setSoLinger(true, 0) } // RST so a blocked send fails at once
+                runCatching { socket.shutdownOutput() }
+                runCatching { socket.close() }
+            }
+        }, timeoutMs, maxOf(timeoutMs / 2, 500), TimeUnit.MILLISECONDS)
+
+        fun kick() { last.set(System.currentTimeMillis()) }
+        fun stop() { stopped = true; task?.cancel(false) }
+    }
+
+    private fun handleShares(out: OutputStream, head: Head, peer: PairedPeer?, ssl: SSLSocket, input: InputStream, started: Long) {
+        if (shares == null) { respond(out, 404, errorJson("not found")); return }
+        if (peer == null) { respond(out, 403, errorJson("not paired")); return }
+        if (!peer.browse) { respond(out, 403, errorJson("pull not permitted")); return }
+        val body = if (head.method == "POST") readSmallBody(ssl, input, head, maxBodyBytes, started) else ByteArray(0)
+        val isFileGet = (head.method == "GET" || head.method == "HEAD") && head.path.endsWith("/file")
+        val guard = if (isFileGet) StallGuard(ssl, stallTimeoutMillis.toLong(), stallScheduler) else null
+        try {
+            shares.handle(
+                out, head.method, head.path, parseQuery(head.query),
+                head.headers["range"], head.headers["if-range"], body, peer,
+            ) { guard?.kick() }
+        } catch (e: PeerHttpException) {
+            respond(out, e.code, errorJson(e.message))
+        } finally {
+            guard?.stop()
+        }
+    }
+
+    private fun parseQuery(query: String): Map<String, String> {
+        if (query.isEmpty()) return emptyMap()
+        val out = HashMap<String, String>()
+        for (part in query.split('&')) {
+            if (part.isEmpty()) continue
+            val i = part.indexOf('=')
+            val k = if (i < 0) part else part.substring(0, i)
+            val v = if (i < 0) "" else part.substring(i + 1)
+            out[k] = try { java.net.URLDecoder.decode(v, Charsets.UTF_8) } catch (_: Exception) { v }
+        }
+        return out
+    }
 
     private fun peerFingerprint(ssl: SSLSocket): String? {
         val leaf = ssl.session.peerCertificates.firstOrNull() as? X509Certificate ?: return null

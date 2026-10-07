@@ -96,6 +96,17 @@ internal class GoPeer(bin: String) : AutoCloseable {
         return "timeout"
     }
 
+    /** Lists the shares a peer exposes (through the desktop's UI). */
+    fun remoteShares(deviceFp: String): com.google.gson.JsonArray =
+        ui.get("/api/remote/shares?device=$deviceFp").asJsonArray
+
+    /** Starts a download of [shareId]'s paths into [dest]; returns the job. */
+    fun download(deviceFp: String, shareId: String, paths: List<String>, dest: String): JsonObject =
+        ui.post(
+            "/api/transfers",
+            """{"device":${quote(deviceFp)},"share_id":${quote(shareId)},"share_label":"folder","paths":${com.google.gson.Gson().toJson(paths)},"dest":${quote(dest)}}""",
+        ).asJsonObject
+
     /** This desktop's fingerprint. */
     fun fingerprint(): String = pairPayload().str("fp")
 
