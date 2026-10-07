@@ -226,7 +226,12 @@ func NewClient(id *identity.Identity) *Client {
 			InsecureSkipVerify: true, // identity is checked by fingerprint below, not by CA
 		},
 		ForceAttemptHTTP2:   true,
-		MaxIdleConnsPerHost: 4,
+		// Keep enough idle connections to match the up-to-16 small-file
+		// transfers a push runs in parallel, so an HTTP/1.1 peer that closes
+		// after every request still reuses connections instead of re-handshaking
+		// for each file.
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 16,
 		IdleConnTimeout:     30 * time.Second,
 	}
 	return &Client{http: &http.Client{Transport: tr}}
