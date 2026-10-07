@@ -533,7 +533,7 @@ function renderDevice(body, p) {
   const paired = pairedEntry(p.device);
   const session = activeSession(p.device);
   const online = isOnline(p.device);
-  const head = el("div", "row");
+  const head = el("div", "row device-head");
   const main = el("div", "grow");
   main.appendChild(el("div", "name", peer.name || "(unnamed)"));
   const bits = [online ? "Online" : "Offline \u2014 " + lastSeenText(p.device), devKindName(devKind(peer.os)), paired ? "Paired" : session ? "Connected" : "Not paired"];
@@ -565,7 +565,7 @@ function renderDevice(body, p) {
     const ta = document.createElement("textarea");
     ta.rows = 3; ta.maxLength = 65536;
     ta.placeholder = "Type a short message or paste a link\u2026";
-    ta.style.flex = "1"; ta.style.minWidth = "280px";
+    ta.style.flex = "1 1 240px"; ta.style.minWidth = "0";
     const send = btn("Send text", async () => {
       const text = ta.value;
       if (!text.trim()) { toast("Type something to send.", "err"); return; }

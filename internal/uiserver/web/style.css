@@ -144,12 +144,22 @@ svg { display: block; }
 /* ---- cards / rows (other pages) ---- */
 .panel { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 14px 16px; }
 .stack { display: flex; flex-direction: column; gap: 10px; }
-.row { display: flex; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 11px 13px; }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 11px 13px; }
 .row.col { flex-direction: column; align-items: stretch; }
-.row .grow { flex: 1; min-width: 0; }
+.row .grow { min-width: 0; }
+/* A row keeps its info block readable: the text block gets a sensible basis so
+   it is never squeezed to a one-letter column, and the action buttons wrap
+   under it when the pane is narrow. */
+.row:not(.col) > .grow { flex: 1 1 220px; }
 .row .name { font-weight: 600; overflow-wrap: anywhere; }
 .row .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+/* Device header: the name and status stay on one line each and the ID stays
+   together as a whole; the buttons drop below the info on narrow panes. */
+.row.device-head { align-items: flex-start; }
+.row.device-head > .grow { flex: 1 1 260px; }
+.row.device-head .name,
+.row.device-head .meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .btn { border: 0; border-radius: 8px; padding: 8px 14px; background: var(--accent); color: #fff; cursor: pointer; }
 .btn:hover { background: var(--accent-2); }
 .btn:disabled { opacity: .5; cursor: default; }

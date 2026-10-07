@@ -41,6 +41,8 @@ static int lan_open(const char *title, const char *url, const char *datadir,
 	lan_win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
 	gtk_window_set_title(GTK_WINDOW(lan_win), title);
 	gtk_window_set_default_size(GTK_WINDOW(lan_win), w, h);
+	// The layout stops being usable below this; refuse to shrink past it.
+	gtk_widget_set_size_request(GTK_WIDGET(lan_win), 720, 520);
 	gtk_window_set_position(GTK_WINDOW(lan_win), GTK_WIN_POS_CENTER);
 	if (icon != NULL && iconlen > 0) {
 		GdkPixbufLoader *l = gdk_pixbuf_loader_new();

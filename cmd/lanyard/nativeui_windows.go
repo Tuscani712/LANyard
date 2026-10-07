@@ -86,6 +86,8 @@ func runNativeUI(opts nativeUIOptions) error {
 
 	hwnd := windows.HWND(w.Window())
 	applyShellFrame(hwnd)
+	// The layout stops being usable below this; refuse to shrink past it.
+	w.SetSize(720, 520, webview2.HintMin)
 
 	_ = w.Bind("lanWin", func(action string) string {
 		switch action {
