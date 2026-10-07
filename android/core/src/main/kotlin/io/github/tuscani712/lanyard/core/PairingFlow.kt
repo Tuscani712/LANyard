@@ -71,14 +71,25 @@ object PairingFlow {
         val sessionId = session.str("session_id")
         if (sessionId.isEmpty()) return PairResult.Refused
 
+        // A session we start but never finish must be ended here. Otherwise the
+        // responder keeps a pending prompt for its 2-minute TTL, and
+        // MAX_PENDING_PER_PEER (1) rejects the very next request from this same
+        // phone with 409 "a request from this device is already waiting" — so a
+        // second attempt could not pair. Closing is best effort: the peer may
+        // already be gone.
+        fun abort(result: PairResult): PairResult {
+            runCatching { client.closeSession(sessionId) }
+            return result
+        }
+
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
             val status = try {
                 client.sessionStatus(sessionId)
             } catch (_: PeerStatusException) {
-                return PairResult.Refused
+                return abort(PairResult.Refused)
             } catch (_: Exception) {
-                return PairResult.Unreachable
+                return abort(PairResult.Unreachable)
             }
             when (status.str("status")) {
                 "accepted" -> return finish(client, sessionId, status, match, payload, selfName, store)
@@ -87,7 +98,7 @@ object PairingFlow {
             }
             Thread.sleep(200)
         }
-        return PairResult.Expired
+        return abort(PairResult.Expired)
     }
 
     private fun finish(
@@ -102,8 +113,10 @@ object PairingFlow {
         try {
             client.confirmSession(sessionId)
         } catch (_: PeerStatusException) {
+            runCatching { client.closeSession(sessionId) }
             return PairResult.Refused
         } catch (_: Exception) {
+            runCatching { client.closeSession(sessionId) }
             return PairResult.Unreachable
         }
         val granted = status.get("granted")?.takeIf { !it.isJsonNull }?.asJsonObject

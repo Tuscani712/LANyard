@@ -148,32 +148,19 @@ class PeerServer(
 
     private fun handleConnection(socket: Socket) {
         val ssl = socket as SSLSocket
-        var acquired = false
-        var paired = false
         var reason = "error"
         diag("conn open")
         try {
             ssl.startHandshake()
             handshakes.incrementAndGet()
             val fp = peerFingerprint(ssl) ?: run { reason = "no-cert"; return }
-            val peer = isPaired(fp)
-            paired = peer != null
-            diag("handshake ok peer=${fp.take(8)} paired=${if (paired) "yes" else "no"}")
-            val counter = if (paired) pairedActive else unpairedActive
-            val cap = if (paired) maxPairedConnections else maxUnpairedConnections
-            if (!acquireConnection(counter, cap)) { reason = "budget"; return }
-            acquired = true
+            diag("handshake ok peer=${fp.take(8)} paired=${if (isPaired(fp) != null) "yes" else "no"}")
             reason = requestLoop(ssl, fp)
         } catch (e: Exception) {
             // handshake/read failure or a timeout: drop
             reason = "error:" + e.javaClass.simpleName
         } finally {
-            if (acquired) {
-                diag("conn close $reason")
-                if (paired) pairedActive.decrementAndGet() else unpairedActive.decrementAndGet()
-            } else {
-                diag("conn close $reason")
-            }
+            diag("conn close $reason")
             live.remove(socket)
             runCatching { socket.close() }
         }
@@ -221,43 +208,60 @@ class PeerServer(
             // uploads fail on a reused connection (Task 30).
             val peer = isPaired(fp)
             diag("req ${head.method} ${reqLabel(head)}")
-            if (head.path == "/api/v1/shares" || head.path.startsWith("/api/v1/shares/")) {
-                handleShares(out, head, peer, ssl, input, started)
-                if (head.close || requests >= maxRequestsPerConnection) return "close-requested"
-                continue
+            // The connection budget also counts only the request being served,
+            // not the idle keep-alive time between requests. Otherwise a peer's
+            // ordinary discovery/liveness probes (each a short /hello) pile up
+            // as idle unpaired connections and exhaust maxUnpairedConnections,
+            // so a phone-to-phone session request is refused with no response.
+            val pairedNow = peer != null
+            val counter = if (pairedNow) pairedActive else unpairedActive
+            val cap = if (pairedNow) maxPairedConnections else maxUnpairedConnections
+            if (!acquireConnection(counter, cap)) {
+                respond(out, 503, errorJson("busy"), true)
+                diag("resp 503 ${head.method} ${reqLabel(head)} (connection budget)")
+                return "budget"
             }
-            val fileBody = head.method == "PUT" && isFileBodyPath(head.path)
-            val closing = head.close || requests >= maxRequestsPerConnection
             try {
-                if (fileBody) {
-                    ssl.soTimeout = stallTimeoutMillis
-                    handleFileBody(out, head, fp, peer, input, closing)
-                } else {
-                    val cap = bodyCap(head.path)
-                    val body = readSmallBody(ssl, input, head, cap, started)
-                    val (code, text) = route(head, body, fp, peer, ssl)
-                    respond(out, code, text, closing)
-                    diag("resp $code ${head.method} ${reqLabel(head)}")
+                if (head.path == "/api/v1/shares" || head.path.startsWith("/api/v1/shares/")) {
+                    handleShares(out, head, peer, ssl, input, started)
+                    if (head.close || requests >= maxRequestsPerConnection) return "close-requested"
+                    continue
                 }
-            } catch (e: PeerHttpException) {
-                // If a file body was being read, the rest of it is still on the
-                // wire, so the connection cannot be reused: close it.
-                val mustClose = closing || fileBody
-                respond(out, e.code, errorJson(e.message), mustClose)
-                diag("resp ${e.code} ${head.method} ${reqLabel(head)} (${e.message})")
-                if (mustClose) return "body-error"
-            } catch (e: Exception) {
-                // An unexpected failure while handling the request (for example
-                // the save location could not be written). Never drop the
-                // connection silently: a bare EOF tells the sender nothing. A
-                // file body may be half-read, so that connection cannot be
-                // reused; a small request can.
-                val mustClose = closing || fileBody
-                respond(out, 500, errorJson("could not save the file on this device"), mustClose)
-                diag("resp 500 ${head.method} ${reqLabel(head)} (${e.javaClass.simpleName}: ${e.message?.take(160)})")
-                if (mustClose) return "handler-error"
+                val fileBody = head.method == "PUT" && isFileBodyPath(head.path)
+                val closing = head.close || requests >= maxRequestsPerConnection
+                try {
+                    if (fileBody) {
+                        ssl.soTimeout = stallTimeoutMillis
+                        handleFileBody(out, head, fp, peer, input, closing)
+                    } else {
+                        val bodyCap = bodyCap(head.path)
+                        val body = readSmallBody(ssl, input, head, bodyCap, started)
+                        val (code, text) = route(head, body, fp, peer, ssl)
+                        respond(out, code, text, closing)
+                        diag("resp $code ${head.method} ${reqLabel(head)}")
+                    }
+                } catch (e: PeerHttpException) {
+                    // If a file body was being read, the rest of it is still on the
+                    // wire, so the connection cannot be reused: close it.
+                    val mustClose = closing || fileBody
+                    respond(out, e.code, errorJson(e.message), mustClose)
+                    diag("resp ${e.code} ${head.method} ${reqLabel(head)} (${e.message})")
+                    if (mustClose) return "body-error"
+                } catch (e: Exception) {
+                    // An unexpected failure while handling the request (for example
+                    // the save location could not be written). Never drop the
+                    // connection silently: a bare EOF tells the sender nothing. A
+                    // file body may be half-read, so that connection cannot be
+                    // reused; a small request can.
+                    val mustClose = closing || fileBody
+                    respond(out, 500, errorJson("could not save the file on this device"), mustClose)
+                    diag("resp 500 ${head.method} ${reqLabel(head)} (${e.javaClass.simpleName}: ${e.message?.take(160)})")
+                    if (mustClose) return "handler-error"
+                }
+                if (closing) return "close-requested"
+            } finally {
+                counter.decrementAndGet()
             }
-            if (closing) return "close-requested"
         }
         return "max-requests"
     }
