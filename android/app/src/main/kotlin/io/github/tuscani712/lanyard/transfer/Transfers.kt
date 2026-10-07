@@ -70,6 +70,7 @@ object TransferManager {
     val state: StateFlow<List<TransferRecord>> = _state.asStateFlow()
 
     private val cancels = HashMap<String, AtomicBoolean>()
+    private val pushReceives = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val speedSamples = java.util.concurrent.ConcurrentHashMap<String, SpeedSample>()
     private val cleanups = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
 
@@ -187,6 +188,7 @@ object TransferManager {
 
     fun noteReceiveStarted(id: String, peerName: String, peerFp: String, label: String, total: Long) {
         if (_state.value.any { it.id == id }) return
+        pushReceives.add(id)
         add(TransferRecord(id, "receive", peerName, peerFp, label, total, 0, TransferState.Running, null, 0.0, now()))
     }
 
@@ -196,12 +198,34 @@ object TransferManager {
     }
 
     fun noteReceiveDone(id: String, message: String) {
+        pushReceives.remove(id)
         if (_state.value.none { it.id == id }) return
         complete(id, message)
     }
 
+    /** Marks a push this phone abandoned (declined or cut off) as failed. */
+    fun noteReceiveFailed(id: String, reason: String) {
+        pushReceives.remove(id)
+        if (_state.value.none { it.id == id }) return
+        fail(id, reason)
+    }
+
+    /**
+     * Fails every push still being received. Called when the peer server stops
+     * (the app was backgrounded): a push cannot continue without it, so the row
+     * should not sit at Running until the next restart. Pull downloads are not
+     * touched, since those keep running in the background.
+     */
+    fun failPushReceives(reason: String) {
+        for (id in pushReceives.toList()) {
+            if (_state.value.any { it.id == id }) fail(id, reason)
+        }
+        pushReceives.clear()
+    }
+
     /** Removes a finished (Done/Failed/Cancelled) row from the list. */
     fun dismiss(id: String) {
+        pushReceives.remove(id)
         _state.value = _state.value.filterNot { it.id == id }
         persist()
     }

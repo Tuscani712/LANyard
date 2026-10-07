@@ -51,6 +51,7 @@ class InboxReceiver(
     private val onOffer: (pushId: String, peerFp: String, files: Int, total: Long) -> Unit = { _, _, _, _ -> },
     private val onProgress: (pushId: String, done: Long, total: Long) -> Unit = { _, _, _ -> },
     private val onDone: (pushId: String, peerFp: String, files: Int, total: Long) -> Unit = { _, _, _, _ -> },
+    private val onCancelled: (pushId: String, reason: String) -> Unit = { _, _ -> },
     private val clock: () -> Long = System::currentTimeMillis,
     // Whether a verified file can actually be saved right now (a download folder
     // is set and writable). When false, an offer is refused up front with a clear
@@ -80,7 +81,7 @@ class InboxReceiver(
     ): PushOffer {
         if (reqs.isEmpty()) throw PeerHttpException(400, "no files")
         if (!destinationReady()) {
-            throw PeerHttpException(503, "This phone needs a download folder set in Settings before it can receive files.")
+            throw PeerHttpException(503, "This device cannot save received files. Choose a writable download folder in Settings.")
         }
         if (reqs.size > PushProtocol.MAX_OFFER_FILES) {
             throw PeerHttpException(413, "too many files in one push")
@@ -195,6 +196,7 @@ class InboxReceiver(
         val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
         for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
         onChange()
+        onCancelled(id, "The transfer was cancelled")
         return true
     }
 

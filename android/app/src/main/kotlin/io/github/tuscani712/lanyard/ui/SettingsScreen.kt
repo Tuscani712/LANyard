@@ -196,7 +196,7 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("Default download folder", style = MaterialTheme.typography.bodyLarge)
                 Text(
-                    folderName ?: "Not set",
+                    folderName ?: "Downloads/LANyard (default)",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -204,7 +204,7 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
             if (folderUri != null) {
                 TextButton(onClick = {
                     SettingsHolder.update { it.copy(downloadFolder = null) }
-                }) { Text("Clear") }
+                }) { Text("Use default") }
             }
             OutlinedButton(onClick = { folderPicker.launch(folderUri) }) {
                 Text(if (folderUri == null) "Choose" else "Change")

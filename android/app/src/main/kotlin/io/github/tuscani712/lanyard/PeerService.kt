@@ -15,6 +15,7 @@ import io.github.tuscani712.lanyard.core.PairLink
 import io.github.tuscani712.lanyard.core.PairingSessions
 import io.github.tuscani712.lanyard.core.PeerServer
 import io.github.tuscani712.lanyard.core.PushApproval
+import io.github.tuscani712.lanyard.core.PushDestination
 import io.github.tuscani712.lanyard.core.ServerDiagnostics
 import io.github.tuscani712.lanyard.core.ShareServer
 import io.github.tuscani712.lanyard.core.TrustStore
@@ -53,6 +54,8 @@ object PeerService {
     private lateinit var sessionStore: PairingSessions
     private lateinit var inviteStore: PairInvites
     private lateinit var receiver: InboxReceiver
+    private lateinit var safDestination: SafInboxDestination
+    private lateinit var defaultDestination: PushDestination
     private lateinit var shareStore: ShareStore
     private lateinit var shareSource: SafShareSource
     private lateinit var spoolDir: File
@@ -101,8 +104,18 @@ object PeerService {
         )
         inviteStore = PairInvites()
         spoolDir = File(app.filesDir, "spool").apply { mkdirs() }
-        val destination = SafInboxDestination(app) {
+        safDestination = SafInboxDestination(app) {
             SettingsHolder.settings.value.downloadFolder?.let { Uri.parse(it) }
+        }
+        defaultDestination = defaultInboxDestination(app)
+        val destination = PushDestination { rel, spool, size ->
+            // A folder chosen in Settings wins; otherwise every install can
+            // receive straight away into Downloads/LANyard.
+            if (SettingsHolder.settings.value.downloadFolder != null) {
+                safDestination.place(rel, spool, size)
+            } else {
+                defaultDestination.place(rel, spool, size)
+            }
         }
         receiver = InboxReceiver(
             spoolRoot = spoolDir,
@@ -114,8 +127,9 @@ object PeerService {
             },
             onProgress = { pushId, done, total -> TransferManager.noteReceiveProgress(pushId, done, total) },
             onDone = { pushId, _, files, _ -> TransferManager.noteReceiveDone(pushId, "Received $files file(s)") },
+            onCancelled = { pushId, reason -> TransferManager.noteReceiveFailed(pushId, reason) },
             destinationReady = ready@{
-                val uri = SettingsHolder.settings.value.downloadFolder?.let { Uri.parse(it) } ?: return@ready false
+                val uri = SettingsHolder.settings.value.downloadFolder?.let { Uri.parse(it) } ?: return@ready true
                 runCatching { DocumentFile.fromTreeUri(app, uri)?.canWrite() == true }.getOrDefault(false)
             },
         )
@@ -164,6 +178,9 @@ object PeerService {
         server = null
         advertiser?.stop()
         advertiser = null
+        // A push cannot continue without the server; fail any still-running
+        // receive now rather than leave it Running until the next launch.
+        TransferManager.failPushReceives("Interrupted")
     }
 
     fun accept(id: String) {

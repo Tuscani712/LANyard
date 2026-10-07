@@ -221,6 +221,20 @@ class InboxReceiverTest {
         )
     }
 
+    @Test
+    fun cancelNotifiesTheCallerWithThePushId() {
+        val cancelled = mutableListOf<String>()
+        val r = InboxReceiver(
+            spoolRoot = spool,
+            destination = PushDestination { rel, _, _ -> rel },
+            freeBytes = { 1L shl 40 },
+            onCancelled = { pushId, _ -> cancelled.add(pushId) },
+        )
+        val o = r.offer("p", "P", listOf(req("a.bin", 4)), 0, 0)
+        assertTrue(r.cancel(o.pushId, "p"))
+        assertEquals(listOf(o.pushId), cancelled, "a cancelled push must be reported so its row does not stay Running")
+    }
+
     private fun genSha(total: Long): String {
         val md = MessageDigest.getInstance("SHA-256")
         GenInput(total).use { ins ->
