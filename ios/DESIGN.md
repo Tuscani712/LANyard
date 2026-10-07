@@ -129,8 +129,18 @@ the rest is behind `LanyardNet` and is written, not compiled, until a Mac exists
     adapters over the Phase 1b seams, all in the `LanyardNet` target behind
     `#if canImport(Network)`/`#if canImport(Security)`. First-Mac checklist in
     [`SPIKE.md`](SPIKE.md). Go/no-go on the P-256 fallback comes out of step 1.
-- **Phase 3 — push receive.** Listener, offer/approval, spool, Documents
-  destination + Files-app visibility.
+- **Phase 3 — push receive.** *(delivered)*
+  - **Linux-tested:** `TransferManager` (states incl. an interrupted receive
+    becoming Failed("Interrupted"), Dismiss, clear history),
+    `InboxDestination` (default `Documents/LANyard`, `name (1).ext`,
+    writability refusal), `Authorizer` (per-request rules), `ServerLifecycle`
+    (foreground/background). 250 tests, 0 failures.
+  - **Written, not compiled (iOS-only):** the SwiftUI app (`LanyardApp/`), the
+    `UIDocumentPicker` security-scoped-bookmark override, the
+    foreground/background listener glue, the `Info.plist` keys
+    (`NSLocalNetworkUsageDescription`, `NSBonjourServices` = `_lanyard._tcp`,
+    `UIFileSharingEnabled`, `LSSupportsOpeningDocumentsInPlace`), and
+    `project.yml` (XcodeGen, every target).
 - **Phase 4 — discovery + pairing.** `NWBrowser` Bonjour + beacon, QR/link, SAS,
   trust store, Local Network permission.
 - **Phase 5 — push send + share/serve + Transfers screen.**

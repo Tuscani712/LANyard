@@ -1,0 +1,78 @@
+# project.yml — XcodeGen spec for the LANyard iPhone app.
+#
+# WRITTEN, NOT COMPILED and NOT RUN here: this Linux box has no XcodeGen or
+# Xcode. On a Mac:
+#
+#     brew install xcodegen
+#     cd ios && xcodegen generate && open Lanyard.xcodeproj
+#
+# It references the local SwiftPM package (this directory) and produces two
+# targets: the app (LanyardApp) and the Phase 6 share extension
+# (LanyardShareExtension). Both app and extension link the package products
+# LanyardCore and LanyardNet; the extension also embeds into the app.
+
+name: Lanyard
+
+options:
+  bundleIdPrefix: io.github.tuscani712.lanyard
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+# The local package declared by Package.swift in this directory.
+packages:
+  LanyardPackage:
+    path: .
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    ENABLE_USER_SCRIPT_SANDBOXING: true
+
+targets:
+  # The SwiftUI app. Sources are in LanyardApp/ (outside the SwiftPM targets, so
+  # they are not part of `swift build`).
+  LanyardApp:
+    type: application
+    platform: iOS
+    sources:
+      - path: LanyardApp
+        excludes:
+          - Info.plist
+    info:
+      path: LanyardApp/Info.plist
+    dependencies:
+      - package: LanyardPackage
+        product: LanyardCore
+      - package: LanyardPackage
+        product: LanyardNet
+      - target: LanyardShareExtension
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.tuscani712.lanyard
+        GENERATE_INFOPLIST_FILE: false
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+  # Phase 6 stub. Exists so the target, its Info.plist and its embed relationship
+  # are real today; ShareViewController.swift just shows a placeholder.
+  LanyardShareExtension:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: LanyardShareExtension
+        excludes:
+          - Info.plist
+    info:
+      path: LanyardShareExtension/Info.plist
+    dependencies:
+      - package: LanyardPackage
+        product: LanyardCore
+      - package: LanyardPackage
+        product: LanyardNet
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.github.tuscani712.lanyard.share
+        GENERATE_INFOPLIST_FILE: false

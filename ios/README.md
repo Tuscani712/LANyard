@@ -41,6 +41,8 @@ swift test
 On a Mac, the same command works, or open `Package.swift` in Xcode and run the
 `LanyardCoreTests` scheme.
 
+`swift test` on Linux currently runs **250 tests, 0 failures**.
+
 ## What was verified
 
 | Area | Status |
@@ -63,7 +65,9 @@ On a Mac, the same command works, or open `Package.swift` in Xcode and run the
 | Ed25519 self-signed X.509 certificate builder (`swift-asn1` + swift-crypto, never Security) | **Linux-tested** |
 | Certificate cross-check: `ios/fixtures/verify_cert.go` parses Swift's DER (`crosscheck.sh`); Swift parses and verifies a Go-generated cert | **Linux-tested** |
 | `LanyardNet`: Keychain identity storage, `SecIdentity` creation, `NWListener`/`NWConnection` TLS 1.3 mTLS, the verify-block pin, `NWBrowser` Bonjour, and the PeerClient/PeerServer adapters over the Phase 1b seams | **Written, not compiled — Apple-only; see [`SPIKE.md`](SPIKE.md)** |
-| Discovery, pairing UI, push receive/send, share/serve, Transfers, Settings, Troubleshoot, Share extension | **Written, not compiled — Phases 3–6** |
+| Receive logic: `TransferManager` (states, `Interrupted`, `Dismiss`, clear history), `InboxDestination` (Documents/`LANyard` default, `name (1).ext`, writability refusal), `Authorizer` (per-request rules), `ServerLifecycle` (foreground/background) | **Linux-tested** |
+| SwiftUI app (`LanyardApp/`), the `UIDocumentPicker` bookmark adapter, the foreground/background lifecycle glue, `Info.plist` keys (`NSLocalNetworkUsageDescription`, `NSBonjourServices`, `UIFileSharingEnabled`, `LSSupportsOpeningDocumentsInPlace`), and `project.yml` | **Written, not compiled — iOS-only; see [`DESIGN.md`](DESIGN.md)** |
+| Discovery, pairing UI, push/send, share/serve, Troubleshoot, Share extension | **Written, not compiled — Phases 4–6** |
 
 ## Layout
 
