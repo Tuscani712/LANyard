@@ -231,3 +231,34 @@ func TestNearestExistingDir(t *testing.T) {
 		t.Fatalf("nearestExistingDir(\"\") = %q, want \"\"", got)
 	}
 }
+
+// Finishing a push reports each file that landed, so the caller can record a
+// receive entry in the transfer history.
+func TestFinishReportsReceivedFiles(t *testing.T) {
+	m := New(t.TempDir(), nil)
+	var gotPeer string
+	var gotFiles []ReceivedFile
+	m.SetOnDone(func(peerFP string, files []ReceivedFile) { gotPeer, gotFiles = peerFP, files })
+
+	data := []byte("hello push")
+	p, err := m.Offer("peer", "paired", []FileReq{{RelPath: "sub/a.txt", Size: int64(len(data)), MTime: time.Now()}}, 0)
+	if err != nil {
+		t.Fatalf("Offer: %v", err)
+	}
+	if _, err := m.Receive(p.ID, "peer", "sub/a.txt", sha(data), strings.NewReader(string(data))); err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+	if !m.Finish(p.ID, "peer") {
+		t.Fatal("Finish returned false")
+	}
+	if gotPeer != "peer" {
+		t.Fatalf("peer = %q", gotPeer)
+	}
+	if len(gotFiles) != 1 {
+		t.Fatalf("files = %+v", gotFiles)
+	}
+	f := gotFiles[0]
+	if f.Rel != "sub/a.txt" || f.Name != "a.txt" || f.Size != int64(len(data)) {
+		t.Fatalf("file = %+v", f)
+	}
+}

@@ -26,7 +26,13 @@ func (s *Server) handlePairPayload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	self := s.d.Self()
-	nonce, exp := s.d.Trust.MintPairInvite()
+	// Reuse the invite the panel is already showing while it is still valid, so
+	// the QR code stays put; mint a fresh one once it expired or was used.
+	nonce := strings.TrimSpace(r.URL.Query().Get("nonce"))
+	exp, ok := s.d.Trust.PairInviteValid(nonce)
+	if !ok {
+		nonce, exp = s.d.Trust.MintPairInvite()
+	}
 	port := self.PeerPort
 	addrs := make([]string, 0, 8)
 	for _, a := range lanaddr.Addrs() {
@@ -176,7 +182,8 @@ func (s *Server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		s.d.Trust.Close(sess.ID)
-		http.Error(w, "could not reach device: "+err.Error(), http.StatusBadGateway)
+		msg, _ := pairingStartMessage(err)
+		http.Error(w, msg, http.StatusBadGateway)
 		return
 	}
 	s.d.Trust.SetRemote(sess.ID, resp.SessionID, resp.Nonce)
@@ -188,6 +195,18 @@ func (s *Server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 	}
 	view, _ := s.d.Trust.View(sess.ID)
 	writeJSON(w, view)
+}
+
+// pairingStartMessage turns a failure to reach a peer's session endpoint into a
+// person-readable line. A 404 means the peer speaks the discovery protocol but
+// does not run the pairing service yet (for example the current Android app),
+// which is a different situation from a device that cannot be reached at all.
+func pairingStartMessage(err error) (string, bool) {
+	var se *peerapi.StatusError
+	if errors.As(err, &se) && se.Code == http.StatusNotFound {
+		return "This device can't accept pairing yet. Pair from it instead: scan this computer's QR code.", true
+	}
+	return "could not reach device: " + err.Error(), false
 }
 
 func (s *Server) handleSessionAccept(w http.ResponseWriter, r *http.Request) {

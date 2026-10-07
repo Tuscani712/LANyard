@@ -84,6 +84,9 @@ type Deps struct {
 	Approvals *approval.Manager
 	// Inbox holds pushes being received (shown with a Cancel button).
 	Inbox *inbox.Manager
+	// OpenFolder reveals a folder in the OS file manager. Nil uses the platform
+	// default (xdg-open / open / explorer).
+	OpenFolder func(path string) error
 	// Mounts serves paired devices as drives (spec §11.2).
 	Mounts *mount.Manager
 
@@ -249,6 +252,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/sessions/{id}/close", s.auth(s.handleSessionClose))
 	mux.HandleFunc("POST /api/sessions/{id}/offers", s.auth(s.handleSessionOffers))
 	mux.HandleFunc("POST /api/sessions/{id}/keep", s.auth(s.handleSessionKeep))
+	mux.HandleFunc("POST /api/inbox/open", s.auth(s.handleInboxOpen))
 	mux.HandleFunc("GET /api/events", s.auth(s.handleEvents))
 	mux.Handle("GET /", http.FileServerFS(sub))
 

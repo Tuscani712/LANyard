@@ -50,6 +50,11 @@ func (s *Server) settingsView() settingsView {
 	}
 	v.StartOnLogin = st.StartOnLogin
 	v.MinimizeToTray = st.MinimizeToTray
+	// Show the folder pushes actually land in: the configured one, or the
+	// default (~/LANyard) the manager resolved at startup.
+	if st.InboxFolder == "" && s.d.Inbox != nil {
+		v.InboxFolder = s.d.Inbox.Dir()
+	}
 	v.TraySupported = runtime.GOOS == "windows"
 	v.Version = self.Version
 	v.UpdateURL = st.UpdateURL

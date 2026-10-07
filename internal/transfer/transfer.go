@@ -469,6 +469,61 @@ func (m *Manager) Create(ctx context.Context, p CreateParams) (*View, error) {
 	return m.view(job), nil
 }
 
+// ReceivedFile is one file that finished landing in the Inbox.
+type ReceivedFile struct {
+	Name string
+	Size int64
+}
+
+// RecordReceived adds a finished received push to the history as a "receive"
+// entry. The inbox calls it when a push completes, so a file pushed to this
+// device shows in the Transfers history like a download or a send. It is kept
+// in memory and persisted like any other terminal job.
+func (m *Manager) RecordReceived(peerFP, peerName string, files []ReceivedFile, started time.Time) {
+	if len(files) == 0 {
+		return
+	}
+	now := time.Now()
+	if started.IsZero() {
+		started = now
+	}
+	job := &Job{
+		ID:         "r_" + randHex(6),
+		Direction:  "receive",
+		PeerID:     peerFP,
+		PeerName:   peerName,
+		StartedAt:  started,
+		UpdatedAt:  now,
+		FinishedAt: now,
+		State:      StateDone,
+		wake:       make(chan struct{}, 1),
+	}
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		job.Files = append(job.Files, &FileJob{
+			Rel: f.Name, Local: f.Name, Target: f.Name,
+			Size: f.Size, Done: f.Size, State: FileDone,
+		})
+		job.Total += f.Size
+		names = append(names, f.Name)
+	}
+	if len(files) == 1 {
+		job.ShareLabel = files[0].Name
+	} else {
+		job.ShareLabel = fmt.Sprintf("%d files", len(files))
+	}
+	// RemotePaths survives the compact on-disk form, so the names remain after
+	// a restart even though a large job's per-file list is dropped.
+	job.RemotePaths = names
+	sort.Strings(job.RemotePaths)
+
+	m.mu.Lock()
+	m.jobs[job.ID] = job
+	m.mu.Unlock()
+	m.persist()
+	m.onChange()
+}
+
 // Resume restarts a paused/failed/waiting job.
 func (m *Manager) Resume(id string) error {
 	m.mu.Lock()
