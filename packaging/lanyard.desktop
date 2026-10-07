@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=LANyard File Transfer
+Comment=Send files directly between your devices on your local network
+Exec=lanyard
+Icon=lanyard
+Terminal=false
+Categories=Network;FileTransfer;
+StartupWMClass=lanyard

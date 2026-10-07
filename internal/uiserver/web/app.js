@@ -1107,7 +1107,9 @@ function renderSettings(s) {
   box.appendChild(settingsField("Sound when a transfer finishes", sound));
   box.appendChild(settingsField("Show desktop notifications for pairing requests and finished transfers", notif));
   box.appendChild(settingsField("Start LANyard when I sign in", startup));
-  if (s.tray_supported) box.appendChild(settingsField("Minimize to system tray (closing or minimizing hides the window; use the tray icon to reopen or quit)", tray));
+  tray.disabled = !s.tray_supported;
+  box.appendChild(settingsField("Minimize to system tray (closing or minimizing hides the window; use the tray icon to reopen or quit)", tray));
+  if (!s.tray_supported) box.appendChild(el("p", "muted", s.tray_reason || "The system tray is not available in this mode."));
   box.appendChild(settingsField("Default download folder", dlWrap));
   box.appendChild(settingsField("Inbox folder (pushes)", inboxWrap));
   box.appendChild(settingsField("Bandwidth limit (MB/s, 0 = unlimited)", bw));

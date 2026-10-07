@@ -27,10 +27,25 @@ type settingsView struct {
 	StartOnLogin          bool          `json:"start_on_login"`
 	MinimizeToTray        bool          `json:"minimize_to_tray"`
 	TraySupported         bool          `json:"tray_supported"`
+	TrayReason            string        `json:"tray_reason"`
 	Version               string        `json:"version"`
 	UpdateURL             string        `json:"update_url"`
 	AutoUpdate            bool          `json:"auto_update"`
 	Paired                []trust.Entry `json:"paired"`
+}
+
+// TrayProbe is set by the native app to report whether a system tray is really
+// available (and why not). Nil falls back to a per-platform default.
+var TrayProbe func() (bool, string)
+
+func traySupported() (bool, string) {
+	if TrayProbe != nil {
+		return TrayProbe()
+	}
+	if runtime.GOOS == "windows" {
+		return true, ""
+	}
+	return false, "The system tray is not available in this mode."
 }
 
 func (s *Server) settingsView() settingsView {
@@ -55,7 +70,7 @@ func (s *Server) settingsView() settingsView {
 	if st.InboxFolder == "" && s.d.Inbox != nil {
 		v.InboxFolder = s.d.Inbox.Dir()
 	}
-	v.TraySupported = runtime.GOOS == "windows"
+	v.TraySupported, v.TrayReason = traySupported()
 	v.Version = self.Version
 	v.UpdateURL = st.UpdateURL
 	v.AutoUpdate = st.AutoUpdate

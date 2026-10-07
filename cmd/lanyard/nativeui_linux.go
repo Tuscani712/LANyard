@@ -18,6 +18,22 @@ static gboolean lan_on_delete(GtkWidget *w, GdkEvent *e, gpointer d) {
 	return FALSE;
 }
 
+// lan_on_state turns a minimize (iconify) into a hide-to-tray when the setting
+// and a tray are both active, so the window leaves the taskbar and is restored
+// from the tray icon. With the setting off, minimizing behaves normally.
+static gboolean lan_on_state(GtkWidget *w, GdkEventWindowState *e, gpointer d) {
+	if (lan_hide_on_close &&
+	    (e->changed_mask & GDK_WINDOW_STATE_ICONIFIED) &&
+	    (e->new_window_state & GDK_WINDOW_STATE_ICONIFIED)) {
+		// Clear the WM's iconified state first, then withdraw. Otherwise a
+		// later show leaves the window stuck unmapped.
+		gtk_window_deiconify(GTK_WINDOW(w));
+		gtk_widget_hide(w);
+		return TRUE;
+	}
+	return FALSE;
+}
+
 static gboolean lan_on_new_window(WebKitWebView *v, WebKitNavigationAction *a, gpointer d) {
 	// Links that would open a new window stay inside the app's one window.
 	return TRUE;
@@ -48,12 +64,13 @@ static int lan_open(const char *title, const char *url, const char *datadir,
 		GdkPixbufLoader *l = gdk_pixbuf_loader_new();
 		if (gdk_pixbuf_loader_write(l, icon, iconlen, NULL) && gdk_pixbuf_loader_close(l, NULL)) {
 			GdkPixbuf *pb = gdk_pixbuf_loader_get_pixbuf(l);
-			if (pb) gtk_window_set_icon(GTK_WINDOW(lan_win), pb);
+			if (pb) { gtk_window_set_icon(GTK_WINDOW(lan_win), pb); gtk_window_set_default_icon(pb); }
 		}
 		g_object_unref(l);
 	}
 	gtk_container_add(GTK_CONTAINER(lan_win), lan_view);
 	g_signal_connect(lan_win, "delete-event", G_CALLBACK(lan_on_delete), NULL);
+	g_signal_connect(lan_win, "window-state-event", G_CALLBACK(lan_on_state), NULL);
 	g_signal_connect(lan_win, "destroy", G_CALLBACK(gtk_main_quit), NULL);
 	webkit_web_view_load_uri(WEBKIT_WEB_VIEW(lan_view), url);
 	gtk_widget_show_all(lan_win);
@@ -111,7 +128,12 @@ static char *lan_pick(int folder, const char *title, const char *start) {
 }
 
 static gboolean lan_idle_show(gpointer d) {
-	if (lan_win) { gtk_widget_show_all(lan_win); gtk_window_deiconify(GTK_WINDOW(lan_win)); gtk_window_present(GTK_WINDOW(lan_win)); }
+	if (lan_win) {
+		gtk_window_deiconify(GTK_WINDOW(lan_win));
+		gtk_widget_show_all(lan_win);
+		gtk_window_present(GTK_WINDOW(lan_win));
+		gtk_window_present_with_time(GTK_WINDOW(lan_win), gtk_get_current_event_time());
+	}
 	return G_SOURCE_REMOVE;
 }
 static gboolean lan_idle_quit(gpointer d) { gtk_main_quit(); return G_SOURCE_REMOVE; }
@@ -136,7 +158,7 @@ import (
 	"lanyard/internal/uiserver"
 )
 
-//go:embed icon.ico
+//go:embed icon.png
 var windowIcon []byte
 
 // nativeProfileDir holds WebKit's cookies and storage inside the data dir.
