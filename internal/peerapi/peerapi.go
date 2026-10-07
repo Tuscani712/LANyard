@@ -225,7 +225,7 @@ func NewClient(id *identity.Identity) *Client {
 			MinVersion:         tls.VersionTLS13,
 			InsecureSkipVerify: true, // identity is checked by fingerprint below, not by CA
 		},
-		ForceAttemptHTTP2:   true,
+		ForceAttemptHTTP2: true,
 		// Keep enough idle connections to match the up-to-16 small-file
 		// transfers a push runs in parallel, so an HTTP/1.1 peer that closes
 		// after every request still reuses connections instead of re-handshaking

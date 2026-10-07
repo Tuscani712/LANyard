@@ -225,3 +225,12 @@ func startTray(opts trayOptions) func() {
 		}
 	}
 }
+
+// trayProbe reports whether the StatusNotifier icon registered with a host, so
+// Settings can enable or disable "minimize to tray" honestly.
+func trayProbe() (bool, string) {
+	if trayActive.Load() {
+		return true, ""
+	}
+	return false, "No system tray (StatusNotifier) host was found. Start LANyard in a desktop session that shows a tray."
+}

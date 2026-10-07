@@ -535,6 +535,9 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	}
 	defer stopTray()
 
+	// Tell the Settings UI whether minimizing to the tray can actually work here.
+	uiserver.TrayProbe = trayProbe
+
 	ri := runInfo{PID: os.Getpid(), UIURL: ui.URL(), Base: fmt.Sprintf("http://127.0.0.1:%d", ui.Port()), UI: uiMode, Version: version}
 	if b, err := json.Marshal(ri); err == nil {
 		_ = config.WriteFileAtomic(runPath, b, 0o600)

@@ -284,3 +284,11 @@ func trayWndProc(hwnd uintptr, message uint32, wparam, lparam uintptr) uintptr {
 	r, _, _ := procDefWindowProcW.Call(hwnd, uintptr(message), wparam, lparam)
 	return r
 }
+
+// trayProbe reports whether the tray icon was created, for the Settings toggle.
+func trayProbe() (bool, string) {
+	if currentTray != nil {
+		return true, ""
+	}
+	return false, "The system tray icon could not be created."
+}
