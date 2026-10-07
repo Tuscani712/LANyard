@@ -33,7 +33,7 @@ import (
 	"lanyard/internal/update"
 )
 
-const version = "1.1.0-beta.2"
+const version = "1.1.0-beta.3"
 
 type runInfo struct {
 	PID     int    `json:"pid"`
