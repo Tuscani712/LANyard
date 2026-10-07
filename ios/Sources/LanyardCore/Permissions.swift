@@ -3,13 +3,13 @@ import Foundation
 /// Permissions one side allows the other; mirrors `trust.Permissions` (Go) and
 /// the Kotlin `Permissions`. The receive byte limits default to `0` ("no limit /
 /// no ask"), which is the safe, non-surprising default for an old entry.
-struct Permissions: Equatable {
-    var browse: Bool
-    var push: Bool
-    var pushMaxBytes: Int64
-    var askOver: Int64
+package struct Permissions: Equatable {
+    package var browse: Bool
+    package var push: Bool
+    package var pushMaxBytes: Int64
+    package var askOver: Int64
 
-    init(
+    package init(
         browse: Bool = false,
         push: Bool = false,
         pushMaxBytes: Int64 = 0,
@@ -24,7 +24,7 @@ struct Permissions: Equatable {
     /// The wire shape for a `requested_permissions`/`granted` object. The two
     /// byte limits are only emitted when positive, exactly as the Kotlin
     /// `toJson` does.
-    func toJSONObject() -> [String: Any] {
+    package func toJSONObject() -> [String: Any] {
         var out: [String: Any] = ["browse": browse, "push": push]
         if pushMaxBytes > 0 { out["push_max_bytes"] = pushMaxBytes }
         if askOver > 0 { out["ask_over"] = askOver }

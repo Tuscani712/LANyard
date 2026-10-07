@@ -3,14 +3,14 @@ import Foundation
 /// What a status poll returns to the initiating device.
 ///
 /// Ported from the Kotlin `SessionView` in `PairingSessions.kt`.
-struct SessionView: Equatable {
-    let id: String
-    let status: String
-    let mode: String
-    let nonce: String
-    let granted: Permissions
-    let sas: String
-    let error: String
+package struct SessionView: Equatable {
+    package let id: String
+    package let status: String
+    package let mode: String
+    package let nonce: String
+    package let granted: Permissions
+    package let sas: String
+    package let error: String
 }
 
 /// One incoming pairing request, as the phone's dialog shows it.
@@ -40,7 +40,7 @@ struct IncomingRequest: Equatable {
 /// same reentrancy for `onChange` callbacks.
 ///
 /// Ported from the Kotlin `PairingSessions` in `PairingSessions.kt`.
-final class PairingSessions {
+package final class PairingSessions {
     static let MODE_CONNECT = "connect"
     static let MODE_PAIR = "pair"
 
@@ -123,7 +123,7 @@ final class PairingSessions {
     // pending list's stable sort relies on.
     private var sessions: [Session] = []
 
-    init(
+    package init(
         selfFp: @escaping () -> String,
         trust: TrustStore,
         onChange: @escaping () -> Void = {},
@@ -144,7 +144,7 @@ final class PairingSessions {
     /// cap has passed, so a request rejected for a cap does not waste a valid QR
     /// code. When it is present the request is a QR pairing: a false result is a
     /// hard 403 and never falls back to the SAS path.
-    func createIncoming(
+    package func createIncoming(
         mode: String,
         peerFp: String,
         peerName: String,
@@ -214,7 +214,7 @@ final class PairingSessions {
     }
 
     /// The status poll, for the session's own peer only.
-    func statusFor(_ id: String, callerFp: String) throws -> SessionView {
+    package func statusFor(_ id: String, callerFp: String) throws -> SessionView {
         lock.lock(); defer { lock.unlock() }
         let sess = try requirePeer(id, callerFp: callerFp)
         return view(sess)
@@ -246,7 +246,7 @@ final class PairingSessions {
 
     /// The initiator confirms; only then is the pairing written to the trust
     /// store, with the permissions this phone granted.
-    func confirm(_ id: String, callerFp: String) throws -> SessionView {
+    package func confirm(_ id: String, callerFp: String) throws -> SessionView {
         lock.lock(); defer { lock.unlock() }
         let sess = try requirePeer(id, callerFp: callerFp)
         if sess.status == Self.STATUS_PENDING {
@@ -275,7 +275,7 @@ final class PairingSessions {
     }
 
     /// Ends a session from either side.
-    func close(_ id: String, callerFp: String) throws -> Bool {
+    package func close(_ id: String, callerFp: String) throws -> Bool {
         lock.lock(); defer { lock.unlock() }
         let sess = try requirePeer(id, callerFp: callerFp)
         sess.status = Self.STATUS_CLOSED

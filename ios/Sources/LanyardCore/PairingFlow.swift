@@ -37,26 +37,30 @@ final class PeerStatusException: Error, CustomStringConvertible {
 /// The identity the pairing flow needs: only the device ID is read by the state
 /// machine. The real Ed25519 key/X.509 certificate (BouncyCastle on Kotlin,
 /// Security.framework on iOS) is not pure and stays behind the transport seam.
-protocol PairingIdentity {
+package protocol PairingIdentity {
     var deviceId: String { get }
 }
 
 /// The `/hello` response as the flow uses it: only the name.
-struct PairHello {
-    let name: String
+package struct PairHello {
+    package let name: String
+
+    package init(name: String) {
+        self.name = name
+    }
 }
 
 /// The discovery probe: one `GET /api/v1/hello` plus the fingerprint of the
 /// certificate that answered. Implemented on iOS over an unpinned TLS
 /// connection; faked in tests. Mirrors the Kotlin `ProbeClient`.
-protocol PairingProbe: AnyObject {
+package protocol PairingProbe: AnyObject {
     func hello() throws
     func observedFingerprint() -> String
 }
 
 /// The session API the flow drives. Implemented on iOS over pinned mTLS;
 /// faked in tests. Mirrors the Kotlin `PeerClient` pairing methods.
-protocol PairingClient: AnyObject {
+package protocol PairingClient: AnyObject {
     func startSession(
         mode: String,
         name: String,
@@ -73,7 +77,7 @@ protocol PairingClient: AnyObject {
 /// The socket/TLS seam. The pairing state machine only ever talks to the peer
 /// through these two factories, so it is pure and testable on Linux; the real
 /// implementation lives with the Apple networking code.
-protocol PairingTransport {
+package protocol PairingTransport {
     func probe(host: String, port: Int, identity: PairingIdentity) -> PairingProbe
     func client(
         host: String,

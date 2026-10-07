@@ -13,7 +13,7 @@ struct ManifestFile: Equatable {
 /// A write destination for one downloaded file, the Linux-friendly stand-in for
 /// Java's `OutputStream`: `write` appends `count` bytes from `bytes[offset...]`,
 /// `close` flushes. A reference type so the stream's state is shared.
-protocol ByteSink: AnyObject {
+package protocol ByteSink: AnyObject {
     func write(_ bytes: [UInt8], offset: Int, count: Int) throws
     func close() throws
 }
@@ -67,7 +67,7 @@ enum DownloadResult: Equatable {
 ///
 /// Ported from the Kotlin `ShareReader`. `JsonObject` becomes raw `Data` so
 /// `DownloadSession` owns the manifest parsing (exercised by the tests).
-protocol ShareReader: AnyObject {
+package protocol ShareReader: AnyObject {
     func manifestFiles(shareId: String, path: String) throws -> Data
     func openFileStream(shareId: String, path: String, rangeFrom: Int64) throws -> ByteSource
     func wholeFileHash(shareId: String, path: String) throws -> String

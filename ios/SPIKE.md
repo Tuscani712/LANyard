@@ -14,18 +14,19 @@ The checklist below is the order to run on a real Mac, highest risk first.
 These are real blockers found while writing the code on Linux. They are not
 guesses; they are facts about the current repository snapshot.
 
-1. **Module access.** Every type in `Sources/LanyardCore/` is `internal`. A
-   sibling SwiftPM target cannot see `internal` symbols, so `LanyardNet` cannot
-   use `Fingerprint`, `ChunkedDecoder`, `PairingSessions`, `InboxReceiver`,
-   `PeerHttpException`, the seam protocols, … as written. Promote the seams to
-   `package` access (SwiftPM's cross-target level) **or** `public`. Verify with
-   `swift build` on the Mac; a wall of "cannot find type 'X' in scope" errors
-   means this was not done.
-2. **`CertificateBuilder` is new.** The prompt referenced `LanyardCore`'s
-   `CertificateBuilder`, but the snapshot had none (only the `certgen`
-   placeholder). It was added at
-   `Sources/LanyardCore/CertificateBuilder.swift`, pure and covered by
-   `Tests/LanyardCoreTests/CertificateBuilderTests.swift`, which runs on Linux.
+1. **Module access — RESOLVED.** The Phase-1b seams were `internal`; they are now
+   `package`, so the sibling `LanyardNet` target can see `Fingerprint`,
+   `ChunkedDecoder`, `PairingSessions`, `InboxReceiver`, `PeerHttpException` and
+   the seam protocols. Verify with `swift build` on the Mac; a "cannot find type
+   'X' in scope" error means a seam was still `internal`.
+2. **`CertificateBuilder`.** `Sources/LanyardCore/CertificateBuilder.swift`
+   builds the Ed25519 self-signed X.509 with `swift-asn1` + swift-crypto (never
+   Security), and is Linux-tested in both directions against Go
+   (`ios/fixtures/crosscheck.sh` and `GoCertCrossCheckTests`). It exposes
+   `build(deviceName:privateKey:serial:notBefore:notAfter:)` plus an
+   external-signer `selfSignedCertificate(publicKeyRaw:subject:serialNumber:
+   notBefore:notAfter:sign:)` — the one `SecIdentityFactory` uses when the
+   Ed25519 key lives in the Keychain as a `SecKey`.
 3. **Info.plist, iOS.** Add `NSLocalNetworkUsageDescription` and
    `NSBonjourServices = ["_lanyard._tcp"]`, or the Bonjour browse in step 5
    silently returns nothing (TN3179).

@@ -8,11 +8,11 @@ import Foundation
 ///
 /// Reads pull from a `ByteSource` — the Linux-friendly stand-in for Java's
 /// `InputStream` — so the whole rule set is unit-testable without a socket.
-final class ChunkedDecoder {
-    static let maxChunkLine = 256
-    static let maxTrailerLine = 1024
-    static let maxTrailerLines = 32
-    static let maxTrailerBytes = 8 * 1024
+package final class ChunkedDecoder {
+    package static let maxChunkLine = 256
+    package static let maxTrailerLine = 1024
+    package static let maxTrailerLines = 32
+    package static let maxTrailerBytes = 8 * 1024
 
     private let source: ByteSource
     private var remaining: Int64 = 0
@@ -20,15 +20,15 @@ final class ChunkedDecoder {
     private var trailerLines = 0
     private var trailerBytes = 0
 
-    init(_ source: ByteSource) {
+    package init(_ source: ByteSource) {
         self.source = source
     }
 
     /// True once the terminal zero-length chunk and its trailers are consumed.
-    var isFinished: Bool { done }
+    package var isFinished: Bool { done }
 
     /// Reads one decoded byte, or `-1` at end of body. Throws on malformed input.
-    func readByte() throws -> Int {
+    package func readByte() throws -> Int {
         if done { return -1 }
         if remaining == 0 { try nextChunk() }
         if done { return -1 }
@@ -41,7 +41,7 @@ final class ChunkedDecoder {
 
     /// Reads up to `max` decoded bytes. Returns fewer than `max` when a chunk
     /// boundary is reached; empty only at end of body. Throws on malformed input.
-    func read(max: Int) throws -> [UInt8] {
+    package func read(max: Int) throws -> [UInt8] {
         precondition(max > 0)
         if done { return [] }
         if remaining == 0 { try nextChunk() }
@@ -58,7 +58,7 @@ final class ChunkedDecoder {
 
     /// Drains the whole body. Intended for tests and small bodies; large bodies
     /// should stream with `read(max:)`.
-    func readAll(limit: Int = .max) throws -> [UInt8] {
+    package func readAll(limit: Int = .max) throws -> [UInt8] {
         var out = [UInt8]()
         while true {
             let part = try read(max: min(8192, limit - out.count))
@@ -114,7 +114,7 @@ final class ChunkedDecoder {
 
 extension ByteSource {
     /// Reads one byte, or `-1` at end of stream.
-    func readByte() throws -> Int {
+    package func readByte() throws -> Int {
         var one = [UInt8](repeating: 0, count: 1)
         let n = read(&one, offset: 0, count: 1)
         return n < 0 ? -1 : (n == 0 ? -1 : Int(one[0]))

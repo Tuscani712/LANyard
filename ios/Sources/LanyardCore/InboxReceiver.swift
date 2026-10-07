@@ -2,14 +2,14 @@ import Foundation
 import Crypto
 
 /// One file in an accepted push.
-final class PushFileState {
-    let relPath: String
-    let size: Int64
-    let mtimeMillis: Int64
-    var done: Int64
-    var placedName: String?
+package final class PushFileState {
+    package let relPath: String
+    package let size: Int64
+    package let mtimeMillis: Int64
+    package var done: Int64
+    package var placedName: String?
     /// The spool part this file streams into. Set when the offer is accepted.
-    var part: URL!
+    package var part: URL!
 
     init(relPath: String, size: Int64, mtimeMillis: Int64, done: Int64 = 0, placedName: String? = nil) {
         self.relPath = relPath
@@ -42,7 +42,7 @@ struct IncomingPush: Equatable {
 /// Java `InputStream` becomes the `ByteSource` protocol (or a `Data` convenience
 /// overload). `@Synchronized` becomes an `NSRecursiveLock` to keep Java's
 /// reentrant monitor semantics.
-final class InboxReceiver {
+package final class InboxReceiver {
     final class Session {
         let id: String
         let peerFp: String
@@ -79,7 +79,7 @@ final class InboxReceiver {
 
     private static let bufferSize = 256 * 1024
 
-    init(
+    package init(
         spoolRoot: URL,
         destination: PushDestination,
         freeBytes: @escaping () -> Int64,
@@ -104,7 +104,7 @@ final class InboxReceiver {
     }
 
     @discardableResult
-    func offer(
+    package func offer(
         peerFp: String,
         peerName: String,
         reqs: [PushFileRequest],
@@ -187,7 +187,7 @@ final class InboxReceiver {
 
     /// Appends bytes at `offset` to a file's spool part. Streams; returns bytes written.
     @discardableResult
-    func writeChunk(id: String, peerFp: String, rel: String, offset: Int64, source: ByteSource) throws -> Int64 {
+    package func writeChunk(id: String, peerFp: String, rel: String, offset: Int64, source: ByteSource) throws -> Int64 {
         let s = try session(id, peerFp)
         guard let st = s.files[rel] else { throw PeerHttpException(404, "no such file in push") }
         return try writeStream(s, st, offset, source, nil)
@@ -201,7 +201,7 @@ final class InboxReceiver {
 
     /// Whole-file fast path: one request carries the bytes and the digest.
     @discardableResult
-    func receiveWhole(id: String, peerFp: String, rel: String, sha256: String, source: ByteSource) throws -> Int64 {
+    package func receiveWhole(id: String, peerFp: String, rel: String, sha256: String, source: ByteSource) throws -> Int64 {
         let s = try session(id, peerFp)
         guard let st = s.files[rel] else { throw PeerHttpException(404, "no such file in push") }
         if st.done != 0 { throw PeerHttpException(409, "file already partly received") }
@@ -222,7 +222,7 @@ final class InboxReceiver {
 
     /// Verifies a streamed part against `sha256` and places it.
     @discardableResult
-    func complete(id: String, peerFp: String, rel: String, sha256: String) throws -> PushFileState {
+    package func complete(id: String, peerFp: String, rel: String, sha256: String) throws -> PushFileState {
         let s = try session(id, peerFp)
         guard let st = s.files[rel] else { throw PeerHttpException(404, "no such file in push") }
         let have = fileSize(st.part)
@@ -243,7 +243,7 @@ final class InboxReceiver {
 
     /// Finishes a push (the job-level "all done").
     @discardableResult
-    func finish(id: String, peerFp: String) -> Bool {
+    package func finish(id: String, peerFp: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard let s = sessions.first(where: { $0.id == id }) else { return false }
@@ -259,7 +259,7 @@ final class InboxReceiver {
     }
 
     @discardableResult
-    func cancel(id: String, peerFp: String) -> Bool {
+    package func cancel(id: String, peerFp: String) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         guard let s = sessions.first(where: { $0.id == id }) else { return false }

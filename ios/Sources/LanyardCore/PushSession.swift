@@ -5,13 +5,13 @@ import Foundation
 ///
 /// Ported from the Kotlin `PushSource`. The Java `InputStream` becomes a
 /// pull-based `ByteSource` so the session runs on Linux.
-struct PushSource {
-    let relPath: String
-    let size: Int64
-    let mtimeMillis: Int64
-    let open: () -> ByteSource
+package struct PushSource {
+    package let relPath: String
+    package let size: Int64
+    package let mtimeMillis: Int64
+    package let open: () -> ByteSource
 
-    init(relPath: String, size: Int64, mtimeMillis: Int64, open: @escaping () -> ByteSource) {
+    package init(relPath: String, size: Int64, mtimeMillis: Int64, open: @escaping () -> ByteSource) {
         self.relPath = relPath
         self.size = size
         self.mtimeMillis = mtimeMillis
@@ -20,7 +20,7 @@ struct PushSource {
 }
 
 /// The outcome of a push. Ported from the Kotlin `PushResult`.
-enum PushResult: Equatable {
+package enum PushResult: Equatable {
     /// Everything was sent and verified by the receiver.
     case sent(files: Int, bytes: Int64)
 
@@ -38,16 +38,21 @@ enum PushResult: Equatable {
 
 /// One streamed file's result: the digest the receiver will verify, plus the
 /// bytes actually sent on this call (past any resume offset).
-struct PushFileResult: Equatable {
-    let sha256: String
-    let bytes: Int64
+package struct PushFileResult: Equatable {
+    package let sha256: String
+    package let bytes: Int64
+
+    package init(sha256: String, bytes: Int64) {
+        self.sha256 = sha256
+        self.bytes = bytes
+    }
 }
 
 /// The network seam `PushSession` drives. The app implements it over
 /// `PeerClient` (TLS/sockets, Apple-only); the tests supply a fake so the pure
 /// state machine runs on Linux. Ported from the subset of the Kotlin
 /// `PeerClient` that `PushSession` touches.
-protocol PushClient: AnyObject {
+package protocol PushClient: AnyObject {
     func pushOffer(_ files: [PushFileRequest]) throws -> PushOffer
 
     func pushFileStream(

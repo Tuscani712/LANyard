@@ -1,7 +1,7 @@
 import Foundation
 
 /// The state of one diagnostic check.
-enum CheckStatus: String {
+package enum CheckStatus: String {
     case ok = "Ok"
     case warning = "Warning"
     case failed = "Failed"
@@ -9,14 +9,14 @@ enum CheckStatus: String {
 }
 
 /// One row of the troubleshoot report.
-struct CheckResult {
-    let id: String
-    let title: String
-    let status: CheckStatus
-    let detail: String
-    let fix: String
+package struct CheckResult {
+    package let id: String
+    package let title: String
+    package let status: CheckStatus
+    package let detail: String
+    package let fix: String
 
-    init(_ id: String, _ title: String, _ status: CheckStatus, _ detail: String, _ fix: String = "") {
+    package init(_ id: String, _ title: String, _ status: CheckStatus, _ detail: String, _ fix: String = "") {
         self.id = id
         self.title = title
         self.status = status
@@ -26,21 +26,21 @@ struct CheckResult {
 }
 
 /// The paired device chosen for the reachability check.
-struct DiagTarget {
-    let name: String
-    let host: String
-    let port: Int
-    let expectedFingerprint: String
+package struct DiagTarget {
+    package let name: String
+    package let host: String
+    package let port: Int
+    package let expectedFingerprint: String
 }
 
 /// The result of probing a device: TCP, then TLS, then identity.
-struct Reachability {
-    let tcp: Bool
-    let tls: Bool
-    let presentedFingerprint: String?
-    let match: Bool
+package struct Reachability {
+    package let tcp: Bool
+    package let tls: Bool
+    package let presentedFingerprint: String?
+    package let match: Bool
 
-    init(tcp: Bool, tls: Bool, presentedFingerprint: String? = nil, match: Bool = false) {
+    package init(tcp: Bool, tls: Bool, presentedFingerprint: String? = nil, match: Bool = false) {
         self.tcp = tcp
         self.tls = tls
         self.presentedFingerprint = presentedFingerprint
@@ -50,7 +50,7 @@ struct Reachability {
 
 /// Everything the diagnostics need, so tests can inject each state. Implemented
 /// on iOS by a real environment; the checks themselves stay pure.
-protocol DiagEnv {
+package protocol DiagEnv {
     func networkConnected() -> Bool
     func networkMetered() -> Bool
     func networkRestricted() -> Bool
@@ -70,13 +70,13 @@ protocol DiagEnv {
 /// Runs the troubleshoot checks and builds a redacted report. Pure: all input
 /// comes from `DiagEnv`. The desktop's peer-port bind, firewall self-probe and
 /// clock checks are intentionally omitted (they are rows on neither platform).
-enum Diagnostics {
-    static let MDNS_TIMEOUT_MS: Int64 = 10_000
+package enum Diagnostics {
+    package static let MDNS_TIMEOUT_MS: Int64 = 10_000
 
     /// Below this, a download folder is called low on space.
-    static let LOW_SPACE_BYTES: Int64 = 50 * 1024 * 1024
+    package static let LOW_SPACE_BYTES: Int64 = 50 * 1024 * 1024
 
-    static func run(_ env: DiagEnv) -> [CheckResult] {
+    package static func run(_ env: DiagEnv) -> [CheckResult] {
         var out: [CheckResult] = []
         out.append(networkCheck(env))
         out.append(addressesCheck(env))
@@ -240,7 +240,7 @@ enum Diagnostics {
     }
 
     /// A plain-text report with secrets redacted.
-    static func copyReport(_ results: [CheckResult], serverEvents: [String] = []) -> String {
+    package static func copyReport(_ results: [CheckResult], serverEvents: [String] = []) -> String {
         let checks = results.map { r -> String in
             let fix = r.fix.isEmpty ? "" : "\nFix: \(r.fix)"
             return "[\(r.status.rawValue.uppercased())] \(r.title)\n\(r.detail)\(fix)"
@@ -253,7 +253,7 @@ enum Diagnostics {
 }
 
 /// Removes secrets from report text: tokens, invites and full fingerprints.
-enum Redaction {
+package enum Redaction {
     private static let inviteLinkPattern = "lanyard://pair[^\\s]*"
     private static let urlSecretPattern = "([?&](?:t|token|nonce|invite|n)=)[^&\\s]+"
     private static let hex64Pattern = "(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])"
@@ -261,7 +261,7 @@ enum Redaction {
     // An absolute path under a well-known root (a message can name a file location).
     private static let absPathPattern = "/(?:data|storage|sdcard|system|home|users|tmp|private|var|mnt|cache)/[\\w./\\-]+"
 
-    static func redact(_ text: String) -> String {
+    package static func redact(_ text: String) -> String {
         var out = text
         out = replace(out, pattern: inviteLinkPattern, template: "lanyard://pair?<redacted>")
         out = replace(out, pattern: urlSecretPattern, template: "$1<redacted>")

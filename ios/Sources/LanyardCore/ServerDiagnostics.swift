@@ -7,16 +7,16 @@ import Foundation
 /// redacted again on the way out by `Redaction`.
 ///
 /// Not persisted: it is diagnostic breadcrumbs for the current app run only.
-final class ServerDiagnostics {
+package final class ServerDiagnostics {
     private let capacity: Int
     private let clock: () -> Int64
     private var events: [String] = []
     private let lock = NSLock()
 
     /// An optional sink (used by the app to mirror events to logcat). Never a secret.
-    var onRecord: ((String) -> Void)?
+    package var onRecord: ((String) -> Void)?
 
-    init(
+    package init(
         capacity: Int = 200,
         clock: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }
     ) {
@@ -24,7 +24,7 @@ final class ServerDiagnostics {
         self.clock = clock
     }
 
-    func record(_ event: String) {
+    package func record(_ event: String) {
         let line = timestamp() + " " + event
         lock.lock()
         if events.count >= capacity { events.removeFirst() }
@@ -34,13 +34,13 @@ final class ServerDiagnostics {
     }
 
     /// The events oldest-first.
-    func snapshot() -> [String] {
+    package func snapshot() -> [String] {
         lock.lock()
         defer { lock.unlock() }
         return events
     }
 
-    func clear() {
+    package func clear() {
         lock.lock()
         events.removeAll()
         lock.unlock()

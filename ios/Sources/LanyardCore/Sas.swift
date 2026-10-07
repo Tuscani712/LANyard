@@ -9,8 +9,8 @@ import Crypto
 ///  3. the first four bytes, big-endian, modulo 1e6, zero-padded to six digits.
 ///
 /// Both sides may pass their own fingerprint/nonce first; the result is the same.
-enum Sas {
-    static func code(fpA: String, fpB: String, nonceA: String, nonceB: String) -> String {
+package enum Sas {
+    package static func code(fpA: String, fpB: String, nonceA: String, nonceB: String) -> String {
         var a = fpA, b = fpB, na = nonceA, nb = nonceB
         if a > b {
             (a, b) = (b, a)

@@ -1,15 +1,15 @@
 import Foundation
 
 /// A pace control for a streaming loop: call `pace` after emitting `bytes`.
-protocol Throttle: AnyObject {
+package protocol Throttle: AnyObject {
     func pace(_ bytes: Int)
 }
 
 /// A `Throttle` that does nothing (unlimited).
-final class NoThrottle: Throttle, Sendable {
-    static let shared = NoThrottle()
+package final class NoThrottle: Throttle, Sendable {
+    package static let shared = NoThrottle()
     private init() {}
-    func pace(_ bytes: Int) {}
+    package func pace(_ bytes: Int) {}
 }
 
 enum Bandwidth {

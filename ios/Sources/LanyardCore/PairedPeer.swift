@@ -5,18 +5,18 @@ import Foundation
 /// Mirrors the Kotlin `PairedPeer`. The two receive-permission fields default
 /// to `0` ("no limit / no ask") so a `peers.json` written before they existed
 /// still decodes, matching the Kotlin `codec` behaviour.
-struct PairedPeer: Codable, Equatable {
-    var fingerprint: String
-    var name: String
-    var host: String
-    var port: Int
-    var browse: Bool
-    var push: Bool
-    var pairedAt: Int64
-    var pushMaxBytes: Int64
-    var askOver: Int64
+package struct PairedPeer: Codable, Equatable {
+    package var fingerprint: String
+    package var name: String
+    package var host: String
+    package var port: Int
+    package var browse: Bool
+    package var push: Bool
+    package var pairedAt: Int64
+    package var pushMaxBytes: Int64
+    package var askOver: Int64
 
-    init(
+    package init(
         fingerprint: String,
         name: String,
         host: String,
@@ -42,7 +42,7 @@ struct PairedPeer: Codable, Equatable {
         case fingerprint, name, host, port, browse, push, pairedAt, pushMaxBytes, askOver
     }
 
-    init(from decoder: Decoder) throws {
+    package init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         fingerprint = try c.decode(String.self, forKey: .fingerprint)
         name = try c.decode(String.self, forKey: .name)

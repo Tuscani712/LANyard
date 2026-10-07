@@ -11,10 +11,10 @@ import Foundation
 ///
 /// `valid(_:)` is the non-consuming lookup used by the QR screen so it can keep
 /// showing the same code until it expires or is used.
-final class PairInvites {
-    struct Invite: Equatable {
-        let token: String
-        let expiresAt: Int64
+package final class PairInvites {
+    package struct Invite: Equatable {
+        package let token: String
+        package let expiresAt: Int64
     }
 
     private let ttlMillis: Int64
@@ -22,13 +22,13 @@ final class PairInvites {
     private let lock = NSLock()
     private var invites: [String: Int64] = [:]
 
-    init(ttlMillis: Int64 = 2 * 60 * 1000, clock: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }) {
+    package init(ttlMillis: Int64 = 2 * 60 * 1000, clock: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }) {
         self.ttlMillis = ttlMillis
         self.clock = clock
     }
 
     @discardableResult
-    func mint() -> Invite {
+    package func mint() -> Invite {
         lock.lock(); defer { lock.unlock() }
         sweep()
         var rng = SystemRandomNumberGenerator()
@@ -42,7 +42,7 @@ final class PairInvites {
     }
 
     /// The expiry of a still-valid invite, or nil if unknown, used or expired.
-    func valid(_ token: String) -> Int64? {
+    package func valid(_ token: String) -> Int64? {
         if token.isEmpty { return nil }
         lock.lock(); defer { lock.unlock() }
         sweep()
@@ -53,7 +53,7 @@ final class PairInvites {
     }
 
     /// Consumes `token` on the first attempt; true only if it was valid.
-    func consume(_ token: String) -> Bool {
+    package func consume(_ token: String) -> Bool {
         if token.isEmpty { return false }
         lock.lock(); defer { lock.unlock() }
         sweep()
