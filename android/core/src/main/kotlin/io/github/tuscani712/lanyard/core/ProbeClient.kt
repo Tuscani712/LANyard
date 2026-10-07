@@ -17,7 +17,13 @@ import javax.net.ssl.HttpsURLConnection
  * mismatch. Everything that reads or writes real data uses [PeerClient], whose
  * trust manager pins the expected fingerprint.
  */
-class ProbeClient(host: String, port: Int, identity: Identity) {
+class ProbeClient(
+    host: String,
+    port: Int,
+    identity: Identity,
+    private val connectTimeoutMs: Int = DEFAULT_TIMEOUT_MS,
+    private val readTimeoutMs: Int = DEFAULT_TIMEOUT_MS,
+) {
     private val url = "https://$host:$port/api/v1/hello"
     private val recorder = FingerprintRecorder()
     private val socketFactory = Tls.probeSocketFactory(identity, recorder)
@@ -30,8 +36,8 @@ class ProbeClient(host: String, port: Int, identity: Identity) {
         conn.sslSocketFactory = socketFactory
         conn.hostnameVerifier = HostnameVerifier { _, _ -> true }
         conn.requestMethod = "GET"
-        conn.connectTimeout = 5_000
-        conn.readTimeout = 5_000
+        conn.connectTimeout = connectTimeoutMs
+        conn.readTimeout = readTimeoutMs
         val status = conn.responseCode
         val text = (if (status in 200..299) conn.inputStream else conn.errorStream)
             ?.bufferedReader()?.use { it.readText() } ?: ""
@@ -52,4 +58,9 @@ class ProbeClient(host: String, port: Int, identity: Identity) {
 
     private fun JsonObject.int(key: String): Int =
         get(key)?.takeIf { !it.isJsonNull }?.asInt ?: 0
+
+    companion object {
+        /** Connect and read timeout for one probe attempt, in milliseconds. */
+        const val DEFAULT_TIMEOUT_MS = 5_000
+    }
 }

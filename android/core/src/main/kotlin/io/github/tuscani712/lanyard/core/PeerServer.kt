@@ -67,6 +67,8 @@ class PeerServer(
     private val maxRequestsPerConnection: Int = 10_000,
     private val maxUnpairedConnections: Int = 4,
     private val maxPairedConnections: Int = 32,
+    private val maxIdleUnpairedConnections: Int = MAX_IDLE_UNPAIRED_CONNECTIONS,
+    private val idleUnpairedGraceMillis: Int = 1_000,
     private val maxSessionRequestsPerMinute: Int = 10,
     private val maxBodyBytes: Int = 64 * 1024,
     private val clock: () -> Long = System::currentTimeMillis,
@@ -81,6 +83,7 @@ class PeerServer(
     private var hello: ((Int) -> JsonObject)? = null
     private val unpairedActive = AtomicInteger()
     private val pairedActive = AtomicInteger()
+    private val idleUnpaired = AtomicInteger()
     private var stallScheduler: java.util.concurrent.ScheduledExecutorService? = null
 
     /** Count of accepted TLS connections (used by the handshake-reuse test). */
@@ -91,6 +94,9 @@ class PeerServer(
         private set
 
     fun activeConnections(): Int = pool?.activeCount ?: 0
+
+    /** Unpaired connections currently parked waiting for their next request. */
+    fun idleUnpairedConnections(): Int = idleUnpaired.get()
 
     fun start(identity: Identity, hello: (Int) -> JsonObject): Int {
         stop()
@@ -183,13 +189,32 @@ class PeerServer(
         val out = BufferedOutputStream(ssl.getOutputStream())
         var requests = 0
         while (requests < maxRequestsPerConnection) {
-            ssl.soTimeout = idleTimeoutMillis
+            // An unpaired connection parked between requests holds a worker
+            // thread (the pool is sized maxUnpaired + maxPaired). A flood of
+            // idle unpaired sockets would otherwise occupy every thread and
+            // starve a paired peer, so cap only the idle-unpaired ones. Paired
+            // peers are never capped here.
+            val idleUnpairedNow = isPaired(fp) == null
+            val parked = idleUnpairedNow && acquireConnection(idleUnpaired, maxIdleUnpairedConnections)
+            val overCap = idleUnpairedNow && !parked
+            if (overCap) {
+                // At the cap we never park. A request already on its way (a
+                // discovery probe) is still answered, then the connection is
+                // closed; a socket that stays silent is dropped after a short
+                // grace so it cannot hold a worker thread.
+                diag("conn idle-unpaired over cap")
+                ssl.soTimeout = minOf(idleTimeoutMillis, idleUnpairedGraceMillis)
+            } else {
+                ssl.soTimeout = idleTimeoutMillis
+            }
             val first = try {
                 input.read()
             } catch (_: java.net.SocketTimeoutException) {
-                return "idle" // idle keep-alive expired
+                return if (overCap) "idle-unpaired-cap" else "idle" // idle keep-alive expired
+            } finally {
+                if (parked) idleUnpaired.decrementAndGet()
             }
-            if (first < 0) return "peer-closed"
+            if (first < 0) return if (overCap) "idle-unpaired-cap" else "peer-closed"
             requests++
             val started = clock()
             val head = try {
@@ -224,11 +249,11 @@ class PeerServer(
             try {
                 if (head.path == "/api/v1/shares" || head.path.startsWith("/api/v1/shares/")) {
                     handleShares(out, head, peer, ssl, input, started)
-                    if (head.close || requests >= maxRequestsPerConnection) return "close-requested"
+                    if (head.close || requests >= maxRequestsPerConnection || overCap) return "close-requested"
                     continue
                 }
                 val fileBody = head.method == "PUT" && isFileBodyPath(head.path)
-                val closing = head.close || requests >= maxRequestsPerConnection
+                val closing = head.close || requests >= maxRequestsPerConnection || overCap
                 try {
                     if (fileBody) {
                         ssl.soTimeout = stallTimeoutMillis
@@ -454,26 +479,41 @@ class PeerServer(
     }
 
     private fun handleSessionRequest(body: ByteArray, fp: String, socket: SSLSocket): String {
-        if (!allowSessionRequest()) throw PeerHttpException(429, "too many requests")
+        val short = fp.take(8)
+        if (!allowSessionRequest()) {
+            diag("session refused peer=$short rate limited")
+            throw PeerHttpException(429, "too many requests")
+        }
         val json = parseObject(body)
         val claimed = json.str("fingerprint")
         if (claimed.isNotEmpty() && !claimed.equals(fp, ignoreCase = true)) {
+            diag("session refused peer=$short fingerprint mismatch")
             throw PeerHttpException(400, "fingerprint does not match the certificate")
         }
         val claimedId = json.str("device_id")
         if (claimedId.length == 64 && claimedId.all { it.isHex() } && !claimedId.equals(fp, ignoreCase = true)) {
+            diag("session refused peer=$short device id mismatch")
             throw PeerHttpException(400, "device id does not match the certificate")
         }
-        val view = sessions.createIncoming(
-            mode = json.str("mode"),
-            peerFp = fp,
-            peerName = json.str("name"),
-            peerDevice = json.str("device_id"),
-            peerHost = socket.inetAddress?.hostAddress ?: "",
-            peerNonce = json.str("nonce"),
-            requested = json.permissions("requested_permissions"),
-            consumeInvite = if (json.str("invite").isEmpty()) null else ({ invites.consume(json.str("invite")) }),
-        )
+        val mode = json.str("mode")
+        val viaQr = json.str("invite").isNotEmpty()
+        diag("session request peer=$short ${if (viaQr) "qr" else if (mode == "pair") "pair" else "connect"}")
+        val view = try {
+            sessions.createIncoming(
+                mode = mode,
+                peerFp = fp,
+                peerName = json.str("name"),
+                peerDevice = json.str("device_id"),
+                peerHost = socket.inetAddress?.hostAddress ?: "",
+                peerNonce = json.str("nonce"),
+                requested = json.permissions("requested_permissions"),
+                consumeInvite = if (json.str("invite").isEmpty()) null else ({ invites.consume(json.str("invite")) }),
+            )
+        } catch (e: PeerHttpException) {
+            diag("session refused peer=$short ${e.message ?: "refused"}")
+            throw e
+        }
+        diag("session ok peer=$short ${if (viaQr) "qr" else "sas"} $mode")
         return """{"session_id":${jsonStr(view.id)},"nonce":${jsonStr(view.nonce)},"status":${jsonStr(view.status)}}"""
     }
 
@@ -800,5 +840,12 @@ class PeerServer(
 
     companion object {
         const val MAX_HEADER_BYTES = 16 * 1024
+
+        /**
+         * Most unpaired connections that may sit idle between requests. Beyond
+         * this they are closed, so discovery/liveness floods cannot fill the
+         * worker pool and starve a paired peer.
+         */
+        const val MAX_IDLE_UNPAIRED_CONNECTIONS = 16
     }
 }

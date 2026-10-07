@@ -33,6 +33,17 @@ sealed class PairResult {
  * check is fail-closed: a mismatch never proceeds to the session request.
  */
 object PairingFlow {
+    /**
+     * The whole probe phase shares one deadline. A phone can advertise up to
+     * [PairLink.MAX_ADDRS] addresses and each dead one used to burn its own
+     * connect+read timeout, so an unreachable peer could stall pairing for
+     * minutes. With this budget the phase always ends promptly.
+     */
+    const val PROBE_DEADLINE_MS = 12_000L
+
+    /** Connect/read timeout for a single probe attempt (see [ProbeClient]). */
+    private const val PROBE_ATTEMPT_TIMEOUT_MS = ProbeClient.DEFAULT_TIMEOUT_MS
+
     fun pair(
         link: String,
         identity: Identity,
@@ -40,6 +51,10 @@ object PairingFlow {
         store: TrustStore,
         requested: Permissions = Permissions(browse = true, push = true),
         timeoutMs: Long = 30_000,
+        probeDeadlineMs: Long = PROBE_DEADLINE_MS,
+        probeAttemptTimeoutMs: Int = PROBE_ATTEMPT_TIMEOUT_MS,
+        localAddresses: () -> List<String> = { defaultLocalAddresses() },
+        clock: () -> Long = System::currentTimeMillis,
     ): PairResult {
         val payload = try {
             PairLink.parse(link)
@@ -47,7 +62,15 @@ object PairingFlow {
             return PairResult.InvalidLink
         }
 
-        val outcome = probeAddresses(payload.addrs, payload.fingerprint, identity)
+        val outcome = probeAddresses(
+            addrs = payload.addrs,
+            expected = payload.fingerprint,
+            identity = identity,
+            localAddresses = localAddresses(),
+            deadlineMs = probeDeadlineMs,
+            perAttemptMs = probeAttemptTimeoutMs,
+            clock = clock,
+        )
         val match = outcome.match
             ?: return if (outcome.mismatch) PairResult.FingerprintMismatch else PairResult.Unreachable
 
@@ -142,12 +165,24 @@ object PairingFlow {
 
     private data class ProbeOutcome(val match: HostPort?, val mismatch: Boolean)
 
-    private fun probeAddresses(addrs: List<String>, expected: String, identity: Identity): ProbeOutcome {
+    private fun probeAddresses(
+        addrs: List<String>,
+        expected: String,
+        identity: Identity,
+        localAddresses: List<String>,
+        deadlineMs: Long,
+        perAttemptMs: Int,
+        clock: () -> Long,
+    ): ProbeOutcome {
         var mismatch = false
-        for (addr in addrs) {
+        val startedAt = clock()
+        for (addr in orderForProbe(addrs, localAddresses)) {
             val hp = splitAddr(addr) ?: continue
+            if (!isDialable(hp.host)) continue
+            val remaining = deadlineMs - (clock() - startedAt)
+            if (remaining <= 0 || remaining < perAttemptMs) break
             try {
-                val probe = ProbeClient(hp.host, hp.port, identity)
+                val probe = ProbeClient(hp.host, hp.port, identity, perAttemptMs, perAttemptMs)
                 probe.hello()
                 if (probe.observedFingerprint().equals(expected, ignoreCase = true)) {
                     return ProbeOutcome(hp, mismatch)
@@ -159,6 +194,45 @@ object PairingFlow {
         }
         return ProbeOutcome(null, mismatch)
     }
+
+    /**
+     * Reorders link addresses so the ones on the same /24 as one of our own
+     * interface addresses are tried first. The sort is stable, so the relative
+     * order within each group is exactly what the link carried: deterministic.
+     */
+    internal fun orderForProbe(addrs: List<String>, localAddresses: List<String>): List<String> =
+        addrs.sortedBy { if (onSameSubnet(it, localAddresses)) 0 else 1 }
+
+    /**
+     * A link address that is unusable from this phone is dropped rather than
+     * probed: a link-local `169.254.x.x` (an unconfigured/adhoc address on the
+     * *other* phone) and any IPv6 literal (the other phone's link-local IPv6 is
+     * not dialable from here). Site-local IPv4 is kept.
+     */
+    internal fun isDialable(host: String): Boolean {
+        if (host.contains(':')) return false // IPv6 literal from a link
+        if (host.startsWith("169.254.")) return false // IPv4 link-local
+        return true
+    }
+
+    private fun onSameSubnet(addr: String, localAddresses: List<String>): Boolean {
+        val host = splitAddr(addr)?.host ?: return false
+        val a = host.split('.')
+        if (a.size != 4 || a.any { it.toIntOrNull() == null }) return false
+        return localAddresses.any { loc ->
+            val l = loc.split('.')
+            l.size == 4 && l.all { it.toIntOrNull() != null } &&
+                l[0] == a[0] && l[1] == a[1] && l[2] == a[2]
+        }
+    }
+
+    /** This device's non-loopback, non-link-local addresses, for /24 ordering. */
+    private fun defaultLocalAddresses(): List<String> = runCatching {
+        java.net.NetworkInterface.getNetworkInterfaces().toList()
+            .flatMap { it.inetAddresses.toList() }
+            .filter { !it.isLoopbackAddress && !it.isLinkLocalAddress }
+            .mapNotNull { it.hostAddress }
+    }.getOrDefault(emptyList())
 
     private fun splitAddr(addr: String): HostPort? {
         val host: String
