@@ -72,6 +72,17 @@ type Store struct {
 	data Settings
 }
 
+// DefaultInboxDir is where received pushes land when no Inbox folder is
+// configured: a visible "LANyard" folder in the user's home directory, next to
+// Downloads, rather than a hidden folder under the data directory.
+func DefaultInboxDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "LANyard"), nil
+}
+
 // DefaultDir returns the per-user data directory.
 func DefaultDir() (string, error) {
 	base, err := os.UserConfigDir()

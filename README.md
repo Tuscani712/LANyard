@@ -179,7 +179,8 @@ Release builds are produced by `build.ps1 -Release` into `dist\release\`:
 | `lanyard-win-x64.exe` | Windows, no console window (double-click, start at sign-in) |
 | `lanyard-win-x64-console.exe` | Windows, for batch files and scripts |
 | `lanyard-mac-arm64`, `lanyard-mac-x64` | macOS (Apple silicon / Intel) |
-| `lanyard-linux-x64`, `lanyard-linux-arm64` | Linux |
+| `lanyard-linux-x64` | Linux with its own window (needs GTK 3 and `libwebkit2gtk-4.1-0`; Ubuntu 22.04+ / Debian 12+) |
+| `lanyard-linux-x64-static`, `lanyard-linux-arm64-static` | Linux, no extra libraries; opens in the browser |
 
 Building needs Go (the version in `go.mod`, currently 1.27) and nothing else: `.\build.ps1` makes the development build
 `dist\lanyard.exe` (no console window) and `dist\lanyard-console.exe` (console, for the CLI and the `dist\itest*.ps1`

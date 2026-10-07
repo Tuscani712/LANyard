@@ -200,6 +200,28 @@ func (s *Store) ConsumePairInvite(token string) bool {
 	return now.Before(exp)
 }
 
+// PairInviteValid reports the expiry of an existing invite that is still valid,
+// without consuming it. It is used to keep showing the same QR code until it
+// expires or is used, instead of minting a new one on every page refresh.
+func (s *Store) PairInviteValid(token string) (time.Time, bool) {
+	if token == "" {
+		return time.Time{}, false
+	}
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for t, e := range s.invites {
+		if subtle.ConstantTimeCompare([]byte(t), []byte(token)) == 1 {
+			if now.Before(e) {
+				return e, true
+			}
+			delete(s.invites, t)
+			return time.Time{}, false
+		}
+	}
+	return time.Time{}, false
+}
+
 // MarkViaQR records that a session was authenticated by a QR invite nonce.
 func (s *Store) MarkViaQR(id string) bool {
 	s.mu.Lock()

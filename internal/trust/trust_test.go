@@ -209,3 +209,28 @@ func TestMarkViaQR(t *testing.T) {
 		t.Fatal("ViaQR should be set after MarkViaQR")
 	}
 }
+
+// PairInviteValid lets the QR panel keep showing the same code until it expires
+// or is used, instead of minting a new one on every poll.
+func TestPairInviteValidReusesUntilExpiryOrUse(t *testing.T) {
+	st := newStore(t)
+	tok, exp := st.MintPairInvite()
+
+	got, ok := st.PairInviteValid(tok)
+	if !ok {
+		t.Fatal("a fresh invite should be valid")
+	}
+	if !got.Equal(exp) {
+		t.Fatalf("expiry = %v, want %v", got, exp)
+	}
+	if _, ok := st.PairInviteValid("not-a-real-nonce"); ok {
+		t.Fatal("an unknown token must be invalid")
+	}
+
+	if !st.ConsumePairInvite(tok) {
+		t.Fatal("ConsumePairInvite should succeed on a fresh invite")
+	}
+	if _, ok := st.PairInviteValid(tok); ok {
+		t.Fatal("a consumed invite must be invalid")
+	}
+}

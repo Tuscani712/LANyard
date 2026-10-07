@@ -240,3 +240,49 @@ func TestRetryKeepsCommaInRemotePath(t *testing.T) {
 	// The re-created job starts a real download; stop it, we only check the plan.
 	_ = e.mgr.Cancel(v2.ID, false)
 }
+
+// A received push is recorded as a terminal "receive" entry so it shows in the
+// Transfers history with peer, file name, size and time.
+func TestRecordReceivedAddsHistoryEntry(t *testing.T) {
+	m := historyManager(t)
+	m.RecordReceived("fp-1", "Pixel 8 Pro", []ReceivedFile{{Name: "photo.jpg", Size: 2048}}, time.Time{})
+
+	list := m.List()
+	if len(list) != 1 {
+		t.Fatalf("List length = %d, want 1", len(list))
+	}
+	v := list[0]
+	if v.Direction != "receive" {
+		t.Errorf("direction = %q, want receive", v.Direction)
+	}
+	if v.State != StateDone {
+		t.Errorf("state = %q, want Done", v.State)
+	}
+	if v.PeerID != "fp-1" || v.PeerName != "Pixel 8 Pro" {
+		t.Errorf("peer = %q / %q", v.PeerID, v.PeerName)
+	}
+	if v.ShareLabel != "photo.jpg" {
+		t.Errorf("share_label = %q, want the file name", v.ShareLabel)
+	}
+	if v.Total != 2048 || v.FilesDone != 1 || len(v.Files) != 1 || v.Files[0].Local != "photo.jpg" {
+		t.Errorf("files = %+v total=%d done=%d", v.Files, v.Total, v.FilesDone)
+	}
+	if v.FinishedAt.IsZero() {
+		t.Error("finished time was not set")
+	}
+	if raw := m.cfg.Get().Transfers; len(raw) == 0 {
+		t.Error("receive entry was not persisted")
+	}
+}
+
+func TestRecordReceivedMultipleNamesLabel(t *testing.T) {
+	m := historyManager(t)
+	m.RecordReceived("fp", "Peer", []ReceivedFile{{Name: "a.txt", Size: 1}, {Name: "b.txt", Size: 2}}, time.Time{})
+	v := m.List()[0]
+	if v.ShareLabel != "2 files" {
+		t.Errorf("share_label = %q, want \"2 files\"", v.ShareLabel)
+	}
+	if v.Total != 3 {
+		t.Errorf("total = %d, want 3", v.Total)
+	}
+}

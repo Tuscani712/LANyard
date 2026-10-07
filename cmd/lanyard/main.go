@@ -33,7 +33,7 @@ import (
 	"lanyard/internal/update"
 )
 
-const version = "1.0.0"
+const version = "1.1.0-beta.2"
 
 type runInfo struct {
 	PID     int    `json:"pid"`
@@ -227,6 +227,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	// store; there is no bypass in a shipped build.
 	var auth peerapi.Authorizer = trustStore
 	inboxMgr := inbox.New(inboxDir(dataDir, st.InboxFolder), onChange)
+	_ = inboxMgr.EnsureDir() // the default ~/LANyard folder is created up front
 	trMgr.SetBandwidthLimit(st.BandwidthLimitMBps)
 	var peerSrv *peerapi.Server
 	hello := func() discovery.Hello {
@@ -326,10 +327,20 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 			ui.NotifyUser(uiserver.Notice{Kind: "receive-start", Peer: resolvePeer(peerFP), Files: files, Total: total})
 		}
 	})
-	inboxMgr.SetOnDone(func(peerFP string, files int, total int64) {
-		if ui != nil {
-			ui.NotifyUser(uiserver.Notice{Kind: "receive", Peer: resolvePeer(peerFP), Files: files, Total: total})
+	inboxMgr.SetOnDone(func(peerFP string, files []inbox.ReceivedFile) {
+		peer := resolvePeer(peerFP)
+		var total int64
+		for _, f := range files {
+			total += f.Size
 		}
+		if ui != nil {
+			ui.NotifyUser(uiserver.Notice{Kind: "receive", Peer: peer, Files: len(files), Total: total})
+		}
+		received := make([]transfer.ReceivedFile, 0, len(files))
+		for _, f := range files {
+			received = append(received, transfer.ReceivedFile{Name: f.Name, Size: f.Size})
+		}
+		trMgr.RecordReceived(peerFP, peer, received, time.Time{})
 	})
 	// A received text snippet is announced too; notify truncates and sanitizes
 	// the body before it reaches the desktop.
@@ -477,6 +488,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		Cfg:       cfg,
 		ApplySettings: func(s config.Settings) {
 			inboxMgr.SetDir(inboxDir(dataDir, s.InboxFolder))
+			_ = inboxMgr.EnsureDir()
 			trMgr.SetBandwidthLimit(s.BandwidthLimitMBps)
 			disc.SetIdentity(s.DeviceName, s.DeviceIDLabel) // re-announce without a restart
 			minimizeToTray.Store(s.MinimizeToTray)
@@ -619,6 +631,9 @@ func openBrowser(url string) {
 func inboxDir(dataDir, custom string) string {
 	if strings.TrimSpace(custom) != "" {
 		return custom
+	}
+	if d, err := config.DefaultInboxDir(); err == nil {
+		return d
 	}
 	return filepath.Join(dataDir, "Inbox")
 }

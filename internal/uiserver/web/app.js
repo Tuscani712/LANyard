@@ -830,7 +830,7 @@ function renderPairedPage() {
     box.appendChild(filters);
     const list = history.filter((t) => {
       if (hf === "sent") return t.direction === "push";
-      if (hf === "received") return t.direction === "download";
+      if (hf === "received") return t.direction === "download" || t.direction === "receive";
       if (hf === "failed") return t.state === "Failed";
       return true;
     });
@@ -852,11 +852,15 @@ function renderPairedPage() {
       row.appendChild(meta);
       if (t.error) row.appendChild(el("div", "msg err", t.error));
       const acts = el("div", "actions");
-      acts.appendChild(btn("Resend", async () => {
-        const r = await fetch(`/api/transfers/${encodeURIComponent(t.id)}/retry`, { method: "POST" });
-        if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
-        toast("Resent.", "ok");
-      }));
+      if (t.direction === "receive") {
+        acts.appendChild(btn("Open folder", () => fetch("/api/inbox/open", { method: "POST" }), "ghost"));
+      } else {
+        acts.appendChild(btn("Resend", async () => {
+          const r = await fetch(`/api/transfers/${encodeURIComponent(t.id)}/retry`, { method: "POST" });
+          if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
+          toast("Resent.", "ok");
+        }));
+      }
       acts.appendChild(btn("Remove", async () => {
         await fetch(`/api/transfers/${encodeURIComponent(t.id)}/cancel`, { method: "POST" });
       }, "ghost"));
@@ -1062,7 +1066,9 @@ function renderSettings(s) {
   const notif = checkInput(s.notifications, "set-notif");
   const startup = checkInput(s.start_on_login, "set-startup");
   const dl = textInput(s.default_download_folder, "set-dl");
-  const inbox = textInput(s.inbox_folder, "set-inbox"); inbox.placeholder = "default: <data dir>/Inbox";
+  const inbox = textInput(s.inbox_folder, "set-inbox"); inbox.placeholder = "default: ~/LANyard";
+  const inboxWrap = withBrowse(inbox, "Choose the Inbox folder");
+  inboxWrap.appendChild(btn("Open folder", () => fetch("/api/inbox/open", { method: "POST" }), "ghost"));
   const tray = checkInput(s.minimize_to_tray, "set-tray");
   const bw = numberInput(s.bandwidth_limit_mbps || 0, "set-bw");
   const port = numberInput(s.peer_port || 47800, "set-port");
@@ -1077,7 +1083,7 @@ function renderSettings(s) {
   box.appendChild(settingsField("Start LANyard when I sign in", startup));
   if (s.tray_supported) box.appendChild(settingsField("Minimize to system tray (closing or minimizing hides the window; use the tray icon to reopen or quit)", tray));
   box.appendChild(settingsField("Default download folder", withBrowse(dl, "Choose the default download folder")));
-  box.appendChild(settingsField("Inbox folder (pushes)", withBrowse(inbox, "Choose the Inbox folder")));
+  box.appendChild(settingsField("Inbox folder (pushes)", inboxWrap));
   box.appendChild(settingsField("Bandwidth limit (MB/s, 0 = unlimited)", bw));
   box.appendChild(settingsField("Peer port (restart to apply)", port));
 
@@ -1220,7 +1226,7 @@ async function cancelAllShares() {
 }
 
 // ---------- pairing / sessions ----------
-let pairView = null, pairPerms = { browse: true, push: false }, pairKeep = false;
+let pairView = null, pairPerms = { browse: true, push: false }, pairKeep = false, qrTimer = null;
 const sessionMemo = {};        // id -> last status seen (drives transition toasts)
 const autoOpened = new Set();  // incoming ids we auto-surfaced once
 const dismissed = new Set();   // ids the user closed/rejected (do not auto-reopen)
@@ -1326,20 +1332,62 @@ async function renderQRPanel(body) {
   row.appendChild(inp); row.appendChild(b);
   body.appendChild(row);
 
-  try {
-    const r = await fetch("/api/pair/payload");
-    if (!pairView || !pairView.qr) return; // panel closed while loading
-    if (!r.ok) { clear(holder); holder.appendChild(el("div", "msg err", (await r.text()).trim())); return; }
-    const p = await r.json();
+  // The code is a one-time invite that lives for 2 minutes. Show a live
+  // countdown and swap in a fresh code the moment the current one expires or
+  // has been used, so a dead code is never left on screen.
+  let current = null;   // nonce currently shown
+  let expiresAt = 0;    // ms since epoch
+  let info = null;      // countdown line
+  let loading = false;
+
+  if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
+
+  const draw = (p) => {
+    current = p.nonce;
+    expiresAt = Date.parse(p.expires_at) || (Date.now() + 120000);
     clear(holder);
-    holder.appendChild(renderQR(p.uri));
+    const box = el("div", "qrbox");
+    box.appendChild(renderQR(p.uri));
     const link = el("div", "muted", p.uri); link.style.wordBreak = "break-all"; link.style.fontSize = "11px";
-    holder.appendChild(link);
-    const exp = el("div", "muted", "Expires " + new Date(p.expires_at).toLocaleTimeString() + " and works once.");
-    holder.appendChild(exp);
-  } catch (e) {
-    clear(holder); holder.appendChild(el("div", "msg err", String(e)));
-  }
+    box.appendChild(link);
+    info = el("div", "muted");
+    box.appendChild(info);
+    holder.appendChild(box);
+  };
+
+  const load = async () => {
+    if (loading) return;
+    loading = true;
+    try {
+      const q = current ? "?nonce=" + encodeURIComponent(current) : "";
+      const r = await fetch("/api/pair/payload" + q);
+      if (!pairView || !pairView.qr) return;
+      if (!r.ok) { clear(holder); holder.appendChild(el("div", "msg err", (await r.text()).trim())); return; }
+      const p = await r.json();
+      if (p.nonce !== current) draw(p); // redraw only when the invite actually changed
+    } catch (e) {
+      clear(holder); holder.appendChild(el("div", "msg err", String(e)));
+    } finally {
+      loading = false;
+    }
+  };
+
+  const tick = () => {
+    if (!pairView || !pairView.qr) { clearInterval(qrTimer); qrTimer = null; return; }
+    const left = expiresAt - Date.now();
+    if (info) {
+      if (left <= 0) {
+        info.textContent = "Refreshing code\u2026";
+      } else {
+        const s = Math.floor(left / 1000);
+        info.textContent = "Expires in " + Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0") + " \u00b7 works once";
+      }
+    }
+    load(); // also notices a used invite and mints a fresh code
+  };
+
+  await load();
+  qrTimer = setInterval(tick, 1000);
 }
 
 // renderQR draws a pairing link as a QR code onto a canvas, entirely offline.

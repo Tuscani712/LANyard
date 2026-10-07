@@ -199,13 +199,21 @@ type Manager struct {
 	dir       string
 	onChange  func()
 	onOffer   func(peerFP string, files int, total int64)
-	onDone    func(peerFP string, files int, total int64)
+	onDone    func(peerFP string, files []ReceivedFile)
 	onSnippet func(peerFP, text string)
 
 	mu       sync.Mutex
 	pushes   map[string]*Push
 	gone     map[string]struct{} // cancelled push ids
 	snippets []*Snippet
+}
+
+// ReceivedFile describes one file that finished landing in the Inbox, for the
+// transfer history entry the receiver records.
+type ReceivedFile struct {
+	Rel  string `json:"rel"`  // path as offered (relative to the Inbox root)
+	Name string `json:"name"` // the name it was saved under
+	Size int64  `json:"size"`
 }
 
 // FreeSpace reports the bytes available to the current user on the volume
@@ -251,8 +259,9 @@ func New(dir string, onChange func()) *Manager {
 // (used to notify the person that files are arriving).
 func (m *Manager) SetOnOffer(fn func(peerFP string, files int, total int64)) { m.onOffer = fn }
 
-// SetOnDone registers a callback for each push that finishes being received.
-func (m *Manager) SetOnDone(fn func(peerFP string, files int, total int64)) { m.onDone = fn }
+// SetOnDone registers a callback for each push that finishes being received,
+// with the files that landed so the caller can record a history entry.
+func (m *Manager) SetOnDone(fn func(peerFP string, files []ReceivedFile)) { m.onDone = fn }
 
 // SetOnSnippet registers a callback for each text snippet that is received
 // (used to raise a desktop notification).
@@ -310,6 +319,15 @@ func (m *Manager) DismissSnippet(id string) bool {
 }
 
 func (m *Manager) Dir() string { return m.dir }
+
+// EnsureDir creates the Inbox root if it does not exist yet (pushes create it
+// lazily; the settings screen and "Open folder" also call this).
+func (m *Manager) EnsureDir() error {
+	m.mu.Lock()
+	dir := m.dir
+	m.mu.Unlock()
+	return os.MkdirAll(dir, 0o700)
+}
 
 // SetDir changes the Inbox root for future pushes (settings, §11).
 func (m *Manager) SetDir(dir string) {
@@ -557,21 +575,27 @@ func (m *Manager) Complete(id, peerFP, rel, wantSHA string) (*FileState, error) 
 	return st, nil
 }
 
-// Finish removes a completed push.
+// Finish removes a completed push and reports the files that landed.
 func (m *Manager) Finish(id, peerFP string) bool {
-	var files int
-	var total int64
+	var received []ReceivedFile
 	m.mu.Lock()
 	p, ok := m.pushes[id]
 	if ok && p.PeerFP == peerFP {
+		for _, st := range p.Files {
+			name := filepath.Base(st.Final)
+			if st.Final == "" {
+				name = filepath.Base(st.RelPath)
+			}
+			received = append(received, ReceivedFile{Rel: st.RelPath, Name: name, Size: st.Size})
+		}
+		sort.Slice(received, func(i, j int) bool { return received[i].Rel < received[j].Rel })
 		delete(m.pushes, id)
-		files, total = len(p.Files), p.Total
 	}
 	m.mu.Unlock()
 	if ok {
 		m.onChange()
 		if m.onDone != nil {
-			m.onDone(peerFP, files, total)
+			m.onDone(peerFP, received)
 		}
 	}
 	return ok
