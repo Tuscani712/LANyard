@@ -21,6 +21,13 @@ internal class GoPeer(bin: String) : AutoCloseable {
     val peerPort: Int = freePort()
     val uiPort: Int = freePort()
 
+    // Keep the Inbox inside the temp data dir: the shipped default is now
+    // ~/LANyard, but tests must never write to the developer's home directory.
+    init {
+        val inbox = File(dataDir, "Inbox")
+        File(dataDir, "config.json").writeText("""{"inbox_folder":${com.google.gson.Gson().toJson(inbox.absolutePath)}}""")
+    }
+
     private val process: Process = ProcessBuilder(
         bin, "--data-dir", dataDir.absolutePath,
         "--no-browser", "--no-tray", "--port", "$peerPort", "--ui-port", "$uiPort",

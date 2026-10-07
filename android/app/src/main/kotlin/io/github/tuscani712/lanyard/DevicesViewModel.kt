@@ -14,6 +14,7 @@ import io.github.tuscani712.lanyard.core.PeerClient
 import io.github.tuscani712.lanyard.core.PeerHelloServer
 import io.github.tuscani712.lanyard.core.PeerStatusException
 import io.github.tuscani712.lanyard.core.ProbeClient
+import io.github.tuscani712.lanyard.core.SelfFilter
 import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.net.NearbyDevice
 import io.github.tuscani712.lanyard.net.NetAddrs
@@ -120,11 +121,15 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             _state.update { it.copy(refreshing = true) }
             val identity = IdentityHolder.identity
+            val own = SelfFilter.ownShortId(identity?.deviceId.orEmpty())
             val paired = withContext(Dispatchers.IO) {
                 if (identity == null) return@withContext emptyList()
-                store.list().map { peer ->
-                    PairedStatus(peer, isOnline(peer))
-                }
+                store.list()
+                    // Never list this device as one of its own paired peers.
+                    .filterNot { SelfFilter.isSelf(SelfFilter.ownShortId(it.fingerprint), own) }
+                    .map { peer ->
+                        PairedStatus(peer, isOnline(peer))
+                    }
             }
             _state.update { it.copy(paired = paired, refreshing = false) }
         }
@@ -133,8 +138,13 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     fun startNearby() {
         discovery.start(
             onFound = { device ->
-                _state.update { current ->
-                    current.copy(nearby = (current.nearby.filterNot { it.shortId == device.shortId } + device))
+                // Drop this phone's own mDNS advertisement: without this it
+                // lists itself and invites a pairing that cannot work.
+                val own = SelfFilter.ownShortId(IdentityHolder.identity?.deviceId.orEmpty())
+                if (!SelfFilter.isSelf(device.shortId, own)) {
+                    _state.update { current ->
+                        current.copy(nearby = (current.nearby.filterNot { it.shortId == device.shortId } + device))
+                    }
                 }
             },
             onLost = { shortId ->

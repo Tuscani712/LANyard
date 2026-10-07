@@ -35,6 +35,10 @@ class SpikeTest {
         val dataDir = Files.createTempDirectory("lanyard-core").toFile()
         val peerPort = freePort()
         val uiPort = freePort()
+        // Keep the Inbox in the temp dir; the shipped default is ~/LANyard.
+        File(dataDir, "config.json").writeText(
+            """{"inbox_folder":${com.google.gson.Gson().toJson(File(dataDir, "Inbox").absolutePath)}}""",
+        )
         val process = ProcessBuilder(
             bin, "--data-dir", dataDir.absolutePath,
             "--no-browser", "--no-tray", "--port", "$peerPort", "--ui-port", "$uiPort",
