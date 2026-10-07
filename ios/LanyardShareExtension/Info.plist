@@ -28,8 +28,19 @@
 		<string>$(PRODUCT_MODULE_NAME).ShareViewController</string>
 		<key>NSExtensionAttributes</key>
 		<dict>
+			<!-- Offer LANyard for files, web URLs and plain text. Images/movies
+			     arrive as file URLs, so the file count covers them. -->
 			<key>NSExtensionActivationRule</key>
-			<string>TRUEPREDICATE</string>
+			<dict>
+				<key>NSExtensionActivationSupportsFileWithMaxCount</key>
+				<integer>100</integer>
+				<key>NSExtensionActivationSupportsWebURLWithMaxCount</key>
+				<integer>100</integer>
+				<key>NSExtensionActivationSupportsText</key>
+				<true/>
+				<key>NSExtensionActivationSupportsImageWithMaxCount</key>
+				<integer>100</integer>
+			</dict>
 		</dict>
 	</dict>
 </dict>

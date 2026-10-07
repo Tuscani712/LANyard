@@ -41,7 +41,7 @@ swift test
 On a Mac, the same command works, or open `Package.swift` in Xcode and run the
 `LanyardCoreTests` scheme.
 
-`swift test` on Linux currently runs **354 tests, 0 failures**.
+`swift test` on Linux currently runs **373 tests, 0 failures**.
 
 ## What was verified
 
@@ -68,8 +68,8 @@ On a Mac, the same command works, or open `Package.swift` in Xcode and run the
 | Receive logic: `TransferManager` (states, `Interrupted`, `Dismiss`, clear history), `InboxDestination` (Documents/`LANyard` default, `name (1).ext`, writability refusal), `Authorizer` (per-request rules), `ServerLifecycle` (foreground/background) | **Linux-tested** |
 | Discovery/pairing logic: `DiscoveryTxt` (Bonjour TXT + 16-hex short id, beacon), `Devices` (merge/self-filter/online-offline/last-seen/eviction), `PairFlow` (2-minute invite countdown, SAS confirm/decline, permissions, unpair, paste-a-link only) | **Linux-tested** |
 | Send/serve/pull logic: `SendFlow` (offer, per-file progress, cancel, resend a Failed send, 403/410/else), `ShareList` (lifetimes, stop, 4-concurrency cap + 503/Retry-After, digest LRU), `PullBrowse` (browse/pull over the `DownloadSession` seams); and `PairFlow`'s `PortProvider` QR gate (no QR until the listener port is known) | **Linux-tested** |
-| SwiftUI app (`LanyardApp/`: Devices, Pair, invite QR + countdown, Receive, Send, Share, Browse, Settings, Local Network permission screen), the AVFoundation QR scanner, the `UIDocumentPicker` file/folder pickers, the `NWListener` `ShareServer` adapter, the background `URLSession` downloader, the lifecycle glue, `Info.plist`, `project.yml` | **Written, not compiled — iOS-only; see [`DESIGN.md`](DESIGN.md)** |
-| Troubleshoot copy report, Share extension | **Written, not compiled — Phase 6** |
+| Settings + Troubleshoot logic: `SettingsModel` (theme, speed unit, notifications, sound, Wi-Fi-only, bandwidth, folder override, About), `Troubleshoot` (platform checks + the iOS Local-Network/listener rows + the 200-event redacted copy report) | **Linux-tested** |
+| SwiftUI app (`LanyardApp/`: Devices, Pair, invite QR + countdown, Receive, Send, Share, Browse, Settings, Troubleshoot, Local Network permission screen), the AVFoundation QR scanner, the `UIDocumentPicker` file/folder pickers, the `NWListener` `ShareServer` adapter, the background `URLSession` downloader, the Share extension (`ShareViewController` + App Group), the lifecycle glue, `Info.plist`, `project.yml` | **Written, not compiled — iOS-only; see [`DESIGN.md`](DESIGN.md) and [`SPIKE.md`](SPIKE.md)** |
 
 ## Layout
 

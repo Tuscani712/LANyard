@@ -13,6 +13,7 @@
 // and the four observable models from `LanyardNet.ObservableModels`.
 
 import SwiftUI
+import UIKit
 import LanyardCore
 import LanyardNet
 
@@ -30,6 +31,11 @@ struct LanyardApp: App {
                 .environmentObject(services.send)
                 .environmentObject(services.shares)
                 .environmentObject(services.browse)
+                // Final SwiftUI layer: Settings, Troubleshoot and the live
+                // Local Network permission box the Troubleshoot rows read.
+                .environmentObject(services.settings)
+                .environmentObject(services.troubleshoot)
+                .environmentObject(services.localNetworkAccess)
         }
     }
 }
@@ -46,6 +52,12 @@ final class AppServices: ObservableObject {
     let shares: SharesModel
     let browse: BrowseModel
     let shareServices: ShareServices
+
+    // Final layer: Settings + Troubleshoot.
+    let settings: SettingsModelVM
+    let troubleshoot: TroubleshootModel
+    let localNetworkAccess: LocalNetworkAccessBox
+    let diagnostics: ServerDiagnostics
 
     let authorizer: Authorizer
 
@@ -93,6 +105,58 @@ final class AppServices: ObservableObject {
             selfName: ProcessInfo.processInfo.hostName
         )
 
+        // Final layer: Settings and Troubleshoot.
+        //
+        // `SettingsModel` persists `AppSettings` as JSON; `SettingsModelVM`
+        // republishes it and delegates the download-folder override to the same
+        // `InboxDestinationAdapter` the receive path uses, so picking a folder
+        // in Settings immediately changes where received files land.
+        let settingsModel = SettingsModel(
+            store: JsonFileSettingsStore(file: AppServices.settingsFile)
+        )
+        let folderBridge = FolderOverrideBridge(
+            existingToken: { adapter.isUsingOverride ? "inbox-adapter-bookmark" : nil },
+            existingName: { adapter.isUsingOverride ? adapter.displayPath : nil },
+            choose: { url in
+                try adapter.setOverride(from: url)
+                return "inbox-adapter-bookmark"
+            },
+            clear: { adapter.useDefault() }
+        )
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "0.0.0"
+        let settingsVM = SettingsModelVM(
+            model: settingsModel,
+            about: AboutApp(version: version),
+            folder: folderBridge
+        )
+
+        // The breadcrumb buffer is shared with the receive path once that is
+        // wired; the Troubleshoot tab reads it.
+        let diagnostics = ServerDiagnostics()
+
+        // MAC-SPIKE: the `DiagEnv` below only fills the values the app can read
+        // without Network.framework introspection. Live connected/metered/
+        // addresses/mDNS/reachability should be injected from `NWPathMonitor`
+        // and the discovery registry (see SPIKE.md).
+        let diagEnv = AppDiagEnv(
+            addresses: { DeviceIdentity.localAddresses() },
+            folderSelected: { adapter.writableRoot() != nil },
+            folderFreeBytes: { AppServices.freeBytes() }
+        )
+        // The Devices tab's `NWBrowser` is the only observer of TN3179;
+        // `RootView` mirrors its outcome into this box (see `RootView`).
+        let localNetwork = LocalNetworkAccessBox()
+        let troubleshootVM = TroubleshootModel(
+            env: diagEnv,
+            diagnostics: diagnostics,
+            permission: { localNetwork.access },
+            listener: {
+                if lifecycle.state == .running { return .running }
+                if UIApplication.shared.applicationState == .background { return .backgrounded }
+                return .stopped
+            }
+        )
+
         self.transfers = TransfersModel(manager: manager)
         self.inbox = InboxModel(destination: destination, adapter: adapter)
         self.server = ServerModel(lifecycle: lifecycle)
@@ -108,6 +172,10 @@ final class AppServices: ObservableObject {
         self.shareServices = shareServices
         self.shares = shareServices.model
         self.lifecycle = lifecycle
+        self.settings = settingsVM
+        self.troubleshoot = troubleshootVM
+        self.localNetworkAccess = localNetwork
+        self.diagnostics = diagnostics
 
         // A push cannot continue once the listener stops (the app was
         // backgrounded), so fail its row immediately rather than leaving it
@@ -150,6 +218,11 @@ final class AppServices: ObservableObject {
     /// The persisted share catalog (security-scoped bookmarks).
     static var sharesFile: URL {
         applicationSupport.appendingPathComponent("shares.json")
+    }
+
+    /// The persisted app settings.
+    static var settingsFile: URL {
+        applicationSupport.appendingPathComponent("settings.json")
     }
 
     static func freeBytes() -> Int64 {

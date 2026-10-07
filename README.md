@@ -219,7 +219,24 @@ Received pushes go to the Inbox folder, by default `Inbox` inside that folder.
 * The Linux window needs WebKitGTK installed; the tray needs a desktop with a tray host. Not tested on GNOME or Wayland yet.
 * Desktop notifications are Linux-only for now (Windows toasts are not wired up). Text snippets and QR pairing have
   been exercised on one computer (two instances) but not yet across two physical machines.
-* There is no mobile app yet; the pairing link is designed so that a phone app can scan it.
+* There is no released mobile app yet; the pairing link is designed so that a
+  phone app can scan it. Groundwork for an iPhone app lives on the `ios` branch.
+
+## iOS app (work in progress, not compiled)
+
+An iPhone app is being built on the `ios` branch. Its platform-independent
+protocol core (`ios/Sources/LanyardCore`, a Swift package) is built and unit
+tested on Linux — 373 tests, 0 failures — including the chunked decoder, the
+receive spool, discovery and pairing, send/serve/pull, settings and the
+Troubleshoot report; the Ed25519 X.509 certificate builder is cross-checked
+against the Go implementation in both directions. The Apple-only layer
+(Network.framework, Security.framework, the SwiftUI screens and the Share
+extension) is **written but not compiled**: no macOS, Xcode or Apple SDK exists
+in the build environment, so it has never been type-checked. `ios/SPIKE.md` is
+the first-Mac runbook, and its first question is whether Apple's TLS will present
+an Ed25519 client certificate to the Go peer (Android needed BouncyCastle for
+this; the P-256 fallback is a documented option pending a decision). Nothing
+mobile is released.
 
 ## License
 

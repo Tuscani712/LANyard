@@ -167,7 +167,19 @@ the rest is behind `LanyardNet` and is written, not compiled, until a Mac exists
     matching `ObservableObject` adapters. (Background pulls over our custom
     mTLS are flagged as the headline Mac risk — `URLSession` background tasks
     run out-of-process and cannot reuse the in-process verify block.)
-- **Phase 6 — Settings + Troubleshoot log + Share extension.**
+- **Phase 6 — Settings + Troubleshoot log + Share extension.** *(delivered)*
+  - **Linux-tested:** `SettingsModel` (theme, speed unit, notifications, sound,
+    Wi-Fi-only, bandwidth, folder override with "Use default", About with
+    version / AGPL-3.0 / repo link) and `Troubleshoot` (platform checks as far
+    as they are portable, the iOS Local-Network + listener rows, and the
+    200-event redacted copy report). 373 tests, 0 failures.
+  - **Written, not compiled (iOS-only):** the Settings screen (notifications
+    permission prompt via `UNUserNotificationCenter`, About), the Troubleshoot
+    screen with Copy report, and the Share extension (`ShareViewController`
+    accepting files/URLs/text, spooling into the App Group container before
+    finishing). App Group entitlements are in `project.yml`; the parts that
+    require an Apple developer team ID are stated in `ShareViewController.swift`
+    and `SPIKE.md`.
 
 Each phase is independently reviewable. Phases 2–6 will be labelled
 "written, not compiled" throughout.

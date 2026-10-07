@@ -50,14 +50,26 @@ targets:
         product: LanyardNet
       - target: LanyardShareExtension
         embed: true
+    # ── Entitlements need an Apple developer team ─────────────────────────────
+    # App Groups (below) are only honored when both the app and the extension
+    # are signed with the same Team ID and the group is registered on the
+    # developer portal. Without a team / provisioning profile, the extension's
+    # `containerURL(forSecurityApplicationGroupIdentifier:)` returns nil.
+    # Keychain sharing (`keychain-access-groups`) and iCloud would need the same
+    # team setup and are deliberately not declared here.
+    entitlements:
+      path: LanyardApp/LanyardApp.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.io.github.tuscani712.lanyard
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.tuscani712.lanyard
         GENERATE_INFOPLIST_FILE: false
         TARGETED_DEVICE_FAMILY: "1,2"
 
-  # Phase 6 stub. Exists so the target, its Info.plist and its embed relationship
-  # are real today; ShareViewController.swift just shows a placeholder.
+  # Phase 6 share extension: accepts files, URLs and text; spools them into the
+  # App Group container, then hands off to the app.
   LanyardShareExtension:
     type: app-extension
     platform: iOS
@@ -72,6 +84,13 @@ targets:
         product: LanyardCore
       - package: LanyardPackage
         product: LanyardNet
+    # Same App Group as the app so the spooled files are readable across the
+    # boundary. Requires the same Team ID / provisioning profile as the app.
+    entitlements:
+      path: LanyardShareExtension/LanyardShareExtension.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.io.github.tuscani712.lanyard
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.github.tuscani712.lanyard.share

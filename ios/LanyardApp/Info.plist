@@ -20,6 +20,19 @@
 	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<!-- The share extension hands off with lanyard://share?… ; registering the
+	     scheme lets the system open LANyard and let it read the spool. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>io.github.tuscani712.lanyard</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>lanyard</string>
+			</array>
+		</dict>
+	</array>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<!-- TN3179: Bonjour browse of _lanyard._tcp needs both keys or it

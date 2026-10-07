@@ -274,6 +274,43 @@ dns-sd -L <instance> _lanyard._tcp local.   # then read the TXT record
 
 ---
 
+## Final SwiftUI layer (Settings, Troubleshoot, share extension)
+
+WRITTEN, NOT COMPILED. `Sources/LanyardNet/SettingsModels.swift`, the rebuilt
+`LanyardApp/SettingsView.swift` and `TroubleshootView.swift`, and the rewritten
+`LanyardShareExtension/ShareViewController.swift` were written on Linux and
+have never been type-checked. The items below are the real blockers.
+
+### Things that need an Apple developer team ID / provisioning profile
+
+- **App Groups** (`com.apple.security.application-groups`, group
+  `group.io.github.tuscani712.lanyard`). Declared in `project.yml` for both the
+  app and the extension. The group is only honored when both are signed with
+  the same Team ID and the group is registered on the developer portal. Without
+  a team, `FileManager.containerURL(forSecurityApplicationGroupIdentifier:)`
+  returns nil and the extension's spool falls back to a private temp dir the
+  app cannot read — the share handoff silently degrades.
+- **iCloud / any other capability entitlement** — needs a team. Not declared.
+- **Keychain sharing** (`keychain-access-groups`) — needs a team. Not declared.
+  The device identity uses the app's own keychain, which is fine, but a shared
+  keychain across app + extension would need the capability.
+- **Codesigning the embedded extension** — the app embeds
+  `LanyardShareExtension` (project.yml `embed: true`); Xcode requires a team to
+  sign both, or the build fails at the embed step.
+
+### Share extension handoff
+
+- A share extension cannot call `UIApplication.shared.open`. The
+  `openViaResponderChain` path in `ShareViewController.swift` is an
+  undocumented best-effort to bring the app forward; the reliable fallback is
+  that the app reads the App Group spool on its next foreground.
+- **App-side intake is not implemented.** `LanyardApp` does not yet decode
+  `manifest.json` from the App Group, nor feed the spooled items into
+  `SendModel`'s device picker. The extension writes the spool and the
+  `lanyard://share` link; the app only registers the scheme.
+- `NSExtensionActivationRule` is a dictionary (files ≤100, web URLs ≤100,
+  text, images ≤100). `TRUEPREDICATE` was removed.
+
 ## Every `MAC-SPIKE:` item in the code
 
 | File | Item |
@@ -286,6 +323,10 @@ dns-sd -L <instance> _lanyard._tcp local.   # then read the TXT record
 | `PeerListener.swift` | `sec_protocol_metadata_copy_peer_certificate_chain` + `sec_certificate_copy_ref` availability/behaviour under `NWListener`. |
 | `BonjourBrowser.swift` | `NWBrowser.Result.metadata` TXT-record spelling (`service.txtRecord` vs `NWTXTRecord`). |
 | `BonjourBrowser.swift` | Address resolution via a plain TCP connect is intrusive; production should read addresses from a real connection. |
+| `LanyardNet/SettingsModels.swift` | `AppDiagEnv` defaults are conservative; live connected/metered/addresses/mDNS/reachability must be injected from `NWPathMonitor` and the discovery registry. |
+| `LanyardApp/LanyardApp.swift` | `listener`/`permission` for the Troubleshoot rows: listener from `ServerLifecycle` + `UIApplication` state, permission mirrored from `DevicesModel.permission` by `RootView`. |
+| `LanyardShareExtension/ShareViewController.swift` | Share extensions cannot `UIApplication.shared.open`; responder-chain handoff is undocumented. App-side spool intake is not implemented. |
+| `LanyardShareExtension/ShareViewController.swift` | App Groups need a team ID/provisioning profile; without one the spool falls back to an app-unreadable temp dir. |
 
 ## Known gaps / things not implemented
 

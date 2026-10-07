@@ -1,32 +1,32 @@
 import Foundation
 
 /// Which color scheme the app renders, or the system default.
-enum ThemeMode: String, Codable {
+public enum ThemeMode: String, Codable {
     case system = "System"
     case light = "Light"
     case dark = "Dark"
 }
 
 /// How transfer speeds are shown.
-enum SpeedUnit: String, Codable {
+public enum SpeedUnit: String, Codable {
     case MBps = "MBps"
     case Mbps = "Mbps"
 }
 
 /// User-facing preferences that persist across restarts.
-struct AppSettings: Codable, Equatable {
-    var theme: ThemeMode = .system
-    var speedUnit: SpeedUnit = .MBps
-    var notifications: Bool = true
-    var soundOnComplete: Bool = false
+public struct AppSettings: Codable, Equatable {
+    public var theme: ThemeMode = .system
+    public var speedUnit: SpeedUnit = .MBps
+    public var notifications: Bool = true
+    public var soundOnComplete: Bool = false
     /// Refuse transfers on a metered or mobile connection.
-    var wifiOnly: Bool = true
-    /// Persisted SAF tree URI for downloads, or null to ask each time.
-    var downloadFolder: String? = nil
+    public var wifiOnly: Bool = true
+    /// Persisted bookmark token for the download folder, or nil for the default.
+    public var downloadFolder: String? = nil
     /// Bandwidth cap in MB/s; 0 means unlimited.
-    var bandwidthLimitMBps: Int = 0
+    public var bandwidthLimitMBps: Int = 0
 
-    init(
+    public init(
         theme: ThemeMode = .system,
         speedUnit: SpeedUnit = .MBps,
         notifications: Bool = true,
@@ -51,7 +51,7 @@ struct AppSettings: Codable, Equatable {
     // Gson fills any field absent from the JSON with the value it had at
     // construction, so a partial settings file keeps the defaults for the
     // fields it omits. decodeIfPresent mirrors that.
-    init(from decoder: Decoder) throws {
+    public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         theme = try c.decodeIfPresent(ThemeMode.self, forKey: .theme) ?? .system
         speedUnit = try c.decodeIfPresent(SpeedUnit.self, forKey: .speedUnit) ?? .MBps
@@ -64,7 +64,7 @@ struct AppSettings: Codable, Equatable {
 }
 
 /// Persists `AppSettings`. Implementations must never throw on read.
-protocol SettingsStore {
+public protocol SettingsStore {
     func load() -> AppSettings
     func save(_ settings: AppSettings)
 }
@@ -73,24 +73,24 @@ protocol SettingsStore {
 /// file and are atomically renamed into place. A missing, unreadable or partial
 /// file reads as `AppSettings` defaults, so a bad file can never keep the app
 /// from starting.
-final class JsonFileSettingsStore: SettingsStore {
+public final class JsonFileSettingsStore: SettingsStore {
     private let url: URL
     private let encoder: JSONEncoder
     private let decoder = JSONDecoder()
 
-    init(file: URL) {
+    public init(file: URL) {
         self.url = file
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted]
         self.encoder = encoder
     }
 
-    func load() -> AppSettings {
+    public func load() -> AppSettings {
         guard let data = try? Data(contentsOf: url) else { return AppSettings() }
         return (try? decoder.decode(AppSettings.self, from: data)) ?? AppSettings()
     }
 
-    func save(_ settings: AppSettings) {
+    public func save(_ settings: AppSettings) {
         guard let data = try? encoder.encode(settings) else { return }
         try? atomicWrite(data, to: url)
     }
@@ -112,7 +112,7 @@ func atomicWrite(_ contents: Data, to file: URL) throws {
 }
 
 /// Formats a byte-per-second rate for display, in the chosen unit.
-func formatSpeed(_ bytesPerSecond: Double, _ unit: SpeedUnit) -> String {
+public func formatSpeed(_ bytesPerSecond: Double, _ unit: SpeedUnit) -> String {
     switch unit {
     case .MBps:
         return String(format: "%.1f MB/s", bytesPerSecond / 1_048_576.0)
