@@ -111,8 +111,10 @@
         <div class="head-tools"><button class="btn ghost" id="stop-all">Stop all</button></div>
       </header>
       <div class="form-row">
-        <input id="share-path" placeholder="Absolute path to a file or folder" autocomplete="off" style="flex:1;min-width:280px">
-        <input id="share-label" placeholder="Label (optional)" autocomplete="off" style="width:170px">
+        <input id="share-path" placeholder="No file or folder chosen" autocomplete="off" readonly style="flex:1;min-width:220px">
+        <button class="btn ghost" id="share-browse-file">Choose file…</button>
+        <button class="btn ghost" id="share-browse-folder">Choose folder…</button>
+        <input id="share-label" placeholder="Label (optional)" autocomplete="off" style="width:150px">
         <select id="share-lifetime" aria-label="Lifetime">
           <option value="until_stopped">Until I stop</option>
           <option value="persistent">Always</option>

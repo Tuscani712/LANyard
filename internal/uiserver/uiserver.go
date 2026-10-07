@@ -224,6 +224,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/transfers/{id}/cancel", s.auth(s.handleTransferCancel))
 	mux.HandleFunc("POST /api/push", s.auth(s.handlePush))
 	mux.HandleFunc("GET /api/mounts", s.auth(s.handleMounts))
+	mux.HandleFunc("GET /api/mounts/letters", s.auth(s.handleDriveLetters))
 	mux.HandleFunc("POST /api/mounts", s.auth(s.handleMountAdd))
 	mux.HandleFunc("POST /api/mounts/{id}/remove", s.auth(s.handleMountRemove))
 	mux.HandleFunc("GET /api/approvals", s.auth(s.handleApprovals))

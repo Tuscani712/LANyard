@@ -277,20 +277,43 @@ function showNotice(n) {
 
 // ---------- native file / folder dialog ----------
 // Opens the operating system's own Explorer-style dialog (via the app) and
-// returns the chosen paths, or [] if cancelled. Falls back to typing a path
-// where the system has no native dialog.
+// returns the chosen paths, or [] if cancelled. In a plain browser (no native
+// window) there is no system dialog, so we say so in-app rather than asking the
+// person to type a path. The native window routes through the same endpoint.
 async function pickPaths(kind, title, start) {
   try {
     const r = await fetch("/api/fs/pick", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ kind, title, start: start || "" }) });
     if (r.ok) return (await r.json()).paths || [];
     if (r.status !== 501) { toast((await r.text()).trim(), "err"); return []; }
-  } catch (e) { /* fall through to typing */ }
-  const typed = prompt(kind === "folder" ? "Folder path:" : "File or folder path:", start || "");
-  return typed && typed.trim() ? [typed.trim()] : [];
+  } catch (e) { /* no native dialog available */ }
+  toast("File picking needs the LANyard desktop app. Open LANyard as an app (not in a browser) to choose files and folders.", "err");
+  return [];
 }
 async function pickFolder(title, start) { const a = await pickPaths("folder", title, start); return a[0] || ""; }
 const savedDest = () => { try { return localStorage.getItem("lanyard.dest") || ""; } catch (e) { return ""; } };
 const currentDest = () => savedDest() || settings.default_download_folder || "";
+
+// A small in-app chooser, used where there is no native OS dialog: it resolves
+// with the chosen value, or null if dismissed. Nothing here asks for typing.
+function pickOption(title, options) {
+  return new Promise((resolve) => {
+    const back = el("div", "overlay");
+    const box = el("div", "modal");
+    const head = el("div", "modal-head");
+    head.appendChild(el("h2", null, title));
+    box.appendChild(head);
+    const acts = el("div", "actions");
+    for (const opt of options) {
+      const b = el("button", "btn" + (opt.ghost ? " ghost" : ""), opt.label);
+      b.addEventListener("click", () => { back.remove(); resolve(opt.value); });
+      acts.appendChild(b);
+    }
+    box.appendChild(acts);
+    back.appendChild(box);
+    back.addEventListener("click", (e) => { if (e.target === back) { back.remove(); resolve(null); } });
+    document.body.appendChild(back);
+  });
+}
 
 // ---------- context menu ----------
 function closeMenus() { clear($("ctx-root")); }
@@ -818,59 +841,8 @@ function renderPairedPage() {
       row.appendChild(acts);
       stack.appendChild(row);
     }
-  if (history.length) {
-    const hf = S.historyFilter || "all";
-    box.appendChild(el("div", "section-title", "History"));
-    const filters = el("div", "form-row");
-    for (const [key, label] of [["all", "All"], ["sent", "Sent"], ["received", "Received"], ["failed", "Failed"]]) {
-      const b = el("button", "btn ghost" + (hf === key ? " active" : ""), label);
-      b.addEventListener("click", () => { S.historyFilter = key; renderTransfersPage(); });
-      filters.appendChild(b);
-    }
-    box.appendChild(filters);
-    const list = history.filter((t) => {
-      if (hf === "sent") return t.direction === "push";
-      if (hf === "received") return t.direction === "download" || t.direction === "receive";
-      if (hf === "failed") return t.state === "Failed";
-      return true;
-    });
-    const hstack = el("div", "stack");
-    if (!list.length) hstack.appendChild(el("div", "empty", "Nothing here."));
-    for (const t of list) {
-      const row = el("div", "row col");
-      const top = el("div", "row"); top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
-      const dir = t.direction === "push" ? "\u2191 Sent" : "\u2193 Received";
-      const name = t.share_label || (t.files && t.files[0] && t.files[0].local) || t.share_id || "transfer";
-      top.appendChild(el("div", "grow name", dir + " \u00b7 " + name));
-      top.appendChild(el("span", "badge " + stateClass(t.state), t.state));
-      row.appendChild(top);
-      const n = t.files_total || (t.files || []).length;
-      const meta = el("div", "meta");
-      meta.textContent = `${fmtBytes(t.total)} \u00b7 ${n} file${n === 1 ? "" : "s"}` +
-        (t.peer_name ? ` \u00b7 ${t.direction === "push" ? "to " : "from "}${t.peer_name}` : "") +
-        (t.finished_at ? ` \u00b7 ${fmtWhen(t.finished_at)}` : "");
-      row.appendChild(meta);
-      if (t.error) row.appendChild(el("div", "msg err", t.error));
-      const acts = el("div", "actions");
-      if (t.direction === "receive") {
-        acts.appendChild(btn("Open folder", () => fetch("/api/inbox/open", { method: "POST" }), "ghost"));
-      } else {
-        acts.appendChild(btn("Resend", async () => {
-          const r = await fetch(`/api/transfers/${encodeURIComponent(t.id)}/retry`, { method: "POST" });
-          if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
-          toast("Resent.", "ok");
-        }));
-      }
-      acts.appendChild(btn("Remove", async () => {
-        await fetch(`/api/transfers/${encodeURIComponent(t.id)}/cancel`, { method: "POST" });
-      }, "ghost"));
-      row.appendChild(acts);
-      hstack.appendChild(row);
-    }
-    box.appendChild(hstack);
-  }
   box.appendChild(stack);
-}
+  }
   box.appendChild(el("div", "section-title", "Paired devices"));
   const stack = el("div", "stack");
   if (!trustList.length) stack.appendChild(el("div", "empty", "No paired devices yet. Pair with a device from View Devices."));
@@ -1037,6 +1009,57 @@ function renderTransfersPage() {
     row.appendChild(acts);
     stack.appendChild(row);
   }
+  // Finished jobs (Done and Failed). These used to be computed but never shown,
+  // so completed and failed transfers were invisible on this page.
+  if (history.length) {
+    const hf = S.historyFilter || "all";
+    stack.appendChild(el("div", "section-title", "History"));
+    const filters = el("div", "form-row");
+    for (const [key, label] of [["all", "All"], ["sent", "Sent"], ["received", "Received"], ["failed", "Failed"]]) {
+      const b = el("button", "btn ghost" + (hf === key ? " active" : ""), label);
+      b.addEventListener("click", () => { S.historyFilter = key; renderTransfersPage(); });
+      filters.appendChild(b);
+    }
+    stack.appendChild(filters);
+    const list = history.filter((t) => {
+      if (hf === "sent") return t.direction === "push";
+      if (hf === "received") return t.direction === "download" || t.direction === "receive";
+      if (hf === "failed") return t.state === "Failed";
+      return true;
+    });
+    if (!list.length) stack.appendChild(el("div", "empty", "Nothing here."));
+    for (const t of list) {
+      const row = el("div", "row col");
+      const top = el("div", "row"); top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
+      const dir = t.direction === "push" ? "\u2191 Sent" : "\u2193 Received";
+      const name = t.share_label || (t.files && t.files[0] && t.files[0].local) || t.share_id || "transfer";
+      top.appendChild(el("div", "grow name", dir + " \u00b7 " + name));
+      top.appendChild(el("span", "badge " + stateClass(t.state), t.state));
+      row.appendChild(top);
+      const n = t.files_total || (t.files || []).length;
+      const meta = el("div", "meta");
+      meta.textContent = `${fmtBytes(t.total)} \u00b7 ${n} file${n === 1 ? "" : "s"}` +
+        (t.peer_name ? ` \u00b7 ${t.direction === "push" ? "to " : "from "}${t.peer_name}` : "") +
+        (t.finished_at ? ` \u00b7 ${fmtWhen(t.finished_at)}` : "");
+      row.appendChild(meta);
+      if (t.error) row.appendChild(el("div", "msg err", t.error));
+      const acts = el("div", "actions");
+      if (t.direction === "receive") {
+        acts.appendChild(btn("Open folder", () => fetch("/api/inbox/open", { method: "POST" }), "ghost"));
+      } else if (t.state === "Failed") {
+        acts.appendChild(btn("Resend", async () => {
+          const r = await fetch(`/api/transfers/${encodeURIComponent(t.id)}/retry`, { method: "POST" });
+          if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
+          toast("Resent.", "ok");
+        }));
+      }
+      acts.appendChild(btn("Remove", async () => {
+        await fetch(`/api/transfers/${encodeURIComponent(t.id)}/cancel`, { method: "POST" });
+      }, "ghost"));
+      row.appendChild(acts);
+      stack.appendChild(row);
+    }
+  }
   box.appendChild(stack);
 }
 function stateClass(state) {
@@ -1065,9 +1088,12 @@ function renderSettings(s) {
   const sound = checkInput(s.sound_on_complete, "set-sound");
   const notif = checkInput(s.notifications, "set-notif");
   const startup = checkInput(s.start_on_login, "set-startup");
-  const dl = textInput(s.default_download_folder, "set-dl");
-  const inbox = textInput(s.inbox_folder, "set-inbox"); inbox.placeholder = "default: ~/LANyard";
+  const dl = textInput(s.default_download_folder, "set-dl"); dl.readOnly = true; dl.placeholder = "Ask each time";
+  const dlWrap = withBrowse(dl, "Choose the default download folder");
+  dlWrap.appendChild(btn("Clear", () => { dl.value = ""; }, "ghost"));
+  const inbox = textInput(s.inbox_folder, "set-inbox"); inbox.readOnly = true; inbox.placeholder = "default: ~/LANyard";
   const inboxWrap = withBrowse(inbox, "Choose the Inbox folder");
+  inboxWrap.appendChild(btn("Use default", () => { inbox.value = ""; }, "ghost"));
   inboxWrap.appendChild(btn("Open folder", () => fetch("/api/inbox/open", { method: "POST" }), "ghost"));
   const tray = checkInput(s.minimize_to_tray, "set-tray");
   const bw = numberInput(s.bandwidth_limit_mbps || 0, "set-bw");
@@ -1082,7 +1108,7 @@ function renderSettings(s) {
   box.appendChild(settingsField("Show desktop notifications for pairing requests and finished transfers", notif));
   box.appendChild(settingsField("Start LANyard when I sign in", startup));
   if (s.tray_supported) box.appendChild(settingsField("Minimize to system tray (closing or minimizing hides the window; use the tray icon to reopen or quit)", tray));
-  box.appendChild(settingsField("Default download folder", withBrowse(dl, "Choose the default download folder")));
+  box.appendChild(settingsField("Default download folder", dlWrap));
   box.appendChild(settingsField("Inbox folder (pushes)", inboxWrap));
   box.appendChild(settingsField("Bandwidth limit (MB/s, 0 = unlimited)", bw));
   box.appendChild(settingsField("Peer port (restart to apply)", port));
@@ -1574,8 +1600,14 @@ async function mountDevice(deviceId, name) {
   let drive = "";
   const self = await (await fetch("/api/self")).json();
   if (self.os === "windows") {
-    const ans = prompt(`Drive letter for ${name || "this device"} (e.g. Z:).\nLeave empty to only get the address.`, "Z:");
-    if (ans === null) return; drive = ans;
+    let letters = [];
+    try { letters = (await (await fetch("/api/mounts/letters")).json()).letters || []; } catch (e) { }
+    const opts = letters.map((l) => ({ label: l, value: l }));
+    opts.push({ label: "Just the address (no drive)", value: "", ghost: true });
+    opts.push({ label: "Cancel", value: null, ghost: true });
+    const choice = await pickOption(`Choose a drive letter for ${name || "this device"}`, opts);
+    if (choice === null) return;
+    drive = choice || "";
   }
   const r = await fetch("/api/mounts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: deviceId, drive: drive.trim() }) });
   if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
@@ -1784,7 +1816,14 @@ $("nav-up").addEventListener("click", () => {
 });
 $("view-mode").addEventListener("click", () => { S.mode = S.mode === "grid" ? "list" : "grid"; renderExplorer(); });
 $("share-add").addEventListener("click", () => submitShare(false));
-$("share-path").addEventListener("keydown", (e) => { if (e.key === "Enter") submitShare(false); });
+$("share-browse-file").addEventListener("click", async () => {
+  const p = await pickPaths("files", "Choose a file to share");
+  if (p[0]) $("share-path").value = p[0];
+});
+$("share-browse-folder").addEventListener("click", async () => {
+  const p = await pickPaths("folder", "Choose a folder to share");
+  if (p[0]) $("share-path").value = p[0];
+});
 $("stop-all").addEventListener("click", async () => { if (!confirm("Stop every share now?")) return; await fetch("/api/shares/stop-all", { method: "POST" }); });
 $("clear-finished").addEventListener("click", () => fetch("/api/transfers/clear-history", { method: "POST" }));
 $("pair-close").addEventListener("click", closePair);
@@ -1797,7 +1836,7 @@ async function submitShare(confirmFlag) {
   const lifetime = $("share-lifetime").value;
   const body = { path: $("share-path").value.trim(), label: $("share-label").value.trim(), lifetime, seconds: parseInt(lifetime, 10) || 0, confirm: !!confirmFlag };
   const msg = $("share-msg");
-  if (!body.path) { msg.hidden = false; msg.textContent = "Enter a path to share."; return; }
+  if (!body.path) { msg.hidden = false; msg.textContent = "Choose a file or folder to share."; return; }
   msg.hidden = true;
   const r = await fetch("/api/shares", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (r.ok) { $("share-path").value = ""; $("share-label").value = ""; toast("Shared.", "ok"); return; }
