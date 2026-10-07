@@ -41,7 +41,7 @@ swift test
 On a Mac, the same command works, or open `Package.swift` in Xcode and run the
 `LanyardCoreTests` scheme.
 
-`swift test` on Linux currently runs **250 tests, 0 failures**.
+`swift test` on Linux currently runs **304 tests, 0 failures**.
 
 ## What was verified
 
@@ -66,8 +66,9 @@ On a Mac, the same command works, or open `Package.swift` in Xcode and run the
 | Certificate cross-check: `ios/fixtures/verify_cert.go` parses Swift's DER (`crosscheck.sh`); Swift parses and verifies a Go-generated cert | **Linux-tested** |
 | `LanyardNet`: Keychain identity storage, `SecIdentity` creation, `NWListener`/`NWConnection` TLS 1.3 mTLS, the verify-block pin, `NWBrowser` Bonjour, and the PeerClient/PeerServer adapters over the Phase 1b seams | **Written, not compiled — Apple-only; see [`SPIKE.md`](SPIKE.md)** |
 | Receive logic: `TransferManager` (states, `Interrupted`, `Dismiss`, clear history), `InboxDestination` (Documents/`LANyard` default, `name (1).ext`, writability refusal), `Authorizer` (per-request rules), `ServerLifecycle` (foreground/background) | **Linux-tested** |
-| SwiftUI app (`LanyardApp/`), the `UIDocumentPicker` bookmark adapter, the foreground/background lifecycle glue, `Info.plist` keys (`NSLocalNetworkUsageDescription`, `NSBonjourServices`, `UIFileSharingEnabled`, `LSSupportsOpeningDocumentsInPlace`), and `project.yml` | **Written, not compiled — iOS-only; see [`DESIGN.md`](DESIGN.md)** |
-| Discovery, pairing UI, push/send, share/serve, Troubleshoot, Share extension | **Written, not compiled — Phases 4–6** |
+| Discovery/pairing logic: `DiscoveryTxt` (Bonjour TXT + 16-hex short id, beacon), `Devices` (merge/self-filter/online-offline/last-seen/eviction), `PairFlow` (2-minute invite countdown, SAS confirm/decline, permissions, unpair, paste-a-link only) | **Linux-tested** |
+| SwiftUI app (`LanyardApp/`: Devices, Pair, SAS confirm, invite QR + countdown, Local Network permission screen), the AVFoundation QR scanner, the `NWBrowser`/beacon discovery wiring, the `UIDocumentPicker` adapter, the lifecycle glue, `Info.plist`, `project.yml` | **Written, not compiled — iOS-only; see [`DESIGN.md`](DESIGN.md)** |
+| Send/share, Troubleshoot, Share extension | **Written, not compiled — Phases 5–6** |
 
 ## Layout
 

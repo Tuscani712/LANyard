@@ -6,7 +6,7 @@ import Foundation
 /// nonce, and IP-literal host:port addresses. `build` leaves ':' and ',' unescaped
 /// in `addr` (both are legal in a query value and keep the link short); `parse`
 /// accepts both that form and a percent-encoded one.
-enum PairLink {
+public enum PairLink {
     static let SCHEME = "lanyard"
     static let HOST = "pair"
     static let MAX_LEN = 2048
@@ -23,17 +23,24 @@ enum PairLink {
         case malformed(String)
     }
 
-    struct Payload: Equatable {
-        let fingerprint: String
-        let name: String
-        let addrs: [String]
-        let nonce: String
+    public struct Payload: Equatable {
+        public let fingerprint: String
+        public let name: String
+        public let addrs: [String]
+        public let nonce: String
+
+        public init(fingerprint: String, name: String, addrs: [String], nonce: String) {
+            self.fingerprint = fingerprint
+            self.name = name
+            self.addrs = addrs
+            self.nonce = nonce
+        }
     }
 
     /// Renders `p` as a pairing link. The fingerprint and nonce are hex, so only
     /// the name is escaped. The addr value is left unescaped — ':' and ',' are
     /// legal in a query value; `parse` accepts both this form and an encoded one.
-    static func build(_ p: Payload) -> String {
+    public static func build(_ p: Payload) -> String {
         var out = "\(SCHEME)://\(HOST)?fp=\(p.fingerprint)"
         if !p.name.isEmpty {
             out += "&name=" + formEncode(p.name)
@@ -45,7 +52,7 @@ enum PairLink {
 
     /// Decodes a pairing link. It rejects anything malformed, any unexpected or
     /// duplicated parameter, oversized input, and too many addresses.
-    static func parse(_ raw: String) throws -> Payload {
+    public static func parse(_ raw: String) throws -> Payload {
         guard !raw.isEmpty, raw.count <= MAX_LEN else {
             throw ParseError.malformed("malformed pairing link")
         }

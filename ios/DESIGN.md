@@ -141,8 +141,18 @@ the rest is behind `LanyardNet` and is written, not compiled, until a Mac exists
     (`NSLocalNetworkUsageDescription`, `NSBonjourServices` = `_lanyard._tcp`,
     `UIFileSharingEnabled`, `LSSupportsOpeningDocumentsInPlace`), and
     `project.yml` (XcodeGen, every target).
-- **Phase 4 — discovery + pairing.** `NWBrowser` Bonjour + beacon, QR/link, SAS,
-  trust store, Local Network permission.
+- **Phase 4 — discovery + pairing.** *(delivered)*
+  - **Linux-tested:** `DiscoveryTxt` (Bonjour TXT parsing, the 16-hex short id,
+    the UDP beacon message), `Devices` (merge discovered + trust store + online
+    set, self-filter by fingerprint, Paired/Online/Offline, last-seen and
+    eviction), `PairFlow` (idle → generating → awaiting-confirmation → paired /
+    declined / expired, a **2-minute invite** with a countdown, SAS confirm /
+    decline, the permissions step, unpair, and manual add as **paste-a-link
+    only**). 304 tests, 0 failures.
+  - **Written, not compiled (iOS-only):** the SwiftUI `DevicesView` / `PairView`
+    (SAS grouped, permissions toggles, the invite **QR with a live countdown**),
+    the AVFoundation QR scanner, the Local Network permission screen, and the
+    `NWBrowser`/beacon wiring into `DevicesModel`.
 - **Phase 5 — push send + share/serve + Transfers screen.**
 - **Phase 6 — Settings + Troubleshoot log + Share extension.**
 

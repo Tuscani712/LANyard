@@ -30,6 +30,9 @@
 	<array>
 		<string>_lanyard._tcp</string>
 	</array>
+	<!-- The QR scanner (AVCaptureMetadataOutput) needs the camera. -->
+	<key>NSCameraUsageDescription</key>
+	<string>LANyard uses the camera only to scan a pairing QR code.</string>
 	<!-- Received files land in Documents/LANyard, visible in the Files app. -->
 	<key>UIFileSharingEnabled</key>
 	<true/>

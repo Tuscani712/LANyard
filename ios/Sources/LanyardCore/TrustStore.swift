@@ -1,7 +1,7 @@
 import Foundation
 
 /// Persists paired peers. Keyed by certificate fingerprint (lowercase hex).
-package protocol TrustStore {
+public protocol TrustStore {
     func list() -> [PairedPeer]
     func find(_ fingerprint: String) -> PairedPeer?
     func save(_ peer: PairedPeer)
