@@ -182,6 +182,45 @@ class InboxReceiverTest {
         }
     }
 
+    @Test
+    fun receiveCallbacksCarryThePushIdAndProgress() {
+        val offers = mutableListOf<String>()
+        val progress = mutableListOf<Long>()
+        val dones = mutableListOf<String>()
+        val r = InboxReceiver(
+            spoolRoot = spool,
+            destination = PushDestination { rel, _, _ -> rel },
+            freeBytes = { 1L shl 40 },
+            onOffer = { pushId, _, _, _ -> offers.add(pushId) },
+            onProgress = { _, done, _ -> progress.add(done) },
+            onDone = { pushId, _, _, _ -> dones.add(pushId) },
+        )
+        val o = r.offer("p", "P", listOf(req("a.bin", 4)), 0, 0)
+        r.writeChunk(o.pushId, "p", "a.bin", 0, byteArrayOf(1, 2, 3, 4).inputStream())
+        r.finish(o.pushId, "p")
+        assertEquals(listOf(o.pushId), offers)
+        assertEquals(listOf(o.pushId), dones)
+        assertTrue(progress.isNotEmpty() && progress.last() == 4L, "progress should report the bytes written: $progress")
+    }
+
+    @Test
+    fun clearAbandonedSpoolKeepsLivePartsAndDropsLeftovers() {
+        val r = receiver()
+        val o = r.offer("p", "P", listOf(req("live.bin", 10)), 0, 0)
+        r.writeChunk(o.pushId, "p", "live.bin", 0, byteArrayOf(1, 2, 3).inputStream())
+        // A leftover from a previous run (no in-memory session points at it).
+        val stray = java.io.File(spool, "old-peer/dead.bin.lanpart").apply { parentFile?.mkdirs(); writeText("junk") }
+
+        val removed = r.clearAbandonedSpool()
+
+        assertEquals(1, removed)
+        assertFalse(stray.exists(), "an abandoned spool part must be cleared")
+        assertTrue(
+            spool.walkTopDown().any { it.isFile && it.name == "live.bin.lanpart" },
+            "a part belonging to a live push must be kept",
+        )
+    }
+
     private fun genSha(total: Long): String {
         val md = MessageDigest.getInstance("SHA-256")
         GenInput(total).use { ins ->

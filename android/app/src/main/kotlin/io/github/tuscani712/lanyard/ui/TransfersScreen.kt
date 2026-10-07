@@ -54,13 +54,18 @@ fun TransfersScreen(padding: PaddingValues) {
 
     LazyColumn(modifier = Modifier.fillMaxSize().padding(padding)) {
         items(records, key = { it.id }) { record ->
-            TransferRow(record, settings.speedUnit, onCancel = { TransferManager.cancel(record.id) })
+            TransferRow(
+                record,
+                settings.speedUnit,
+                onCancel = { TransferManager.cancel(record.id) },
+                onDismiss = { TransferManager.dismiss(record.id) },
+            )
         }
     }
 }
 
 @Composable
-private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: () -> Unit) {
+private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: () -> Unit, onDismiss: () -> Unit) {
     Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -110,6 +115,11 @@ private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: 
                 Spacer(Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                     OutlinedButton(onClick = onCancel) { Text("Cancel") }
+                }
+            } else {
+                Spacer(Modifier.height(8.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    OutlinedButton(onClick = onDismiss) { Text("Dismiss") }
                 }
             }
         }

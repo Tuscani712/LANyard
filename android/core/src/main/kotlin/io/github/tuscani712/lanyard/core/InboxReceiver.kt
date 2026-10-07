@@ -48,8 +48,9 @@ class InboxReceiver(
     private val destination: PushDestination,
     private val freeBytes: () -> Long,
     private val onChange: () -> Unit = {},
-    private val onOffer: (peerFp: String, files: Int, total: Long) -> Unit = { _, _, _ -> },
-    private val onDone: (peerFp: String, files: Int, total: Long) -> Unit = { _, _, _ -> },
+    private val onOffer: (pushId: String, peerFp: String, files: Int, total: Long) -> Unit = { _, _, _, _ -> },
+    private val onProgress: (pushId: String, done: Long, total: Long) -> Unit = { _, _, _ -> },
+    private val onDone: (pushId: String, peerFp: String, files: Int, total: Long) -> Unit = { _, _, _, _ -> },
     private val clock: () -> Long = System::currentTimeMillis,
     // Whether a verified file can actually be saved right now (a download folder
     // is set and writable). When false, an offer is refused up front with a clear
@@ -125,7 +126,7 @@ class InboxReceiver(
         val sess = Session(id, peerFp, Display.safeName(peerName), files, total, clock())
         sessions[id] = sess
         onChange()
-        onOffer(peerFp, files.size, total)
+        onOffer(id, peerFp, files.size, total)
         val offsets = files.mapValues { it.value.done }
         return PushOffer(id, true, if (maxBytes > 0) maxBytes else 0, offsets)
     }
@@ -181,7 +182,7 @@ class InboxReceiver(
         val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
         for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
         onChange()
-        onDone(peerFp, s.files.size, s.total)
+        onDone(id, peerFp, s.files.size, s.total)
         return true
     }
 
@@ -211,6 +212,25 @@ class InboxReceiver(
     /** True when a partial spool file exists (an interrupted receive to resume). */
     fun hasPartialSpool(): Boolean =
         spoolRoot.isDirectory && spoolRoot.walkTopDown().any { it.isFile && it.name.endsWith(".lanpart") }
+
+    /**
+     * Deletes spool parts that belong to no in-memory push (leftovers from a
+     * previous run). A push still in progress in this process is kept, so
+     * acknowledging an interruption never corrupts a live transfer. Returns how
+     * many were removed.
+     */
+    @Synchronized
+    fun clearAbandonedSpool(): Int {
+        if (!spoolRoot.isDirectory) return 0
+        val active = sessions.values
+            .flatMap { s -> s.files.values.map { it.part.absolutePath } }
+            .toSet()
+        val abandoned = spoolRoot.walkTopDown()
+            .filter { it.isFile && it.name.endsWith(".lanpart") && it.absolutePath !in active }
+            .toList()
+        abandoned.forEach { it.delete() }
+        return abandoned.size
+    }
 
     /** Deletes spool files older than the TTL (an abandoned push). */
     fun sweepStale(ttlMillis: Long = 24 * 60 * 60 * 1000) {
@@ -249,6 +269,7 @@ class InboxReceiver(
                 digest.update(buf, 0, n)
                 written += n
                 synchronized(this) { st.done = offset + written }
+                onProgress(s.id, offset + written, st.size)
             }
             if (written >= limit && input.read() >= 0) {
                 // One byte past the offered size: truncate the part and refuse.

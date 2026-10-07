@@ -21,6 +21,7 @@ import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.net.AndroidMeteredNetwork
 import io.github.tuscani712.lanyard.net.NetAddrs
 import io.github.tuscani712.lanyard.net.NsdAdvertiser
+import io.github.tuscani712.lanyard.transfer.TransferManager
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -108,6 +109,11 @@ object PeerService {
             destination = destination,
             freeBytes = { spoolDir.usableSpace },
             onChange = { publish() },
+            onOffer = { pushId, fp, files, total ->
+                TransferManager.noteReceiveStarted(pushId, trustStore.find(fp)?.name?.takeIf { it.isNotBlank() } ?: "A device", fp, "Inbox", total)
+            },
+            onProgress = { pushId, done, total -> TransferManager.noteReceiveProgress(pushId, done, total) },
+            onDone = { pushId, _, files, _ -> TransferManager.noteReceiveDone(pushId, "Received $files file(s)") },
             destinationReady = ready@{
                 val uri = SettingsHolder.settings.value.downloadFolder?.let { Uri.parse(it) } ?: return@ready false
                 runCatching { DocumentFile.fromTreeUri(app, uri)?.canWrite() == true }.getOrDefault(false)
@@ -176,6 +182,10 @@ object PeerService {
     }
 
     fun dismissInterrupted() {
+        // Acknowledge the interruption: drop the abandoned spool so the dialog
+        // does not return on the next launch. Parts of a push still running in
+        // this process are kept.
+        receiver.clearAbandonedSpool()
         _interrupted.value = false
     }
 

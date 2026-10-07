@@ -180,6 +180,32 @@ object TransferManager {
         return id
     }
 
+    // --- received pushes (this phone is the receiver) ---
+    // A push from a peer is recorded here so it shows on the Transfers screen
+    // like any other transfer. A receive left Running when the app restarts is
+    // turned into a Failed "Interrupted" row by loadHistory().
+
+    fun noteReceiveStarted(id: String, peerName: String, peerFp: String, label: String, total: Long) {
+        if (_state.value.any { it.id == id }) return
+        add(TransferRecord(id, "receive", peerName, peerFp, label, total, 0, TransferState.Running, null, 0.0, now()))
+    }
+
+    fun noteReceiveProgress(id: String, done: Long, total: Long) {
+        if (_state.value.none { it.id == id }) return
+        update(id) { it.copy(done = maxOf(done, it.done), total = maxOf(total, it.total), speed = sampleSpeed(id, done)) }
+    }
+
+    fun noteReceiveDone(id: String, message: String) {
+        if (_state.value.none { it.id == id }) return
+        complete(id, message)
+    }
+
+    /** Removes a finished (Done/Failed/Cancelled) row from the list. */
+    fun dismiss(id: String) {
+        _state.value = _state.value.filterNot { it.id == id }
+        persist()
+    }
+
     private suspend fun runSnippet(id: String, peer: PairedPeer, text: String) {
         val identity = IdentityHolder.identity ?: return fail(id, "no identity on this device")
         setState(id, TransferState.Running)
