@@ -73,6 +73,17 @@ internal class GoPeer(bin: String) : AutoCloseable {
     /** A file the receiver has finalized in its Inbox, or a not-yet-existing path. */
     fun inboxFile(name: String): File = File(File(dataDir, "Inbox"), name)
 
+    /**
+     * Adds a peer by address through the UI API (the manual "add device" path).
+     * With [fingerprint] set the presented certificate must match it before the
+     * peer is accepted. Returns the peer record (`verified`, `name`, ...).
+     */
+    fun addPeer(address: String, fingerprint: String = ""): JsonObject =
+        ui.post(
+            "/api/peers/add",
+            """{"address":${quote(address)},"fingerprint":${quote(fingerprint)}}""",
+        ).asJsonObject
+
     /** The devices this peer currently trusts (its paired list). */
     fun pairedDevices(): List<JsonObject> =
         ui.get("/api/trust").asJsonArray.map { it.asJsonObject }

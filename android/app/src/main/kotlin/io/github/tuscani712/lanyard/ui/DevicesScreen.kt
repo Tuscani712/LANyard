@@ -347,6 +347,11 @@ private fun PairCodeDialog(link: String?, onDismiss: () -> Unit) {
                         style = MaterialTheme.typography.bodyMedium,
                     )
                     Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Pairing from this code is not available yet. For now, scan the other device's code from this phone.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(8.dp))
                     Text(link, style = MaterialTheme.typography.bodySmall, maxLines = 5)
                     Spacer(Modifier.height(8.dp))
                     TextButton(onClick = { clipboard.setText(AnnotatedString(link)) }) { Text("Copy link") }

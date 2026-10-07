@@ -77,24 +77,37 @@ data class DevicesUiState(
 
 /**
  * State and network work for the Devices tab. All blocking IO and TLS runs on
- * [Dispatchers.IO]; cancellation is tied to the ViewModel's lifetime. mDNS is
- * released whenever [stopNearby] is called (the screen leaving composition).
+ * [Dispatchers.IO]; cancellation is tied to the ViewModel's lifetime.
+ *
+ * Discovery lifecycle: mDNS browsing ([discovery]), mDNS advertising
+ * ([advertiser]) and the `/hello` responder ([helloServer]) all run only while
+ * the Devices screen is showing — they are started together in [startNearby]
+ * (from the screen entering composition) and stopped together in [stopNearby]
+ * (the screen leaving composition, or [onCleared]). Nothing advertises or
+ * listens in the background, so the port is free whenever this screen is not
+ * visible. [stopNearby] stops all three and resets [advertisePort], which frees
+ * the ephemeral port the server had bound.
  */
 class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     private val store: TrustStore = JsonFileTrustStore(File(app.filesDir, "trust/peers.json"))
     private val discovery = NsdDiscovery(app)
     private val advertiser = NsdAdvertiser(app)
-    private val helloServer = PeerHelloServer { boundPort ->
+    // Read the app version rather than hardcoding it: the About screen was fixed
+    // to do the same, so /hello must not drift when the version bumps.
+    private val appVersion: String = runCatching {
+        app.packageManager.getPackageInfo(app.packageName, 0).versionName
+    }.getOrNull().orEmpty()
+    private val helloServer = PeerHelloServer(hello = { boundPort ->
         val id = IdentityHolder.identity
         JsonObject().apply {
             addProperty("device_id", id?.deviceId?.take(16) ?: "")
             addProperty("fingerprint", id?.deviceId ?: "")
             addProperty("name", IdentityHolder.deviceName)
             addProperty("os", "android")
-            addProperty("version", "0.1.0-beta.3")
+            addProperty("version", appVersion)
             addProperty("port", boundPort)
         }
-    }
+    })
 
     // The port this device advertises and answers /hello on (0 when not serving).
     @Volatile
@@ -131,6 +144,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         startAdvertise()
     }
 
+    /** Stops mDNS browsing, mDNS advertising and the `/hello` server, freeing the port. */
     fun stopNearby() {
         discovery.stop()
         advertiser.stop()
@@ -141,6 +155,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     // Advertises this device over mDNS and answers the desktop's /hello probe,
     // so it is listed as a verified nearby device. Pairing and transfers are a
     // later milestone; without the responder the peer is dropped as unverified.
+    // Only called while the Devices screen is showing (see the class KDoc).
     private fun startAdvertise() {
         val id = IdentityHolder.identity ?: return
         val short = id.deviceId.take(16)
