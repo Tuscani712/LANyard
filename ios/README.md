@@ -60,22 +60,26 @@ On a Mac, the same command works, or open `Package.swift` in Xcode and run the
 | `PairingFlow` / `PairingSessions` state machines (behind a transport/clock seam) | **Linux-tested** |
 | `PushSession` / `DownloadSession` state machines (behind a transport/sink seam) | **Linux-tested** |
 | QR round-trip | **Partial** — link build/parse/fingerprint tested; the ZXing render/decode path has no Swift/Linux equivalent and is a Mac-only concern |
-| `NWListener`/`NWConnection` mTLS, `SecIdentity`, X.509 builder, verify-block pinning; the concrete TLS/socket transport behind the seams | **Written, not compiled — Phase 2** |
+| Ed25519 self-signed X.509 certificate builder (`swift-asn1` + swift-crypto, never Security) | **Linux-tested** |
+| Certificate cross-check: `ios/fixtures/verify_cert.go` parses Swift's DER (`crosscheck.sh`); Swift parses and verifies a Go-generated cert | **Linux-tested** |
+| `LanyardNet`: Keychain identity storage, `SecIdentity` creation, `NWListener`/`NWConnection` TLS 1.3 mTLS, the verify-block pin, `NWBrowser` Bonjour, and the PeerClient/PeerServer adapters over the Phase 1b seams | **Written, not compiled — Apple-only; see [`SPIKE.md`](SPIKE.md)** |
 | Discovery, pairing UI, push receive/send, share/serve, Transfers, Settings, Troubleshoot, Share extension | **Written, not compiled — Phases 3–6** |
 
 ## Layout
 
 ```
 ios/
-  Package.swift            SwiftPM package: LanyardCore + tests
+  Package.swift            SwiftPM package: LanyardCore, LanyardNet, certgen
   DESIGN.md                design of record
+  SPIKE.md                 first-Mac checklist (Ed25519 client cert, etc.)
   fixtures/generate.go     generates the Go cross-implementation fixtures
+  fixtures/generate_cert.go  generates the Go certificate fixture
+  fixtures/verify_cert.go  parses Swift's cert DER (used by crosscheck.sh)
+  fixtures/crosscheck.sh   Swift -> Go certificate cross-check
   Sources/LanyardCore/     pure protocol logic (Linux-testable)
+  Sources/LanyardNet/      Apple-only layer   (guarded; written, not compiled)
+  Sources/certgen/         tiny helper that emits a cert DER for the cross-check
   Tests/LanyardCoreTests/  ported Kotlin tests + generated Go fixtures
-  LanyardNet/              Apple-only shim            (Phase 2)
-  LanyardApp/              SwiftUI app                (Phase 2+)
-  LanyardShareExtension/   share extension            (Phase 6)
-  project.yml              XcodeGen spec              (Phase 2)
 ```
 
 ### Regenerating the Go fixtures
@@ -85,4 +89,20 @@ typed by hand:
 
 ```sh
 go run ios/fixtures/generate.go > ios/Tests/LanyardCoreTests/GoFixtures.generated.swift
+go run ios/fixtures/generate_cert.go > ios/Tests/LanyardCoreTests/GoCert.generated.swift
 ```
+
+### Certificate cross-check (Linux)
+
+The X.509 builder is verified in both directions without a Mac:
+
+```sh
+bash ios/fixtures/crosscheck.sh     # Swift builds a DER; Go parses and validates it
+```
+
+`crosscheck.sh` runs `swift run certgen <seed>`, pipes the DER into
+`go run ios/fixtures/verify_cert.go -`, and fails unless Go's
+`x509.ParseCertificate` confirms the Ed25519 signature, the SPKI fingerprint,
+the subject, the validity window, and both client and server `ExtKeyUsage`. In
+the other direction, `GoCertCrossCheckTests` parses a Go-generated certificate
+and verifies its SPKI hash and signature. No expected value is hand-typed.

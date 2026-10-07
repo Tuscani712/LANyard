@@ -118,10 +118,17 @@ the rest is behind `LanyardNet` and is written, not compiled, until a Mac exists
     `PairingFlow`/`PairingSessions`, and the `PushSession`/`DownloadSession`
     state machines, each behind a small transport/clock seam. The concrete
     transport (TLS/sockets) is Phase 2.
-- **Phase 2 — `LanyardNet` identity + TLS spike (Mac, written-not-compiled).**
-  Ed25519 self-signed cert builder, Keychain `SecIdentity`, `NWConnection`/
-  `NWListener` mTLS, verify-block pinning, the fingerprint-parity test, and the
-  Ed25519-client-cert handshake spike against Go. Go/no-go on the P-256 fallback.
+- **Phase 2 — `LanyardNet` identity + TLS layer.** *(delivered)*
+  - **Linux-tested:** the Ed25519 self-signed X.509 certificate builder
+    (`swift-asn1` + swift-crypto, no Security), verified in both directions
+    against Go — `ios/fixtures/verify_cert.go` parses Swift's DER
+    (`crosscheck.sh`), and Swift parses and verifies a Go-generated certificate.
+  - **Written, not compiled (Apple-only):** Keychain identity storage,
+    `SecIdentity` creation, `NWListener`/`NWConnection` TLS 1.3 mTLS, the
+    verify-block pin, `NWBrowser` Bonjour, and the `PeerClient`/`PeerServer`
+    adapters over the Phase 1b seams, all in the `LanyardNet` target behind
+    `#if canImport(Network)`/`#if canImport(Security)`. First-Mac checklist in
+    [`SPIKE.md`](SPIKE.md). Go/no-go on the P-256 fallback comes out of step 1.
 - **Phase 3 — push receive.** Listener, offer/approval, spool, Documents
   destination + Files-app visibility.
 - **Phase 4 — discovery + pairing.** `NWBrowser` Bonjour + beacon, QR/link, SAS,
