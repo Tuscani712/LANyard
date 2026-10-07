@@ -219,3 +219,11 @@ Received pushes go to the Inbox folder, by default `Inbox` inside that folder.
 * Desktop notifications are Linux-only for now (Windows toasts are not wired up). Text snippets and QR pairing have
   been exercised on one computer (two instances) but not yet across two physical machines.
 * There is no mobile app yet; the pairing link is designed so that a phone app can scan it.
+
+## License
+
+LANyard is licensed under the **GNU Affero General Public License, version 3.0
+(AGPL-3.0)**. You may use and modify it freely. If you distribute it, or run a
+modified version as a network service, you must release your source under the
+same license. See `LICENSE` for the full text, `NOTICE` for the copyright line
+and `TRADEMARK.md` for the name and logo.
