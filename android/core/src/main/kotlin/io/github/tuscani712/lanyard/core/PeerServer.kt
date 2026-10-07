@@ -254,7 +254,7 @@ class PeerServer(
                 // reused; a small request can.
                 val mustClose = closing || fileBody
                 respond(out, 500, errorJson("could not save the file on this device"), mustClose)
-                diag("resp 500 ${head.method} ${reqLabel(head)} (${e.javaClass.simpleName})")
+                diag("resp 500 ${head.method} ${reqLabel(head)} (${e.javaClass.simpleName}: ${e.message?.take(160)})")
                 if (mustClose) return "handler-error"
             }
             if (closing) return "close-requested"

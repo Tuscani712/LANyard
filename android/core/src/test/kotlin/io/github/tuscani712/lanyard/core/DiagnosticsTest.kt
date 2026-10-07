@@ -220,4 +220,14 @@ class DiagnosticsTest {
         assertTrue(d.snapshot().last().endsWith("event-4"))
         assertFalse(d.snapshot().any { it.endsWith("event-1") })
     }
+
+    @Test
+    fun redactionRemovesAbsolutePathsButKeepsReasons() {
+        val out = Redaction.redact(
+            "resp 500 PUT /file (IOException: Could not write /data/user/0/app/files/spool/p_1/note.txt)",
+        )
+        assertFalse(out.contains("/data/user/0"))
+        assertFalse(out.contains("note.txt"))
+        assertTrue(out.contains("IOException"))
+    }
 }

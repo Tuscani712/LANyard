@@ -23,7 +23,7 @@ import javax.net.ssl.SSLSocket
  */
 class PeerServerTask30Test {
 
-    private class Phone(destination: PushDestination) : AutoCloseable {
+    private class Phone(destination: PushDestination, destinationReady: () -> Boolean = { true }) : AutoCloseable {
         val identity: Identity = Identity.generate("Pixel 8 Pro")
         private val trustFile = Files.createTempFile("lanyard-trust", ".json").toFile().also { it.delete() }
         val trust: TrustStore = JsonFileTrustStore(trustFile)
@@ -33,6 +33,7 @@ class PeerServerTask30Test {
             spoolRoot = spool,
             destination = destination,
             freeBytes = { 1L shl 40 },
+            destinationReady = destinationReady,
         )
         private val server = PeerServer(
             sessions = sessions,
@@ -172,6 +173,23 @@ class PeerServerTask30Test {
             // Before the fix the server closed the socket here and the client saw
             // a bare EOF (error("connection closed before a status line")).
             assertEquals(500, put.code)
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun destinationUnavailableIsRefusedAtOfferWithAClearReason() {
+        // The real cause on the phone: no usable download folder, so every save
+        // would fail. The offer must be refused up front with a reason, not
+        // accepted and then dropped mid-transfer.
+        Phone(PushDestination { rel, _, _ -> rel }, destinationReady = { false }).use { phone ->
+            val client = Identity.generate("Desktop")
+            phone.pair(client.deviceId)
+            val http = connect(client, phone)
+
+            val offer = http.send("POST", "/api/v1/push/offer", mapOf("Content-Type" to "application/json"), offerBody("note.txt", 5))
+            assertEquals(503, offer.code, "an offer that cannot be saved must be refused clearly (got ${offer.code}: ${offer.body})")
+            assertTrue(offer.body.contains("download folder"), "the reason should mention the download folder: ${offer.body}")
         }
     }
 }

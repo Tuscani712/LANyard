@@ -2,6 +2,7 @@ package io.github.tuscani712.lanyard
 
 import android.content.Context
 import android.net.Uri
+import androidx.documentfile.provider.DocumentFile
 import com.google.gson.JsonObject
 import io.github.tuscani712.lanyard.core.ApprovalOutcome
 import io.github.tuscani712.lanyard.core.Display
@@ -107,6 +108,10 @@ object PeerService {
             destination = destination,
             freeBytes = { spoolDir.usableSpace },
             onChange = { publish() },
+            destinationReady = ready@{
+                val uri = SettingsHolder.settings.value.downloadFolder?.let { Uri.parse(it) } ?: return@ready false
+                runCatching { DocumentFile.fromTreeUri(app, uri)?.canWrite() == true }.getOrDefault(false)
+            },
         )
         shareStore = ShareStore(app)
         shareSource = SafShareSource(app, shareStore)

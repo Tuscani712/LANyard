@@ -225,10 +225,13 @@ object Redaction {
     private val urlSecret = Regex("([?&](?:t|token|nonce|invite|n)=)[^&\\s]+")
     private val hex64 = Regex("(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])")
     private val ipv4 = Regex("\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b")
+    // An absolute path under a well-known root (a message can name a file location).
+    private val absPath = Regex("/(?:data|storage|sdcard|system|home|users|tmp|private|var|mnt|cache)/[\\w./\\-]+")
 
     fun redact(text: String): String = text
         .replace(inviteLink, "lanyard://pair?<redacted>")
         .replace(urlSecret) { "${it.groupValues[1]}<redacted>" }
         .replace(hex64) { it.value.take(8) }
         .replace(ipv4, "<ip>")
+        .replace(absPath, "<path>")
 }

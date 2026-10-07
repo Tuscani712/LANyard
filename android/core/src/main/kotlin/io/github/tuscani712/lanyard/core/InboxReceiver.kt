@@ -51,6 +51,10 @@ class InboxReceiver(
     private val onOffer: (peerFp: String, files: Int, total: Long) -> Unit = { _, _, _ -> },
     private val onDone: (peerFp: String, files: Int, total: Long) -> Unit = { _, _, _ -> },
     private val clock: () -> Long = System::currentTimeMillis,
+    // Whether a verified file can actually be saved right now (a download folder
+    // is set and writable). When false, an offer is refused up front with a clear
+    // reason instead of being accepted and failing later mid-transfer (Task 30).
+    private val destinationReady: () -> Boolean = { true },
 ) {
     class Session(
         val id: String,
@@ -74,6 +78,9 @@ class InboxReceiver(
         maxBytes: Long,
     ): PushOffer {
         if (reqs.isEmpty()) throw PeerHttpException(400, "no files")
+        if (!destinationReady()) {
+            throw PeerHttpException(503, "This phone needs a download folder set in Settings before it can receive files.")
+        }
         if (reqs.size > PushProtocol.MAX_OFFER_FILES) {
             throw PeerHttpException(413, "too many files in one push")
         }
