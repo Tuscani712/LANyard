@@ -19,8 +19,8 @@ import javax.net.ssl.SSLSocket
 class PeerServerTest {
 
     private class Harness(
-        deadlineMs: Long = 15_000,
         timeoutMs: Int = 5_000,
+        idleMs: Int = 5_000,
         maxReq: Int = 10,
         maxBody: Int = 64 * 1024,
         selfFpOverride: (() -> String)? = null,
@@ -29,11 +29,17 @@ class PeerServerTest {
         private val trustFile = File.createTempFile("lanyard-trust", ".json").also { it.delete() }
         val trust: TrustStore = JsonFileTrustStore(trustFile)
         val invites = PairInvites()
+        private val spool = File.createTempFile("spool", ".d").let { it.delete(); it.mkdirs(); it }
         val sessions = PairingSessions(selfFp = selfFpOverride ?: { identity.deviceId }, trust = trust)
+        private val receiver = InboxReceiver(spool, PushDestination { _, _, _ -> "x" }, { Long.MAX_VALUE })
         private val server = PeerServer(
-            sessions, trust, invites,
-            connectionTimeoutMillis = timeoutMs,
-            connectionDeadlineMillis = deadlineMs,
+            sessions, receiver, invites,
+            isPaired = { trust.find(it) },
+            onUnpair = { trust.remove(it) },
+            headerTimeoutMillis = timeoutMs,
+            stallTimeoutMillis = timeoutMs,
+            idleTimeoutMillis = idleMs,
+            maxRequestsPerConnection = 64,
             maxSessionRequestsPerMinute = maxReq,
             maxBodyBytes = maxBody,
         )
@@ -44,6 +50,11 @@ class PeerServerTest {
             }
         }
 
+        /** Paired with push permission, for the push-endpoint tests. */
+        fun selfPair() {
+            trust.save(PairedPeer(identity.deviceId, "Self", "127.0.0.1", 1, browse = true, push = true, pairedAt = 0))
+        }
+
         fun request(client: Identity, raw: String): String {
             val factory = Tls.socketFactory(client, identity.deviceId)
             factory.createSocket("127.0.0.1", port).use { rawSocket ->
@@ -51,8 +62,36 @@ class PeerServerTest {
                 s.startHandshake()
                 s.outputStream.write(raw.toByteArray())
                 s.outputStream.flush()
-                return s.inputStream.readBytes().toString(Charsets.UTF_8)
+                return readOneResponse(s.inputStream)
             }
+        }
+
+        private fun readOneResponse(input: java.io.InputStream): String {
+            val head = StringBuilder()
+            var state = 0
+            while (true) {
+                val b = input.read()
+                if (b < 0) break
+                head.append(b.toChar())
+                state = when {
+                    state == 0 && b.toChar() == '\r' -> 1
+                    state == 1 && b.toChar() == '\n' -> 2
+                    state == 2 && b.toChar() == '\r' -> 3
+                    state == 3 && b.toChar() == '\n' -> 4
+                    else -> 0
+                }
+                if (state == 4) break
+            }
+            val text = head.toString()
+            val len = Regex("(?i)content-length:\\s*(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val body = ByteArray(len)
+            var off = 0
+            while (off < len) {
+                val n = input.read(body, off, len - off)
+                if (n < 0) break
+                off += n
+            }
+            return text + String(body, Charsets.UTF_8)
         }
 
         override fun close() = server.stop()
@@ -157,6 +196,70 @@ class PeerServerTest {
                 post("/api/v1/session/request", sessionBody(invite = "deadbeef")),
             )
             assertEquals(403, status(bogus))
+        }
+    }
+
+    private fun offer(h: Harness, size: Int = 4): String {
+        val body = """{"files":[{"rel_path":"a.bin","size":$size}],"total_bytes":$size}"""
+        val resp = h.request(h.identity, post("/api/v1/push/offer", body))
+        assertEquals(200, status(resp), resp)
+        return JsonParser.parseString(body(resp)).asJsonObject.get("push_id").asString
+    }
+
+    private fun chunkedPut(id: String, encoded: String): String =
+        "PUT /api/v1/push/$id/file?path=a.bin HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n$encoded"
+
+    @Test
+    @Timeout(60)
+    fun contentLengthLongerThanOfferedIsRefused() {
+        Harness().use { h ->
+            h.selfPair()
+            val id = offer(h, 4)
+            val raw = "PUT /api/v1/push/$id/file?path=a.bin HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n" + "A".repeat(100)
+            assertEquals(400, status(h.request(h.identity, raw)))
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun chunkedBodyLongerThanOfferedIsStoppedAtTheCap() {
+        Harness().use { h ->
+            h.selfPair()
+            val id = offer(h, 4)
+            // one 100-byte chunk for a 4-byte file
+            val encoded = "64\r\n" + "A".repeat(100) + "\r\n0\r\n\r\n"
+            assertEquals(400, status(h.request(h.identity, chunkedPut(id, encoded))))
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun oversizedChunkSizeLineIsRefused() {
+        Harness().use { h ->
+            h.selfPair()
+            val id = offer(h, 4)
+            assertEquals(400, status(h.request(h.identity, chunkedPut(id, "A".repeat(300) + "\r\n"))))
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun tooManyTrailersIsRefused() {
+        Harness().use { h ->
+            h.selfPair()
+            val id = offer(h, 4)
+            val encoded = "0\r\n" + "X: y\r\n".repeat(40) + "\r\n"
+            assertEquals(400, status(h.request(h.identity, chunkedPut(id, encoded))))
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun badChunkTerminatorIsRefused() {
+        Harness().use { h ->
+            h.selfPair()
+            val id = offer(h, 4)
+            assertEquals(400, status(h.request(h.identity, chunkedPut(id, "4\r\nABCDXX"))))
         }
     }
 
@@ -268,7 +371,7 @@ class PeerServerTest {
     @Test
     @Timeout(60)
     fun wholeConnectionDeadlineClosesADribbler() {
-        Harness(deadlineMs = 800, timeoutMs = 5_000).use { h ->
+        Harness(idleMs = 800, timeoutMs = 5_000).use { h ->
             val start = System.currentTimeMillis()
             runCatching {
                 val factory = Tls.socketFactory(h.identity, h.identity.deviceId)

@@ -17,6 +17,11 @@ data class PairedPeer(
     val browse: Boolean,
     val push: Boolean,
     val pairedAt: Long,
+    // Permissions for files we receive from this peer. Both default to 0 for
+    // peers.json written before these fields existed; 0 means "no limit / no
+    // ask", which is the safe, non-surprising default for an old entry.
+    val pushMaxBytes: Long = 0,
+    val askOver: Long = 0,
 )
 
 /** Persists paired peers. Keyed by certificate fingerprint (lowercase hex). */

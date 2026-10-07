@@ -79,6 +79,23 @@ internal class GoPeer(bin: String) : AutoCloseable {
     /** A file the receiver has finalized in its Inbox, or a not-yet-existing path. */
     fun inboxFile(name: String): File = File(File(dataDir, "Inbox"), name)
 
+    /** Pushes local files/folders to [deviceFp] through the UI API. */
+    fun push(deviceFp: String, paths: List<String>): JsonObject =
+        ui.post("/api/push", """{"device":${quote(deviceFp)},"paths":${com.google.gson.Gson().toJson(paths)}}""").asJsonObject
+
+    /** Blocks until the push job [id] is Done or Failed; returns the state. */
+    fun waitPush(id: String, timeoutMs: Long = 120_000): String {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val job = ui.get("/api/transfers").asJsonArray.map { it.asJsonObject }.firstOrNull { it.str("id") == id }
+            val state = job?.str("state") ?: ""
+            if (state == "Done") return state
+            if (state == "Failed") return "Failed: " + (job?.str("error") ?: "?")
+            Thread.sleep(50)
+        }
+        return "timeout"
+    }
+
     /** This desktop's fingerprint. */
     fun fingerprint(): String = pairPayload().str("fp")
 

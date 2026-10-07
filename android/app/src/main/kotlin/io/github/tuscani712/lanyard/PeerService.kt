@@ -1,60 +1,99 @@
 package io.github.tuscani712.lanyard
 
 import android.content.Context
+import android.net.Uri
 import com.google.gson.JsonObject
+import io.github.tuscani712.lanyard.core.ApprovalOutcome
+import io.github.tuscani712.lanyard.core.Display
 import io.github.tuscani712.lanyard.core.Identity
+import io.github.tuscani712.lanyard.core.InboxReceiver
 import io.github.tuscani712.lanyard.core.IncomingRequest
 import io.github.tuscani712.lanyard.core.JsonFileTrustStore
 import io.github.tuscani712.lanyard.core.PairInvites
 import io.github.tuscani712.lanyard.core.PairLink
 import io.github.tuscani712.lanyard.core.PairingSessions
 import io.github.tuscani712.lanyard.core.PeerServer
+import io.github.tuscani712.lanyard.core.PushApproval
 import io.github.tuscani712.lanyard.core.TrustStore
+import io.github.tuscani712.lanyard.net.AndroidMeteredNetwork
 import io.github.tuscani712.lanyard.net.NetAddrs
 import io.github.tuscani712.lanyard.net.NsdAdvertiser
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
+import java.util.UUID
+
+/** A push from a paired peer waiting for the person to accept or decline. */
+data class PushApprovalRequest(
+    val id: String,
+    val peerName: String,
+    val files: Int,
+    val total: Long,
+    val names: List<String>,
+)
 
 /**
  * The app-scoped home of the phone-side peer server and the shared trust store.
  *
- * Lifetime: [start] is called while the app is in the foreground (any screen)
- * and [stop] when it is backgrounded, so the phone is discoverable and online
- * to a desktop on any screen, and offline when the app is not showing. There is
- * deliberately no background service in this milestone.
- *
- * It also owns the one-time QR invites and the incoming pairing prompts, and
- * exposes them as [pending] for the global accept/decline dialog.
+ * Lifetime: [start] while the app is foregrounded (any screen), [stop] when it is
+ * backgrounded. It owns the `/hello` responder, pairing (C1) and the receive
+ * side of pushes (C2a), plus the one-time QR invites and the pending prompts.
  */
 object PeerService {
     private var initialized = false
     private lateinit var trustStore: TrustStore
     private lateinit var sessionStore: PairingSessions
     private lateinit var inviteStore: PairInvites
+    private lateinit var receiver: InboxReceiver
+    private lateinit var spoolDir: File
     private var server: PeerServer? = null
     private var advertiser: NsdAdvertiser? = null
     private var appVersion: String = ""
     private var currentInvite: PairInvites.Invite? = null
+    private var metered: AndroidMeteredNetwork? = null
 
     private val _pending = MutableStateFlow<List<IncomingRequest>>(emptyList())
     val pending: StateFlow<List<IncomingRequest>> = _pending.asStateFlow()
+
+    private val _approval = MutableStateFlow<PushApprovalRequest?>(null)
+    val approval: StateFlow<PushApprovalRequest?> = _approval.asStateFlow()
+
+    private val _interrupted = MutableStateFlow(false)
+    val interrupted: StateFlow<Boolean> = _interrupted.asStateFlow()
+
+    private val approvalLock = Any()
+    private var approvalWaiter: CompletableDeferred<Boolean>? = null
 
     /** The shared paired-peer store (also used by the Devices screen). */
     val trust: TrustStore get() = trustStore
 
     fun init(context: Context) {
         if (initialized) return
-        trustStore = JsonFileTrustStore(File(context.filesDir, "trust/peers.json"))
+        val app = context.applicationContext
+        trustStore = JsonFileTrustStore(File(app.filesDir, "trust/peers.json"))
         sessionStore = PairingSessions(
             selfFp = { IdentityHolder.identity?.deviceId.orEmpty() },
             trust = trustStore,
             onChange = { publish() },
         )
         inviteStore = PairInvites()
+        spoolDir = File(app.filesDir, "spool").apply { mkdirs() }
+        val destination = SafInboxDestination(app) {
+            SettingsHolder.settings.value.downloadFolder?.let { Uri.parse(it) }
+        }
+        receiver = InboxReceiver(
+            spoolRoot = spoolDir,
+            destination = destination,
+            freeBytes = { spoolDir.usableSpace },
+            onChange = { publish() },
+        )
+        metered = AndroidMeteredNetwork(app)
         appVersion = runCatching {
-            context.packageManager.getPackageInfo(context.packageName, 0).versionName
+            app.packageManager.getPackageInfo(app.packageName, 0).versionName
         }.getOrNull().orEmpty()
         initialized = true
     }
@@ -64,17 +103,27 @@ object PeerService {
         if (!initialized) init(context)
         if (server != null) return
         val id = IdentityHolder.identity ?: return
-        sessionStore.clear() // fresh prompts for this foreground session
-        val srv = PeerServer(sessionStore, trustStore, inviteStore)
+        val app = context.applicationContext
+        sessionStore.clear()
+        receiver.sweepStale()
+        _interrupted.value = receiver.hasPartialSpool()
+        val srv = PeerServer(
+            sessions = sessionStore,
+            receiver = receiver,
+            invites = inviteStore,
+            isPaired = { trustStore.find(it) },
+            metered = { metered?.isMetered() ?: false },
+            wifiOnly = { SettingsHolder.settings.value.wifiOnly },
+            approval = pushApproval,
+            onUnpair = { trustStore.remove(it) },
+        )
         val port = try {
             srv.start(id) { boundPort -> hello(id, boundPort) }
         } catch (_: Exception) {
             return
         }
         server = srv
-        advertiser = NsdAdvertiser(context).also {
-            it.start(id.deviceId.take(16), txt(id, port), port)
-        }
+        advertiser = NsdAdvertiser(app).also { it.start(id.deviceId.take(16), txt(id, port), port) }
     }
 
     fun stop() {
@@ -94,10 +143,18 @@ object PeerService {
         publish()
     }
 
+    fun answerApproval(accepted: Boolean) {
+        val waiter = synchronized(approvalLock) { approvalWaiter }
+        waiter?.complete(accepted)
+    }
+
+    fun dismissInterrupted() {
+        _interrupted.value = false
+    }
+
     /**
      * The `lanyard://pair?...` link for this device's QR code, or null until the
-     * server is listening. The one-time invite is reused while still valid so the
-     * code does not change on every refresh.
+     * server is listening. The one-time invite is reused while still valid.
      */
     fun pairingLink(): String? {
         val id = IdentityHolder.identity ?: return null
@@ -119,6 +176,29 @@ object PeerService {
 
     private fun publish() {
         _pending.value = sessionStore.pending()
+    }
+
+    /**
+     * Asks the person before accepting a push. Answers quickly when no prompt can
+     * be shown (another prompt is up, or nothing is foreground), so the sender is
+     * refused at once rather than waiting on an offer that can never be answered.
+     */
+    private val pushApproval = PushApproval { _, name, files, total, names ->
+        val waiter = CompletableDeferred<Boolean>()
+        synchronized(approvalLock) {
+            if (approvalWaiter != null || sessionStore.pending().isNotEmpty()) {
+                return@PushApproval ApprovalOutcome.BUSY
+            }
+            if (server == null) return@PushApproval ApprovalOutcome.UNAVAILABLE
+            approvalWaiter = waiter
+            _approval.value = PushApprovalRequest(UUID.randomUUID().toString(), Display.safeName(name), files, total, names)
+        }
+        val accepted = runBlocking { withTimeoutOrNull(120_000) { waiter.await() } } ?: false
+        synchronized(approvalLock) {
+            approvalWaiter = null
+            _approval.value = null
+        }
+        if (accepted) ApprovalOutcome.ACCEPTED else ApprovalOutcome.DECLINED
     }
 
     private fun hello(id: Identity, port: Int): JsonObject = JsonObject().apply {

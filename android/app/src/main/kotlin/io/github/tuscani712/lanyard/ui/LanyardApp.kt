@@ -31,6 +31,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import io.github.tuscani712.lanyard.DevicesViewModel
 import io.github.tuscani712.lanyard.PeerService
+import io.github.tuscani712.lanyard.PushApprovalRequest
 import io.github.tuscani712.lanyard.core.Display
 import io.github.tuscani712.lanyard.core.IncomingRequest
 import io.github.tuscani712.lanyard.core.PairingSessions
@@ -48,13 +49,34 @@ private val TABS = listOf(
 fun LanyardApp(viewModel: DevicesViewModel = viewModel()) {
     var selected by rememberSaveable { mutableIntStateOf(0) }
     val pending by PeerService.pending.collectAsStateWithLifecycle()
+    val approval by PeerService.approval.collectAsStateWithLifecycle()
+    val interrupted by PeerService.interrupted.collectAsStateWithLifecycle()
+    val showingPairing = pending.isNotEmpty()
 
-    // One prompt at a time, on any screen: a desktop asking to connect or pair.
+    // One prompt at a time, on any screen: pairing first, then a received-files
+    // approval, then a note that a transfer was interrupted.
     pending.firstOrNull()?.let { request ->
         IncomingPairDialog(
             request = request,
             onAccept = { PeerService.accept(request.id) },
             onDecline = { PeerService.decline(request.id) },
+        )
+    }
+    if (!showingPairing) {
+        approval?.let { req ->
+            PushApprovalDialog(
+                request = req,
+                onAccept = { PeerService.answerApproval(true) },
+                onDecline = { PeerService.answerApproval(false) },
+            )
+        }
+    }
+    if (!showingPairing && approval == null && interrupted) {
+        AlertDialog(
+            onDismissRequest = { PeerService.dismissInterrupted() },
+            title = { Text("Transfer interrupted") },
+            text = { Text("A file transfer was interrupted when the app left the foreground. The sender can resume it.") },
+            confirmButton = { TextButton(onClick = { PeerService.dismissInterrupted() }) { Text("OK") } },
         )
     }
 
@@ -81,6 +103,29 @@ fun LanyardApp(viewModel: DevicesViewModel = viewModel()) {
             else -> SettingsScreen(inner, viewModel)
         }
     }
+}
+
+/** The accept/decline prompt for files pushed to this phone. */
+@Composable
+private fun PushApprovalDialog(request: PushApprovalRequest, onAccept: () -> Unit, onDecline: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("Receive files?") },
+        text = {
+            Column {
+                Text(request.peerName.ifEmpty { "A paired device" }, style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(4.dp))
+                Text("${request.files} file${if (request.files == 1) "" else "s"} · ${request.total} bytes")
+                if (request.names.isNotEmpty()) {
+                    Spacer(Modifier.height(8.dp))
+                    request.names.forEach { Text(it, style = MaterialTheme.typography.bodySmall, fontFamily = FontFamily.Monospace) }
+                    if (request.files > request.names.size) Text("…", style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onAccept) { Text("Accept") } },
+        dismissButton = { TextButton(onClick = onDecline) { Text("Decline") } },
+    )
 }
 
 /** The accept/decline prompt for an incoming Connect/Pair request, on any screen. */

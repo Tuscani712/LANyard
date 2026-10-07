@@ -22,7 +22,17 @@ class PeerServerLiveTest {
         private val trustFile = File.createTempFile("lanyard-trust", ".json").also { it.delete() }
         val trust: TrustStore = JsonFileTrustStore(trustFile)
         val sessions = PairingSessions(selfFp = { identity.deviceId }, trust = trust)
-        private val server = PeerServer(sessions, trust, PairInvites())
+        private val spool = File.createTempFile("spool", ".d").let { it.delete(); it.mkdirs(); it }
+        val received = java.util.concurrent.ConcurrentLinkedQueue<String>()
+        private val receiver = InboxReceiver(
+            spool,
+            PushDestination { rel, _, _ -> received.add(rel); rel },
+            { Long.MAX_VALUE },
+        )
+        private val server = PeerServer(
+            sessions, receiver, PairInvites(),
+            isPaired = { trust.find(it) }, onUnpair = { trust.remove(it) },
+        )
         val port: Int = server.start(identity) { p ->
             JsonObject().apply {
                 addProperty("device_id", identity.deviceId.take(16))

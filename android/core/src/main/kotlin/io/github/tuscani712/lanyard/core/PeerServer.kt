@@ -17,52 +17,74 @@ import java.util.concurrent.ThreadFactory
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
 
+/** How a push-approval prompt ended. */
+enum class ApprovalOutcome { ACCEPTED, DECLINED, BUSY, UNAVAILABLE }
+
 /**
- * The phone-side peer API (`/api/v1/...`) over mutual TLS 1.3. In C1 it answers
- * the discovery probe and the responder side of pairing, so a desktop can pair
- * *to* the phone and then see it online.
+ * Asks the person before accepting a push (a paired peer above its ask-over
+ * limit). Must answer quickly; returning [ApprovalOutcome.UNAVAILABLE] or
+ * [ApprovalOutcome.BUSY] makes the server refuse at once rather than hang the
+ * sender.
+ */
+fun interface PushApproval {
+    fun ask(peerFp: String, peerName: String, files: Int, total: Long, names: List<String>): ApprovalOutcome
+}
+
+/**
+ * The phone-side peer API over mutual TLS 1.3: discovery, pairing (C1) and
+ * receiving pushes (C2a).
  *
- * Hardening (all reachable by anyone on the Wi-Fi):
- *  - a fixed pool of [maxConnections] workers; an over-cap connection is closed;
- *  - a per-read [connectionTimeoutMillis] and a whole-connection
- *    [connectionDeadlineMillis] watchdog, so a dribbling client can't hold a
- *    worker;
- *  - a [MAX_HEADER_BYTES] header cap and a body cap; `Content-Length` is
- *    required, chunked encoding is refused;
- *  - a global request limit ([maxSessionRequestsPerMinute]) against session
- *    requests, because a hostile device can present a fresh certificate each
- *    time;
- *  - the caller's identity always comes from the TLS certificate, never the body.
- *
- * [stop] closes the listener, live sockets, the pool and the scheduler, and
- * frees the port.
+ * Hardening, and how it differs from C1:
+ *  - **Keep-alive:** one TLS connection serves many HTTP/1.1 requests (up to
+ *    [maxRequestsPerConnection]), so 1 000 small files are one handshake.
+ *  - **Split timeouts:** [headerTimeoutMillis] covers the request line, headers
+ *    and small JSON bodies; a file body instead gets a [stallTimeoutMillis] stall
+ *    timeout (no progress closes it), and an idle keep-alive connection is
+ *    closed after [idleTimeoutMillis].
+ *  - **Connection budget by class:** an unpaired caller gets at most
+ *    [maxUnpairedConnections]; a paired caller shares a pool of
+ *    [maxPairedConnections] (the desktop opens up to 16 in parallel).
+ *  - Identity is always the TLS certificate; push endpoints require a paired
+ *    fingerprint with the `push` permission.
  */
 class PeerServer(
     private val sessions: PairingSessions,
-    private val trust: TrustStore,
+    private val receiver: InboxReceiver,
     private val invites: PairInvites,
-    private val connectionTimeoutMillis: Int = 10_000,
-    private val connectionDeadlineMillis: Long = 15_000,
-    private val maxConnections: Int = 8,
+    private val isPaired: (String) -> PairedPeer?,
+    private val metered: () -> Boolean = { false },
+    private val wifiOnly: () -> Boolean = { true },
+    private val approval: PushApproval? = null,
+    private val onUnpair: (String) -> Unit = {},
+    private val headerTimeoutMillis: Int = 15_000,
+    private val stallTimeoutMillis: Int = 30_000,
+    private val idleTimeoutMillis: Int = 10_000,
+    private val maxRequestsPerConnection: Int = 10_000,
+    private val maxUnpairedConnections: Int = 4,
+    private val maxPairedConnections: Int = 32,
     private val maxSessionRequestsPerMinute: Int = 10,
     private val maxBodyBytes: Int = 64 * 1024,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private var server: SSLServerSocket? = null
     private var pool: ThreadPoolExecutor? = null
-    private var scheduler: ScheduledExecutorService? = null
     private val live: MutableSet<Socket> = ConcurrentHashMap.newKeySet()
     private val requestTimes = ArrayDeque<Long>()
     private var hello: ((Int) -> JsonObject)? = null
+    private val unpairedActive = AtomicInteger()
+    private val pairedActive = AtomicInteger()
+
+    /** Count of accepted TLS connections (used by the handshake-reuse test). */
+    val handshakes = AtomicLong()
 
     @Volatile
     var port: Int = 0
         private set
 
-    /** How many workers are currently handling a connection. */
     fun activeConnections(): Int = pool?.activeCount ?: 0
 
     fun start(identity: Identity, hello: (Int) -> JsonObject): Int {
@@ -77,20 +99,13 @@ class PeerServer(
         val factory = ThreadFactory { r ->
             Thread(r, "lanyard-peer-${counter.incrementAndGet()}").apply { isDaemon = true }
         }
-        val executor = ThreadPoolExecutor(
-            maxConnections, maxConnections, 30L, TimeUnit.SECONDS, SynchronousQueue(), factory,
-        )
-        val sched = Executors.newSingleThreadScheduledExecutor { r ->
-            Thread(r, "lanyard-peer-watchdog").apply { isDaemon = true }
-        }
+        val poolSize = maxUnpairedConnections + maxPairedConnections
+        val executor = ThreadPoolExecutor(poolSize, poolSize, 30L, TimeUnit.SECONDS, SynchronousQueue(), factory)
 
         server = ss
         pool = executor
-        scheduler = sched
         port = ss.localPort
-        val t = Thread({ acceptLoop(ss, executor, sched) }, "lanyard-peer-accept")
-        t.isDaemon = true
-        t.start()
+        Thread({ acceptLoop(ss, executor) }, "lanyard-peer-accept").apply { isDaemon = true }.start()
         return port
     }
 
@@ -99,8 +114,6 @@ class PeerServer(
         server = null
         pool?.shutdownNow()
         pool = null
-        scheduler?.shutdownNow()
-        scheduler = null
         hello = null
         for (socket in live) runCatching { socket.close() }
         live.clear()
@@ -108,182 +121,105 @@ class PeerServer(
         port = 0
     }
 
-    private fun acceptLoop(ss: SSLServerSocket, executor: ThreadPoolExecutor, sched: ScheduledExecutorService) {
+    private fun acceptLoop(ss: SSLServerSocket, executor: ThreadPoolExecutor) {
         while (!ss.isClosed) {
             val socket = try {
                 ss.accept()
             } catch (_: Exception) {
                 return
             }
-            runCatching { socket.soTimeout = connectionTimeoutMillis }
             live.add(socket)
-            // Whole-connection deadline: closes a client that dribbles bytes
-            // slowly enough to keep every per-read timeout happy.
-            val watchdog = runCatching {
-                sched.schedule({ runCatching { socket.close() } }, connectionDeadlineMillis, TimeUnit.MILLISECONDS)
-            }.getOrNull()
             try {
-                executor.execute {
-                    try {
-                        handle(socket)
-                    } finally {
-                        watchdog?.cancel(false)
-                    }
-                }
+                executor.execute { handleConnection(socket) }
             } catch (_: RejectedExecutionException) {
-                watchdog?.cancel(false)
                 live.remove(socket)
                 runCatching { socket.close() }
             }
         }
     }
 
-    private fun handle(socket: Socket) {
+    private fun handleConnection(socket: Socket) {
+        val ssl = socket as SSLSocket
+        var paired = false
         try {
-            val ssl = socket as SSLSocket
             ssl.startHandshake()
-            val fp = peerFingerprint(ssl) ?: throw PeerHttpException(401, "client certificate required")
-            val out = BufferedOutputStream(ssl.getOutputStream())
-            val req = try {
-                readRequest(BufferedInputStream(ssl.getInputStream()))
-            } catch (e: PeerHttpException) {
-                respond(out, e.code, errorJson(e.message))
-                return
-            }
-            val (code, body) = route(req, fp, ssl)
-            respond(out, code, body)
-        } catch (e: PeerHttpException) {
-            runCatching { respond(BufferedOutputStream(socket.getOutputStream()), e.code, errorJson(e.message)) }
+            handshakes.incrementAndGet()
+            val fp = peerFingerprint(ssl) ?: return
+            val peer = isPaired(fp)
+            paired = peer != null
+            if (!acquireConnection(paired)) return
+            requestLoop(ssl, fp, peer)
         } catch (_: Exception) {
-            // handshake/read failure or the watchdog closing us: simply drop
+            // handshake/read failure or a timeout: drop
         } finally {
+            if (paired) pairedActive.decrementAndGet() else unpairedActive.decrementAndGet()
             live.remove(socket)
             runCatching { socket.close() }
         }
     }
 
-    // --- routing ---
-
-    private fun route(req: Request, fp: String, socket: SSLSocket): Pair<Int, String> {
-        val path = req.path
-        return when {
-            req.method == "GET" && path == "/api/v1/hello" ->
-                200 to (hello?.invoke(port)?.toString() ?: "{}")
-            req.method == "POST" && path == "/api/v1/session/request" ->
-                200 to handleSessionRequest(req, fp, socket)
-            req.method == "POST" && path == "/api/v1/trust/revoke" ->
-                200 to handleTrustRevoke(fp)
-            path.startsWith("/api/v1/session/") -> handleSession(req, fp, path)
-            else -> 404 to errorJson("not found")
+    private fun acquireConnection(paired: Boolean): Boolean {
+        val counter = if (paired) pairedActive else unpairedActive
+        val cap = if (paired) maxPairedConnections else maxUnpairedConnections
+        while (true) {
+            val cur = counter.get()
+            if (cur >= cap) return false
+            if (counter.compareAndSet(cur, cur + 1)) return true
         }
     }
 
-    private fun handleSessionRequest(req: Request, fp: String, socket: SSLSocket): String {
-        if (!allowGlobalRequest()) throw PeerHttpException(429, "too many requests")
-        val json = parseObject(req.body)
-        // The certificate is the identity; a body cannot claim to be someone else.
-        val claimed = json.str("fingerprint")
-        if (claimed.isNotEmpty() && !claimed.equals(fp, ignoreCase = true)) {
-            throw PeerHttpException(400, "fingerprint does not match the certificate")
-        }
-        // device_id is a display label in the protocol, but a caller must not be
-        // able to smuggle a different fingerprint in it either.
-        val claimedId = json.str("device_id")
-        if (claimedId.length == 64 && claimedId.all { isHex(it) } && !claimedId.equals(fp, ignoreCase = true)) {
-            throw PeerHttpException(400, "device id does not match the certificate")
-        }
-        val mode = json.str("mode")
-        val nonce = json.str("nonce")
-        val invite = json.str("invite")
-        // The invite is only spent inside createIncoming, after the caps pass, so
-        // a request rejected for a cap cannot waste a valid code. A bad or reused
-        // invite is still a hard 403 with no SAS fallback.
-        val view = sessions.createIncoming(
-            mode = mode,
-            peerFp = fp,
-            peerName = json.str("name"),
-            peerDevice = json.str("device_id"),
-            peerHost = socket.inetAddress?.hostAddress ?: "",
-            peerNonce = nonce,
-            requested = json.permissions("requested_permissions"),
-            consumeInvite = if (invite.isEmpty()) null else ({ invites.consume(invite) }),
-        )
-        return """{"session_id":${jsonStr(view.id)},"nonce":${jsonStr(view.nonce)},"status":${jsonStr(view.status)}}"""
-    }
+    // --- HTTP/1.1 request loop ---
 
-    private fun handleSession(req: Request, fp: String, path: String): Pair<Int, String> {
-        val rest = path.removePrefix("/api/v1/session/")
-        return when {
-            req.method == "GET" && '/' !in rest -> {
-                val v = sessions.statusFor(rest, fp)
-                200 to statusJson(v)
+    private class Head(val method: String, val path: String, val query: String, val headers: Map<String, String>, val close: Boolean)
+
+    private fun requestLoop(ssl: SSLSocket, fp: String, peer: PairedPeer?) {
+        val input = BufferedInputStream(ssl.getInputStream())
+        val out = BufferedOutputStream(ssl.getOutputStream())
+        var requests = 0
+        while (requests < maxRequestsPerConnection) {
+            ssl.soTimeout = idleTimeoutMillis
+            val first = try {
+                input.read()
+            } catch (_: java.net.SocketTimeoutException) {
+                return // idle keep-alive expired
             }
-            req.method == "POST" && rest.endsWith("/confirm") -> {
-                val v = sessions.confirm(rest.removeSuffix("/confirm"), fp)
-                200 to """{"status":${jsonStr(v.status)}}"""
+            if (first < 0) return
+            requests++
+            val started = clock()
+            val head = try {
+                readHead(ssl, input, first) ?: return
+            } catch (_: java.net.SocketTimeoutException) {
+                return
+            } catch (_: PeerHttpException) {
+                respond(out, 400, errorJson("bad request"))
+                return
             }
-            req.method == "POST" && rest.endsWith("/close") -> {
-                sessions.close(rest.removeSuffix("/close"), fp)
-                200 to """{"closed":true}"""
+            val fileBody = head.method == "PUT" && isFileBodyPath(head.path)
+            val closing = head.close || requests >= maxRequestsPerConnection
+            try {
+                if (fileBody) {
+                    ssl.soTimeout = stallTimeoutMillis
+                    handleFileBody(out, head, fp, peer, input, closing)
+                } else {
+                    val cap = bodyCap(head.path)
+                    val body = readSmallBody(ssl, input, head, cap, started)
+                    val (code, text) = route(head, body, fp, peer, ssl)
+                    respond(out, code, text, closing)
+                }
+            } catch (e: PeerHttpException) {
+                // If a file body was being read, the rest of it is still on the
+                // wire, so the connection cannot be reused: close it.
+                val mustClose = closing || fileBody
+                respond(out, e.code, errorJson(e.message), mustClose)
+                if (mustClose) return
             }
-            else -> 404 to errorJson("not found")
+            if (closing) return
         }
     }
 
-    private fun handleTrustRevoke(fp: String): String {
-        // Only the caller's own entry, and only if it is actually paired.
-        if (trust.find(fp) == null) throw PeerHttpException(403, "not paired")
-        trust.remove(fp)
-        return """{"ok":true}"""
-    }
-
-    private fun allowGlobalRequest(): Boolean {
-        synchronized(requestTimes) {
-            val now = clock()
-            while (requestTimes.isNotEmpty() && now - requestTimes.first() > 60_000) requestTimes.removeFirst()
-            if (requestTimes.size >= maxSessionRequestsPerMinute) return false
-            requestTimes.addLast(now)
-            return true
-        }
-    }
-
-    // --- HTTP ---
-
-    private class Request(val method: String, val path: String, val headers: Map<String, String>, val body: ByteArray)
-
-    private fun readRequest(input: BufferedInputStream): Request {
-        val headerBytes = readHeaders(input) ?: throw PeerHttpException(400, "bad request")
-        val text = String(headerBytes, Charsets.ISO_8859_1)
-        val lines = text.split("\r\n")
-        val parts = lines.firstOrNull()?.trim().orEmpty().split(" ")
-        if (parts.size < 2) throw PeerHttpException(400, "bad request line")
-        val method = parts[0].uppercase()
-        val path = parts[1].substringBefore('?')
-        val headers = HashMap<String, String>()
-        for (line in lines.drop(1)) {
-            val colon = line.indexOf(':')
-            if (colon <= 0) continue
-            headers[line.substring(0, colon).trim().lowercase()] = line.substring(colon + 1).trim()
-        }
-        val te = headers["transfer-encoding"]
-        if (te != null && te.contains("chunked", ignoreCase = true)) {
-            throw PeerHttpException(400, "chunked encoding is not supported")
-        }
-        val body = if (method == "GET" || method == "HEAD") {
-            ByteArray(0)
-        } else {
-            val cl = headers["content-length"] ?: throw PeerHttpException(411, "content-length required")
-            val n = cl.toLongOrNull() ?: throw PeerHttpException(400, "bad content-length")
-            if (n < 0) throw PeerHttpException(400, "bad content-length")
-            if (n > maxBodyBytes) throw PeerHttpException(413, "body too large")
-            readExactly(input, n.toInt())
-        }
-        return Request(method, path, headers, body)
-    }
-
-    /** Reads up to the blank line ending the headers; null if the cap is hit. */
-    private fun readHeaders(input: InputStream): ByteArray? {
+    private fun readHead(ssl: SSLSocket, input: InputStream, first: Int): Head? {
         val buf = java.io.ByteArrayOutputStream()
+        buf.write(first)
         var a = 0
         var b = 0
         var c = 0
@@ -294,9 +230,37 @@ class PeerServer(
             buf.write(r)
             a = b; b = c; c = d; d = r
             if (a == 13 && b == 10 && c == 13 && d == 10) break
-            if (buf.size() > MAX_HEADER_BYTES) return null
+            if (buf.size() > MAX_HEADER_BYTES) throw PeerHttpException(400, "header too large")
         }
-        return buf.toByteArray()
+        val lines = String(buf.toByteArray(), Charsets.ISO_8859_1).split("\r\n")
+        val parts = lines.firstOrNull()?.trim().orEmpty().split(" ")
+        if (parts.size < 2) throw PeerHttpException(400, "bad request line")
+        val headers = HashMap<String, String>()
+        for (line in lines.drop(1)) {
+            val colon = line.indexOf(':')
+            if (colon > 0) headers[line.substring(0, colon).trim().lowercase()] = line.substring(colon + 1).trim()
+        }
+        val close = headers["connection"]?.contains("close", ignoreCase = true) == true
+        val target = parts[1]
+        return Head(parts[0].uppercase(), target.substringBefore('?'), target.substringAfter('?', ""), headers, close)
+    }
+
+    private fun readSmallBody(ssl: SSLSocket, input: InputStream, head: Head, cap: Int, started: Long): ByteArray {
+        if (head.method == "GET" || head.method == "HEAD") return ByteArray(0)
+        val te = head.headers["transfer-encoding"]
+        if (te != null && te.contains("chunked", ignoreCase = true)) throw PeerHttpException(400, "chunked encoding is not supported")
+        val cl = head.headers["content-length"] ?: throw PeerHttpException(411, "content-length required")
+        val n = cl.toLongOrNull() ?: throw PeerHttpException(400, "bad content-length")
+        if (n < 0) throw PeerHttpException(400, "bad content-length")
+        if (n > cap) throw PeerHttpException(413, "body too large")
+        ssl.soTimeout = remainingMillis(started, headerTimeoutMillis)
+        return readExactly(input, n.toInt())
+    }
+
+    private fun remainingMillis(started: Long, budget: Int): Int {
+        val left = budget - (clock() - started).toInt()
+        if (left <= 0) throw PeerHttpException(408, "request timeout")
+        return left
     }
 
     private fun readExactly(input: InputStream, n: Int): ByteArray {
@@ -310,18 +274,277 @@ class PeerServer(
         return body
     }
 
-    private fun respond(out: OutputStream, code: Int, body: String) {
-        val bytes = body.toByteArray(Charsets.UTF_8)
-        val head = "HTTP/1.1 $code ${reason(code)}\r\n" +
-            "Content-Type: application/json\r\n" +
-            "Content-Length: ${bytes.size}\r\n" +
-            "Connection: close\r\n\r\n"
-        out.write(head.toByteArray(Charsets.US_ASCII))
-        out.write(bytes)
-        out.flush()
+    // --- routing ---
+
+    private fun route(head: Head, body: ByteArray, fp: String, peer: PairedPeer?, ssl: SSLSocket): Pair<Int, String> {
+        val path = head.path
+        return when {
+            head.method == "GET" && path == "/api/v1/hello" ->
+                200 to (hello?.invoke(port)?.toString() ?: "{}")
+            head.method == "POST" && path == "/api/v1/session/request" ->
+                200 to handleSessionRequest(body, fp, ssl)
+            head.method == "POST" && path == "/api/v1/trust/revoke" ->
+                handleTrustRevoke(fp)
+            path.startsWith("/api/v1/session/") -> handleSession(head, fp, path)
+            head.method == "POST" && path == "/api/v1/push/offer" -> handlePushOffer(body, fp, peer)
+            path.startsWith("/api/v1/push/") && path.endsWith("/complete") ->
+                handlePushComplete(body, fp, peer, path)
+            else -> 404 to errorJson("not found")
+        }
+    }
+
+    private fun isFileBodyPath(path: String): Boolean =
+        path.startsWith("/api/v1/push/") && path.endsWith("/file")
+
+    private fun bodyCap(path: String): Int =
+        if (path == "/api/v1/push/offer") PushProtocol.MAX_OFFER_BODY_BYTES else maxBodyBytes
+
+    /** A push endpoint needs a paired fingerprint with the push permission. */
+    private fun requirePush(fp: String, peer: PairedPeer?): PairedPeer {
+        val p = peer ?: throw PeerHttpException(403, "not paired")
+        if (!p.push) throw PeerHttpException(403, "push not permitted")
+        return p
+    }
+
+    private fun handlePushOffer(body: ByteArray, fp: String, peer: PairedPeer?): Pair<Int, String> {
+        val p = requirePush(fp, peer)
+        if (wifiOnly() && metered()) throw PeerHttpException(403, "Wi-Fi only is on. Connect to Wi-Fi to receive files.")
+        if (!allowSessionRequest()) throw PeerHttpException(429, "too many requests")
+        val json = parseObject(body)
+        val filesArr = json.getAsJsonArray("files") ?: throw PeerHttpException(400, "no files")
+        val reqs = filesArr.map { el ->
+            val o = el.asJsonObject
+            PushFileRequest(o.str("rel_path"), o.long("size"), parseMtime(o.str("mtime")))
+        }
+        val total = json.long("total_bytes")
+        // Validate here (caps, names, free space) before asking, so a refusal is
+        // for a real reason and no spool is created for a rejected offer.
+        val probe = receiver.offer(p.fingerprint, p.name, reqs, total, p.pushMaxBytes)
+        // ask_over: a person must accept.
+        val realTotal = if (total > 0) total else reqs.sumOf { it.size }
+        if (p.askOver > 0 && realTotal > p.askOver) {
+            val names = reqs.take(5).map { Display.safeName(it.relPath) }
+            val outcome = approval?.ask(p.fingerprint, p.name, reqs.size, realTotal, names) ?: ApprovalOutcome.ACCEPTED
+            when (outcome) {
+                ApprovalOutcome.ACCEPTED -> {}
+                ApprovalOutcome.DECLINED, ApprovalOutcome.UNAVAILABLE ->
+                    { receiver.cancel(probe.pushId, p.fingerprint); throw PeerHttpException(403, "the transfer was declined") }
+                ApprovalOutcome.BUSY ->
+                    { receiver.cancel(probe.pushId, p.fingerprint); throw PeerHttpException(429, "another request is waiting") }
+            }
+        }
+        return 200 to offerJson(probe)
+    }
+
+    private fun handlePushComplete(body: ByteArray, fp: String, peer: PairedPeer?, path: String): Pair<Int, String> {
+        requirePush(fp, peer)
+        val id = idBetween(path, "/api/v1/push/", "/complete")
+        val json = parseObject(body)
+        if (json.get("all")?.takeIf { !it.isJsonNull }?.asBoolean == true) {
+            receiver.finish(id, fp)
+            return 200 to """{"done":true}"""
+        }
+        val rel = json.str("rel_path")
+        val sha = json.str("sha256")
+        val st = receiver.complete(id, fp, rel, sha)
+        return 200 to """{"rel_path":${jsonStr(st.relPath)},"done":true}"""
+    }
+
+    private fun handleFileBody(
+        out: OutputStream,
+        head: Head,
+        fp: String,
+        peer: PairedPeer?,
+        input: InputStream,
+        closing: Boolean,
+    ) {
+        requirePush(fp, peer)
+        val id = idBetween(head.path, "/api/v1/push/", "/file")
+        val rel = queryParam(head.query, "path") ?: throw PeerHttpException(400, "path required")
+        val te = head.headers["transfer-encoding"]
+        val chunked = te != null && te.contains("chunked", ignoreCase = true)
+        // The Go client streams large files with chunked encoding (the body
+        // length is not known up front); the small-file fast path carries
+        // Content-Length. Both are accepted; our own framing stays HTTP/1.1.
+        val body: InputStream = if (chunked) {
+            ChunkedInputStream(input)
+        } else {
+            val cl = head.headers["content-length"] ?: throw PeerHttpException(411, "content-length required")
+            val n = cl.toLongOrNull() ?: throw PeerHttpException(400, "bad content-length")
+            if (n < 0) throw PeerHttpException(400, "bad content-length")
+            LimitedInputStream(input, n)
+        }
+        val sha = head.headers["x-lanyard-sha256"]
+        val offset = parseContentRange(head.headers["content-range"])
+        if (!sha.isNullOrEmpty() && offset == 0L) {
+            val written = receiver.receiveWhole(id, fp, rel, sha, body)
+            respond(out, 200, """{"written":$written,"offset":$written,"done":true}""", closing)
+        } else {
+            val written = receiver.writeChunk(id, fp, rel, offset, body)
+            respond(out, 200, """{"written":$written,"offset":${offset + written}}""", closing)
+        }
+    }
+
+    private fun handleSessionRequest(body: ByteArray, fp: String, socket: SSLSocket): String {
+        if (!allowSessionRequest()) throw PeerHttpException(429, "too many requests")
+        val json = parseObject(body)
+        val claimed = json.str("fingerprint")
+        if (claimed.isNotEmpty() && !claimed.equals(fp, ignoreCase = true)) {
+            throw PeerHttpException(400, "fingerprint does not match the certificate")
+        }
+        val claimedId = json.str("device_id")
+        if (claimedId.length == 64 && claimedId.all { it.isHex() } && !claimedId.equals(fp, ignoreCase = true)) {
+            throw PeerHttpException(400, "device id does not match the certificate")
+        }
+        val view = sessions.createIncoming(
+            mode = json.str("mode"),
+            peerFp = fp,
+            peerName = json.str("name"),
+            peerDevice = json.str("device_id"),
+            peerHost = socket.inetAddress?.hostAddress ?: "",
+            peerNonce = json.str("nonce"),
+            requested = json.permissions("requested_permissions"),
+            consumeInvite = if (json.str("invite").isEmpty()) null else ({ invites.consume(json.str("invite")) }),
+        )
+        return """{"session_id":${jsonStr(view.id)},"nonce":${jsonStr(view.nonce)},"status":${jsonStr(view.status)}}"""
+    }
+
+    private fun handleSession(head: Head, fp: String, path: String): Pair<Int, String> {
+        val rest = path.removePrefix("/api/v1/session/")
+        return when {
+            head.method == "GET" && '/' !in rest -> {
+                val v = sessions.statusFor(rest, fp)
+                200 to statusJson(v)
+            }
+            head.method == "POST" && rest.endsWith("/confirm") -> {
+                val v = sessions.confirm(rest.removeSuffix("/confirm"), fp)
+                200 to """{"status":${jsonStr(v.status)}}"""
+            }
+            head.method == "POST" && rest.endsWith("/close") -> {
+                sessions.close(rest.removeSuffix("/close"), fp)
+                200 to """{"closed":true}"""
+            }
+            else -> 404 to errorJson("not found")
+        }
+    }
+
+    private fun handleTrustRevoke(fp: String): Pair<Int, String> {
+        if (isPaired(fp) == null) throw PeerHttpException(403, "not paired")
+        onUnpair(fp) // only ever the caller's own entry
+        return 200 to """{"ok":true}"""
+    }
+
+    private fun allowSessionRequest(): Boolean {
+        synchronized(requestTimes) {
+            val now = clock()
+            while (requestTimes.isNotEmpty() && now - requestTimes.first() > 60_000) requestTimes.removeFirst()
+            if (requestTimes.size >= maxSessionRequestsPerMinute) return false
+            requestTimes.addLast(now)
+            return true
+        }
     }
 
     // --- helpers ---
+
+    private class LimitedInputStream(private val src: InputStream, private var left: Long) : InputStream() {
+        override fun read(): Int {
+            if (left <= 0) return -1
+            val b = src.read()
+            if (b >= 0) left--
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (left <= 0) return -1
+            val want = minOf(len.toLong(), left).toInt()
+            val n = src.read(b, off, want)
+            if (n > 0) left -= n
+            return n
+        }
+    }
+
+    /**
+     * Decodes HTTP/1.1 chunked transfer coding from [src]. Bounded so a hostile
+     * client cannot grow memory: a chunk-size line is capped, the trailer block
+     * is capped, malformed input is a 400, and the CRLF after each chunk's data
+     * is validated.
+     */
+    private class ChunkedInputStream(private val src: InputStream) : InputStream() {
+        private var remaining = 0L
+        private var done = false
+        private var trailerLines = 0
+        private var trailerBytes = 0
+
+        override fun read(): Int {
+            if (done) return -1
+            if (remaining == 0L) nextChunk()
+            if (done) return -1
+            val b = src.read()
+            if (b < 0) throw PeerHttpException(400, "truncated chunked body")
+            remaining--
+            if (remaining == 0L) endChunkCrc()
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (done) return -1
+            if (remaining == 0L) nextChunk()
+            if (done) return -1
+            val n = src.read(b, off, minOf(len.toLong(), remaining).toInt())
+            if (n < 0) throw PeerHttpException(400, "truncated chunked body")
+            remaining -= n
+            if (remaining == 0L) endChunkCrc()
+            return n
+        }
+
+        private fun nextChunk() {
+            val line = readLine(MAX_CHUNK_LINE)
+            val sizeText = line.substringBefore(';').trim()
+            if (sizeText.isEmpty()) throw PeerHttpException(400, "malformed chunk size")
+            val size = sizeText.toLongOrNull(16) ?: throw PeerHttpException(400, "malformed chunk size")
+            if (size < 0) throw PeerHttpException(400, "malformed chunk size")
+            if (size == 0L) {
+                while (true) {
+                    val t = readLine(MAX_TRAILER_LINE)
+                    trailerLines++
+                    trailerBytes += t.length + 2
+                    if (trailerLines > MAX_TRAILER_LINES || trailerBytes > MAX_TRAILER_BYTES) {
+                        throw PeerHttpException(400, "trailer too large")
+                    }
+                    if (t.isEmpty()) break
+                }
+                done = true
+                return
+            }
+            remaining = size
+        }
+
+        private fun endChunkCrc() {
+            val cr = src.read()
+            val lf = src.read()
+            if (cr != 13 || lf != 10) throw PeerHttpException(400, "malformed chunk terminator")
+        }
+
+        private fun readLine(max: Int): String {
+            val sb = StringBuilder()
+            while (true) {
+                val b = src.read()
+                if (b < 0) throw PeerHttpException(400, "truncated chunked body")
+                val c = b.toChar()
+                if (c == '\n') return sb.toString()
+                if (c != '\r') sb.append(c)
+                if (sb.length > max) throw PeerHttpException(400, "chunk line too long")
+            }
+        }
+
+        private companion object {
+            const val MAX_CHUNK_LINE = 256
+            const val MAX_TRAILER_LINE = 1024
+            const val MAX_TRAILER_LINES = 32
+            const val MAX_TRAILER_BYTES = 8 * 1024
+        }
+    }
+
 
     private fun peerFingerprint(ssl: SSLSocket): String? {
         val leaf = ssl.session.peerCertificates.firstOrNull() as? X509Certificate ?: return null
@@ -343,6 +566,17 @@ class PeerServer(
         append('}')
     }
 
+    private fun offerJson(o: PushOffer): String = buildString {
+        append("""{"push_id":""").append(jsonStr(o.pushId))
+        append(""","accepted":true,"max_bytes":""").append(o.maxBytes)
+        append(""","files":[""")
+        o.offsets.entries.forEachIndexed { i, e ->
+            if (i > 0) append(',')
+            append("""{"rel_path":""").append(jsonStr(e.key)).append(""","offset":""").append(e.value).append('}')
+        }
+        append("]}")
+    }
+
     private fun permissionsJson(p: Permissions): String = buildString {
         append("""{"browse":""").append(p.browse)
         append(""","push":""").append(p.push)
@@ -358,10 +592,45 @@ class PeerServer(
         return Permissions(browse = b("browse"), push = b("push"), pushMaxBytes = l("push_max_bytes"), askOver = l("ask_over"))
     }
 
-    private fun JsonObject.str(key: String): String =
-        get(key)?.takeIf { !it.isJsonNull }?.asString ?: ""
+    private fun JsonObject.str(key: String): String = get(key)?.takeIf { !it.isJsonNull }?.asString ?: ""
 
-    private fun isHex(ch: Char): Boolean = ch in '0'..'9' || ch in 'a'..'f' || ch in 'A'..'F'
+    private fun JsonObject.long(key: String): Long = get(key)?.takeIf { !it.isJsonNull }?.asLong ?: 0L
+
+    private fun Char.isHex(): Boolean = this in '0'..'9' || this in 'a'..'f' || this in 'A'..'F'
+
+    private fun parseMtime(s: String): Long = try {
+        if (s.isEmpty()) 0L else java.time.Instant.parse(s).toEpochMilli()
+    } catch (_: Exception) {
+        0L
+    }
+
+    private fun idBetween(path: String, prefix: String, suffix: String): String {
+        if (!path.startsWith(prefix) || !path.endsWith(suffix)) throw PeerHttpException(404, "not found")
+        return path.removePrefix(prefix).removeSuffix(suffix)
+    }
+
+    private fun queryParam(query: String, name: String): String? {
+        if (query.isEmpty()) return null
+        val raw = query.split('&').map { it.split('=', limit = 2) }
+            .firstOrNull { it[0] == name }?.getOrNull(1) ?: return null
+        return try {
+            java.net.URLDecoder.decode(raw, Charsets.UTF_8)
+        } catch (_: Exception) {
+            raw
+        }
+    }
+
+    /** START from "bytes START-END/TOTAL"; 0 when absent. */
+    private fun parseContentRange(h: String?): Long {
+        if (h.isNullOrBlank()) return 0L
+        val hh = h.trim()
+        if (!hh.startsWith("bytes ")) throw PeerHttpException(400, "bad Content-Range")
+        val range = hh.removePrefix("bytes ").substringBefore('/')
+        val dash = range.indexOf('-')
+        if (dash <= 0) throw PeerHttpException(400, "bad Content-Range")
+        return range.substring(0, dash).trim().toLongOrNull()?.takeIf { it >= 0 }
+            ?: throw PeerHttpException(400, "bad Content-Range")
+    }
 
     private fun errorJson(message: String?): String = """{"error":${jsonStr(message ?: "error")}}"""
 
@@ -382,17 +651,31 @@ class PeerServer(
         return sb.toString()
     }
 
+    private fun respond(out: OutputStream, code: Int, body: String, close: Boolean = false) {
+        val bytes = body.toByteArray(Charsets.UTF_8)
+        val head = "HTTP/1.1 $code ${reason(code)}\r\n" +
+            "Content-Type: application/json\r\n" +
+            "Content-Length: ${bytes.size}\r\n" +
+            "Connection: " + (if (close) "close" else "keep-alive") + "\r\n\r\n"
+        out.write(head.toByteArray(Charsets.US_ASCII))
+        out.write(bytes)
+        out.flush()
+    }
+
     private fun reason(code: Int): String = when (code) {
         200 -> "OK"
         400 -> "Bad Request"
         401 -> "Unauthorized"
         403 -> "Forbidden"
         404 -> "Not Found"
+        408 -> "Request Timeout"
         409 -> "Conflict"
         411 -> "Length Required"
         413 -> "Payload Too Large"
         429 -> "Too Many Requests"
+        500 -> "Internal Server Error"
         503 -> "Service Unavailable"
+        507 -> "Insufficient Storage"
         else -> "Error"
     }
 
