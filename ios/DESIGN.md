@@ -113,6 +113,11 @@ the rest is behind `LanyardNet` and is written, not compiled, until a Mac exists
 
 - **Phase 1 — `LanyardCore` + parity tests.** Pure Swift protocol core and ported
   Kotlin tests. Runnable on Linux. *(this phase)*
+  - **Phase 1b** (also Linux-tested): the chunked decoder, `InboxReceiver` spool
+    rules, `Diagnostics`/redaction and the server event ring buffer,
+    `PairingFlow`/`PairingSessions`, and the `PushSession`/`DownloadSession`
+    state machines, each behind a small transport/clock seam. The concrete
+    transport (TLS/sockets) is Phase 2.
 - **Phase 2 — `LanyardNet` identity + TLS spike (Mac, written-not-compiled).**
   Ed25519 self-signed cert builder, Keychain `SecIdentity`, `NWConnection`/
   `NWListener` mTLS, verify-block pinning, the fingerprint-parity test, and the

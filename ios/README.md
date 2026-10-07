@@ -54,8 +54,13 @@ On a Mac, the same command works, or open `Package.swift` in Xcode and run the
 | Push receive rules: name sanitising, free-space (Kotlin `PushProtocolTest`) | **Linux-tested** |
 | Share validation / spool / picker rules (Kotlin `ShareModelTest`) | **Linux-tested** |
 | Settings persistence, trust store, transfer policy, self-filter, peer addresses, NIC throttle, display (Kotlin `*Test`) | **Linux-tested** |
+| Chunked transfer decoder (chunk line 256, trailer 32 lines / 8 KiB) | **Linux-tested** |
+| `InboxReceiver` spool rules (`.lanpart`, offsets, over-run, free-space, abandoned-spool cleanup, `onCancelled`) | **Linux-tested** |
+| `Diagnostics` + redaction + the 200-event server ring buffer | **Linux-tested** |
+| `PairingFlow` / `PairingSessions` state machines (behind a transport/clock seam) | **Linux-tested** |
+| `PushSession` / `DownloadSession` state machines (behind a transport/sink seam) | **Linux-tested** |
 | QR round-trip | **Partial** — link build/parse/fingerprint tested; the ZXing render/decode path has no Swift/Linux equivalent and is a Mac-only concern |
-| `NWListener`/`NWConnection` mTLS, `SecIdentity`, X.509 builder, verify-block pinning | **Written, not compiled — Phase 2** |
+| `NWListener`/`NWConnection` mTLS, `SecIdentity`, X.509 builder, verify-block pinning; the concrete TLS/socket transport behind the seams | **Written, not compiled — Phase 2** |
 | Discovery, pairing UI, push receive/send, share/serve, Transfers, Settings, Troubleshoot, Share extension | **Written, not compiled — Phases 3–6** |
 
 ## Layout
