@@ -180,7 +180,27 @@ function navigate(p) { S.ex.hist.splice(S.ex.hi + 1); S.ex.hist.push(p); S.ex.hi
 function placePath(k) { return k === "folder" ? "f:" + (place().path || "") : k === "device" ? "d:" + place().device : k === "remote" ? "r:" + place().device + "/" + place().share + "/" + (place().path || "") : "home"; }
 
 function pairedEntry(fp) { return trustList.find((e) => e.cert_fingerprint === fp || e.device_id === fp) || null; }
-function activeSession(fp) { return sessions.find((s) => s.peer_fp === fp && (s.status === "active" || s.status === "accepted")) || null; }
+// Only a Connect-mode accepted/active session grants live access (see the
+// server's trust.Access rule). A Pair-mode session that is merely "accepted" is
+// still a handshake in progress and must never read as "Connected".
+function activeSession(fp) { return sessions.find((s) => s.peer_fp === fp && s.mode === "connect" && (s.status === "active" || s.status === "accepted")) || null; }
+// What a paired peer allows us to do on it (its narrowed grant). Absent for
+// older pairings, where we keep the previous behaviour and allow the action.
+function peerAllowsPush(entry) { const pg = entry && entry.peer_permissions; return !pg || pg.push !== false; }
+function peerGrantText(p) {
+  p = p || {};
+  const bits = [p.browse ? "browse" : "no browse", p.push ? "push" : "no push"];
+  if (p.ask_over) bits.push(`asks over ${Math.round(p.ask_over / 1048576)} MB`);
+  if (p.push_max_bytes) bits.push(`up to ${Math.round(p.push_max_bytes / 1048576)} MB`);
+  return bits.join(" \u00b7 ");
+}
+// Disconnect ends the temporary session only; the pairing is untouched. Make
+// that explicit instead of leaving a bare, vague "Disconnect".
+function disconnectBtn(fn) {
+  const b = btn("Disconnect", fn, "ghost");
+  b.title = "Ends this temporary connection only. The pairing is not removed.";
+  return b;
+}
 
 // ---------- nav ----------
 const NAV = [
@@ -581,17 +601,25 @@ function renderDevice(body, p) {
   if (peer.os) bits.push(peer.os);
   main.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
   main.appendChild(el("div", "meta", "ID " + prettyId(p.device)));
+  if (paired && paired.peer_permissions) main.appendChild(el("div", "meta", "They allow you to: " + peerGrantText(paired.peer_permissions)));
   head.appendChild(main);
   const actions = el("div", "actions");
   if (paired) {
-    actions.appendChild(btn("Push files\u2026", () => pushTo(p.device, peer.name)));
-    actions.appendChild(btn("Push folder\u2026", () => pushTo(p.device, peer.name, true), "ghost"));
+    const canPush = peerAllowsPush(paired);
+    const pf = btn("Push files\u2026", () => pushTo(p.device, peer.name));
+    const pd = btn("Push folder\u2026", () => pushTo(p.device, peer.name, true), "ghost");
+    if (!canPush) {
+      pf.disabled = pd.disabled = true;
+      pf.title = pd.title = "This device did not allow you to push to it.";
+    }
+    actions.appendChild(pf);
+    actions.appendChild(pd);
     actions.appendChild(btn("Mount as drive", () => mountDevice(p.device, peer.name), "ghost"));
     actions.appendChild(btn("Unpair", () => unpair(p.device, paired), "ghost"));
   } else if (session) {
     actions.appendChild(btn("Push files\u2026", () => pushTo(p.device, peer.name)));
     actions.appendChild(btn("Push folder\u2026", () => pushTo(p.device, peer.name, true), "ghost"));
-    actions.appendChild(btn("Disconnect", () => sessionAction(session.id, "close"), "ghost"));
+    actions.appendChild(disconnectBtn(() => sessionAction(session.id, "close")));
   } else {
     actions.appendChild(btn("Connect", () => startPair(p.device, peer.name, "connect")));
     actions.appendChild(btn("Pair", () => startPair(p.device, peer.name, "pair")));
@@ -816,7 +844,7 @@ function peerMenu(p) {
   if (paired || session) {
     items.push({ label: "Push files\u2026", icon: "push", onClick: () => pushTo(p.device_id, p.name) });
     if (paired) items.push({ label: "Unpair", icon: "x", onClick: () => unpair(p.device_id, paired) });
-    else items.push({ label: "Disconnect", icon: "x", onClick: () => sessionAction(session.id, "close") });
+    else items.push({ label: "Disconnect session", icon: "x", onClick: () => sessionAction(session.id, "close") });
   } else {
     items.push({ label: "Connect", icon: "link", onClick: () => startPair(p.device_id, p.name, "connect") });
     items.push({ label: "Pair", icon: "link", onClick: () => startPair(p.device_id, p.name, "pair") });
@@ -848,7 +876,7 @@ function renderPairedPage() {
       row.appendChild(m);
       const acts = el("div", "actions");
       if (s.status === "active") {
-        acts.appendChild(btn("Disconnect", () => sessionAction(s.id, "close"), "ghost"));
+        acts.appendChild(disconnectBtn(() => sessionAction(s.id, "close")));
       } else {
         acts.appendChild(btn("Review", () => openSession(s.id)));
         if (s.incoming && s.status === "pending") acts.appendChild(btn("Accept", () => acceptSession(s.id), "ghost"));
@@ -871,6 +899,7 @@ function renderPairedPage() {
     if (p.ask_over) bits.push(`asks over ${Math.round(p.ask_over / 1048576)} MB`);
     if (p.push_max_bytes) bits.push(`max ${Math.round(p.push_max_bytes / 1048576)} MB`);
     m.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
+    if (e.peer_permissions) m.appendChild(el("div", "meta", "They allow you to: " + peerGrantText(e.peer_permissions)));
     m.appendChild(el("div", "meta", "ID " + prettyId(e.cert_fingerprint || e.device_id)));
     const fpE = e.cert_fingerprint || e.device_id, onE = isOnline(fpE);
     const stE = el("div", "status" + (onE ? "" : " off")); stE.appendChild(el("span", "dot" + (onE ? "" : " off")));
@@ -879,6 +908,7 @@ function renderPairedPage() {
     row.appendChild(m);
     const acts = el("div", "actions");
     const pushBtn = btn("Push files\u2026", () => pushTo(fpE, e.name), "ghost");
+    if (!peerAllowsPush(e)) { pushBtn.disabled = true; pushBtn.title = "This device did not allow you to push to it."; }
     acts.appendChild(pushBtn);
     acts.appendChild(btn("Unpair", () => unpair(e.cert_fingerprint || e.device_id, e), "ghost"));
     row.appendChild(acts);
@@ -1167,6 +1197,7 @@ function renderSettings(s) {
       if (p.ask_over) bits.push(`asks over ${Math.round(p.ask_over / 1048576)} MB`);
       if (p.push_max_bytes) bits.push(`max ${Math.round(p.push_max_bytes / 1048576)} MB`);
       m.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
+      if (e.peer_permissions) m.appendChild(el("div", "meta", "They allow you to: " + peerGrantText(e.peer_permissions)));
       row.appendChild(m);
       const acts2 = el("div", "actions");
       const browse = checkRow("Let them browse and pull my shares", !!p.browse);
@@ -1365,6 +1396,9 @@ function renderPair() {
     status.textContent = "The request was " + reason + (v.error ? ": " + v.error : "") + ".";
     actions.appendChild(btn("Close", closePair, "ghost"));
   }
+  if (!v.incoming && (v.status === "accepted" || v.status === "active") && v.peer_granted) {
+    body.appendChild(el("p", "muted", who + " allows you to: " + peerGrantText(v.peer_granted)));
+  }
   body.appendChild(actions);
 }
 async function renderQRPanel(body) {
@@ -1532,9 +1566,20 @@ async function confirmSession(id) {
   pollSessions();
 }
 async function sessionAction(id, action) {
-  await fetch(`/api/sessions/${id}/${action}`, { method: "POST" });
+  const r = await fetch(`/api/sessions/${id}/${action}`, { method: "POST" });
+  // A 404 means the session is already gone (closed on the other device, or
+  // expired). That is the outcome we wanted, not an error: treat it as done.
+  if (!r.ok && r.status !== 404) {
+    toast((await r.text()).trim(), "err");
+    pollSessions();
+    return;
+  }
   if (action === "close" || action === "reject") { dismissed.add(id); closePair(); }
-  toast(action === "reject" ? "Request rejected." : "Request cancelled.", "info");
+  const gone = r.status === 404;
+  const msg = action === "reject" ? "Request rejected."
+    : action === "close" ? (gone ? "That session was already closed." : "Disconnected. The pairing is unchanged.")
+    : (gone ? "That request was already gone." : "Request cancelled.");
+  toast(msg, "info");
   pollSessions();
 }
 
@@ -1575,11 +1620,12 @@ function onSessionTransition(s, before) {
 }
 function handleSessions(list) {
   sessions = list;
+  let changed = false;
   for (const s of list) {
     const before = sessionMemo[s.id];
-    if (before !== s.status) { onSessionTransition(s, before); sessionMemo[s.id] = s.status; }
+    if (before !== s.status) { onSessionTransition(s, before); sessionMemo[s.id] = s.status; changed = true; }
   }
-  for (const id of Object.keys(sessionMemo)) if (!list.some((s) => s.id === id)) delete sessionMemo[id];
+  for (const id of Object.keys(sessionMemo)) if (!list.some((s) => s.id === id)) { delete sessionMemo[id]; changed = true; }
   if (pairView && !pairView.setup && !pairView.qr) { // setup and QR panels have no session yet
     const fresh = list.find((s) => s.id === pairView.id);
     if (fresh) { pairView = fresh; renderPair(); } else { closePair(); }
@@ -1588,7 +1634,12 @@ function handleSessions(list) {
   document.title = (S.actionable ? `(${S.actionable}) ` : "") + "LANyard File Transfer";
   renderNav();
   if (S.view === "paired") renderPairedPage();
-  if (S.view === "devices") renderExSide();
+  // Re-render the open device pane when a session changed, so its Connected /
+  // Disconnect state follows the transition instead of going stale.
+  if (S.view === "devices") {
+    renderExSide();
+    if (changed && place().kind === "device") renderBody();
+  }
   // A new incoming request is a small notification (bottom right); clicking it
   // opens the accept screen. It never takes over the window by itself.
   const live = new Set();

@@ -62,6 +62,12 @@ type Server struct {
 	rl        rateLimiter
 	log       *slog.Logger
 	xlog      *xferlog.Recorder
+	// onRevoke, when set, runs local cleanup after a peer removes itself from
+	// our trust store via /trust/revoke: the peer's mount is dropped and, if it
+	// was actually paired, it is asked to drop us too. Wired by the UI server in
+	// main; nil is a valid no-op. It is called before the trust entry is removed
+	// so the last-known address is still available for the fallback.
+	onRevoke func(fp string, wasPaired bool)
 	// mu guards srv and port, which Listen and Serve write while Shutdown and
 	// Port may read from other goroutines.
 	mu        sync.Mutex
@@ -79,6 +85,10 @@ func NewServer(id *identity.Identity, hello func() discovery.Hello, sh *shares.M
 // per-file receipts and completions (and their failures) are written to the
 // desktop log and shown in the diagnostics report.
 func (s *Server) SetXferLog(r *xferlog.Recorder) { s.xlog = r }
+
+// SetOnRevoke registers the local cleanup that runs when a peer revokes the
+// pairing over the peer API. It must be safe to call repeatedly.
+func (s *Server) SetOnRevoke(fn func(fp string, wasPaired bool)) { s.onRevoke = fn }
 
 // xfer records one transfer entry and mirrors it into the desktop log. Push
 // and pull entries default to their area at the call site.
@@ -208,12 +218,27 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 // handleTrustRevoke lets an authenticated peer remove itself from our trust
 // store. This is how an unpair on the other device becomes mutual: we only ever
 // drop the caller's own entry, so it needs no extra authorization and is safe to
-// repeat.
+// repeat. A repeat revoke from an already-unpaired peer still succeeds (200) and
+// still runs local cleanup/logging, but does not notify the peer back — that
+// would bounce between the two devices forever.
 func (s *Server) handleTrustRevoke(w http.ResponseWriter, r *http.Request) {
 	fp := PeerID(r.Context())
 	if fp == "" {
 		http.Error(w, "client certificate required", http.StatusUnauthorized)
 		return
+	}
+	wasPaired := false
+	if s.trust != nil {
+		_, wasPaired = s.trust.Entry(fp)
+	}
+	if s.log != nil {
+		s.log.Info("peer requested unpair over the peer API", "fp", identity.ShortID(fp), "paired", wasPaired)
+	}
+	// Cleanup runs before the entry is removed so revokeRemote can fall back to
+	// the trust-stored last-known address. It is safe on a repeat: dropMountsOf
+	// is a no-op and no notification is sent.
+	if s.onRevoke != nil {
+		s.onRevoke(fp, wasPaired)
 	}
 	if s.trust != nil {
 		s.trust.Unpair(fp)

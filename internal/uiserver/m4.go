@@ -67,38 +67,92 @@ func (s *Server) handleUnpair(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "trust unavailable", http.StatusServiceUnavailable)
 		return
 	}
-	if !s.d.Trust.Unpair(r.PathValue("fp")) {
+	fp := r.PathValue("fp")
+	// Remember the last address we saw the peer answer at before the entry is
+	// removed, so we can still ask it to drop us when it is not in the
+	// discovery registry right now.
+	lastKnown, _ := s.d.Trust.Entry(fp)
+	if !s.d.Trust.Unpair(fp) {
 		http.Error(w, "not paired", http.StatusNotFound)
 		return
 	}
-	fp := r.PathValue("fp")
-	s.dropMountsOf(fp) // unpairing revokes the drive
-	s.revokeRemote(fp) // make the unpair mutual, best effort
+	s.dropMountsOf(fp)            // unpairing revokes the drive
+	s.revokeRemote(fp, lastKnown) // make the unpair mutual, best effort
 	writeJSON(w, map[string]bool{"ok": true})
+}
+
+// HandleRemoteRevoke performs the local cleanup when a peer removes this device
+// from its trust store over the peer API (/trust/revoke). It mirrors
+// handleUnpair's post-removal cleanup: the peer's drive is unmounted and, when
+// the peer was actually paired, it is told to drop us too. A repeat revoke from
+// an already-unpaired peer is idempotent: the mounts are still dropped and the
+// event logged, but no notification is sent (the peer is already gone, and
+// notifying back would bounce between the two devices forever).
+func (s *Server) HandleRemoteRevoke(fp string, wasPaired bool) {
+	s.dropMountsOf(fp)
+	if !wasPaired {
+		if s.d.Log != nil {
+			s.d.Log.Info("unpair: peer was already unpaired; nothing to notify", "fp", fp)
+		}
+		return
+	}
+	// peerapi calls this before removing the entry, so the last-known address
+	// is still in the trust store for the fallback below.
+	var lastKnown trust.Entry
+	if s.d.Trust != nil {
+		lastKnown, _ = s.d.Trust.Entry(fp)
+	}
+	s.revokeRemote(fp, lastKnown)
 }
 
 // revokeRemote tells the paired device to drop us too, so an unpair on one side
 // is reflected on the other. Best effort: the peer may be offline, and the local
-// unpair already succeeded.
-func (s *Server) revokeRemote(fp string) {
-	if s.d.Client == nil || s.d.Peers == nil {
+// unpair already succeeded. It prefers the live discovery address and falls back
+// to the last address the trust store remembered (captured before the entry was
+// removed); if neither is known, or the peer cannot be reached, it logs why.
+func (s *Server) revokeRemote(fp string, lastKnown trust.Entry) {
+	if s.d.Client == nil {
+		if s.d.Log != nil {
+			s.d.Log.Info("unpair: peer client unavailable; cannot notify the peer", "fp", fp)
+		}
 		return
 	}
 	var host string
 	var port int
-	for _, p := range s.d.Peers() {
-		if p.DeviceID == fp && len(p.Addrs) > 0 {
-			host, port = p.Addrs[0], p.Port
-			break
+	if s.d.Peers != nil {
+		for _, p := range s.d.Peers() {
+			if p.DeviceID == fp && len(p.Addrs) > 0 {
+				host, port = p.Addrs[0], p.Port
+				break
+			}
+		}
+	}
+	source := "discovery"
+	if host == "" || port == 0 {
+		// Not in the discovery registry right now (it may be off the network).
+		// Fall back to the last address the trust store remembered.
+		if len(lastKnown.Addrs) > 0 && lastKnown.Port > 0 {
+			host, port = lastKnown.Addrs[0], lastKnown.Port
+			source = "last-known address"
 		}
 	}
 	if host == "" || port == 0 {
+		if s.d.Log != nil {
+			s.d.Log.Info("unpair: peer has no known address; skipping notification", "fp", fp)
+		}
 		return
 	}
+	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := s.d.Client.RevokePairing(ctx, host, port, fp); err != nil && s.d.Log != nil {
-		s.d.Log.Debug("unpair: could not notify the peer", "fp", fp, "err", err)
+	if err := s.d.Client.RevokePairing(ctx, host, port, fp); err != nil {
+		if s.d.Log != nil {
+			s.d.Log.Warn("unpair: could not notify the peer", "fp", fp, "addr", addr, "via", source, "err", err)
+		}
+		return
+	}
+	if s.d.Log != nil {
+		s.d.Log.Info("unpair: notified the peer", "fp", fp, "addr", addr, "via", source)
 	}
 }
 
@@ -270,6 +324,10 @@ func (s *Server) handleSessionRefresh(w http.ResponseWriter, r *http.Request) {
 			if host, port, ok := peerAddr(p); ok {
 				if st, err := s.d.Client.SessionStatus(r.Context(), host, port, sess.PeerFP, sess.RemoteID); err == nil && st.Status != "" {
 					s.d.Trust.SetStatus(id, st.Status, st.Error)
+					// The responder may narrow what we asked for; record the
+					// actual grant so we never treat the requested set as if
+					// the peer had allowed it.
+					s.d.Trust.SetPeerGranted(id, st.Granted)
 				}
 			}
 		}
@@ -338,14 +396,31 @@ func (s *Server) handleSessionClose(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no such session", http.StatusNotFound)
 		return
 	}
+	// Disconnect ends the live session only; it never removes a pairing. Say so
+	// in the log so a person reading the diagnostics knows why the device is
+	// still paired afterwards.
+	kind := "temporary connection"
+	if sess.Mode == trust.ModePair {
+		kind = "pairing handshake"
+	}
+	notified := false
 	if sess.RemoteID != "" && s.d.Client != nil {
 		if p, ok := s.peerByID(sess.PeerFP); ok {
 			if host, port, ok := peerAddr(p); ok {
-				_ = s.d.Client.CloseSession(r.Context(), host, port, sess.PeerFP, sess.RemoteID)
+				if err := s.d.Client.CloseSession(r.Context(), host, port, sess.PeerFP, sess.RemoteID); err != nil {
+					if s.d.Log != nil {
+						s.d.Log.Warn("disconnect: could not tell the peer to close", "session", id, "fp", sess.PeerFP, "err", err)
+					}
+				} else {
+					notified = true
+				}
 			}
 		}
 	}
 	s.d.Trust.Close(id)
+	if s.d.Log != nil {
+		s.d.Log.Info("disconnect: ended session", "session", id, "mode", sess.Mode, "kind", kind, "peer_notified", notified)
+	}
 	writeJSON(w, map[string]bool{"ok": true})
 }
 

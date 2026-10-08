@@ -550,6 +550,9 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		Log:                 log,
 		XferLog:             xferLog,
 	})
+	// A peer that unpairs us over the peer API gets the same cleanup as an
+	// unpair from our own UI: drop its mount and, best effort, notify it back.
+	peerSrv.SetOnRevoke(ui.HandleRemoteRevoke)
 	uiWant := st.UIPort
 	if uiPortFlag != 0 {
 		uiWant = uiPortFlag

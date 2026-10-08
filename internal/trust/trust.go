@@ -64,9 +64,15 @@ type Entry struct {
 	Fingerprint string      `json:"cert_fingerprint"`
 	Mode        string      `json:"mode"`
 	Permissions Permissions `json:"permissions"`
-	Addrs       []string    `json:"addrs,omitempty"`
-	Port        int         `json:"port,omitempty"`
-	CreatedAt   time.Time   `json:"created_at"`
+	// PeerPermissions is what the peer granted this device (the opposite
+	// direction from Permissions): it is what we may do on the peer, e.g.
+	// browse its shares or push files to it. It is recorded at pairing time
+	// from the peer's own narrowed grant and is display/UI only: Access still
+	// authorizes the peer's requests to us with Permissions.
+	PeerPermissions Permissions `json:"peer_permissions,omitempty"`
+	Addrs           []string    `json:"addrs,omitempty"`
+	Port            int         `json:"port,omitempty"`
+	CreatedAt       time.Time   `json:"created_at"`
 }
 
 // Access is the authorization decision for a peer certificate.
@@ -93,10 +99,14 @@ type Session struct {
 	selfNonce string
 	PeerNonce string `json:"peer_nonce,omitempty"`
 
-	Status        string      `json:"status"`
-	Error         string      `json:"error,omitempty"`
-	Granted       Permissions `json:"granted"`   // what we allow the peer
-	Requested     Permissions `json:"requested"` // what the peer allows us
+	Status    string      `json:"status"`
+	Error     string      `json:"error,omitempty"`
+	Granted   Permissions `json:"granted"`   // what we allow the peer
+	Requested Permissions `json:"requested"` // what we requested of the peer
+	// PeerGranted is the peer's answer to our request: the (possibly narrowed)
+	// permissions the peer actually granted us. An initiator learns it by
+	// polling the responder's session status; it is what we may do on the peer.
+	PeerGranted   Permissions `json:"peer_granted,omitempty"`
 	KeepConnected bool        `json:"keep_connected"`
 	// ViaQR is set when pairing was authenticated by a QR invite nonce rather
 	// than the SAS compare; the UI then skips the code check for that session.
@@ -121,6 +131,7 @@ type View struct {
 	SAS           string      `json:"sas,omitempty"`
 	Granted       Permissions `json:"granted"`
 	Requested     Permissions `json:"requested"`
+	PeerGranted   Permissions `json:"peer_granted"`
 	KeepConnected bool        `json:"keep_connected"`
 	ViaQR         bool        `json:"via_qr,omitempty"`
 	Offers        []string    `json:"offers"`
@@ -644,7 +655,7 @@ func (s *Store) ActivateRemote(id string) (*Session, error) {
 	if mode == ModePair {
 		s.Pair(Entry{
 			DeviceID: sess.PeerDevice, Name: sess.PeerName, Fingerprint: fp,
-			Mode: ModePair, Permissions: sess.Granted,
+			Mode: ModePair, Permissions: sess.Granted, PeerPermissions: sess.Requested,
 		})
 	}
 	s.pairLog(xferlog.LevelInfo, "confirm", fp, id, "confirmed "+mode, 0, nil)
@@ -677,12 +688,26 @@ func (s *Store) Confirm(id string) (*Session, error) {
 	if mode == ModePair {
 		s.Pair(Entry{
 			DeviceID: sess.PeerDevice, Name: sess.PeerName, Fingerprint: fp,
-			Mode: ModePair, Permissions: sess.Requested,
+			Mode: ModePair, Permissions: sess.Requested, PeerPermissions: sess.PeerGranted,
 		})
 	}
 	s.pairLog(xferlog.LevelInfo, "confirm", fp, id, "confirmed "+mode, 0, nil)
 	s.onChange()
 	return &snap, nil
+}
+
+// SetPeerGranted records the permissions the peer actually granted us, learned
+// by polling the responder's session status. It is the narrowed answer to our
+// request and is what we may do on the peer.
+func (s *Store) SetPeerGranted(id string, granted Permissions) bool {
+	s.mu.Lock()
+	sess := s.sessions[id]
+	if sess != nil {
+		sess.PeerGranted = granted
+		sess.UpdatedAt = time.Now()
+	}
+	s.mu.Unlock()
+	return sess != nil
 }
 
 // SetStatus is used by the responder when the initiator confirms.
@@ -849,6 +874,7 @@ func (s *Store) viewLocked(sess *Session) View {
 		ID: sess.ID, RemoteID: sess.RemoteID, Mode: sess.Mode, Incoming: sess.Incoming,
 		PeerFP: sess.PeerFP, PeerName: sess.PeerName, PeerDevice: sess.PeerDevice,
 		Status: sess.Status, Error: sess.Error, Granted: sess.Granted, Requested: sess.Requested,
+		PeerGranted:   sess.PeerGranted,
 		KeepConnected: sess.KeepConnected, ViaQR: sess.ViaQR, Offers: append([]string(nil), sess.Offers...),
 		CreatedAt: sess.CreatedAt, UpdatedAt: sess.UpdatedAt,
 	}
