@@ -15,6 +15,7 @@ import io.github.tuscani712.lanyard.core.PairInvites
 import io.github.tuscani712.lanyard.core.PairLink
 import io.github.tuscani712.lanyard.core.PairingSessions
 import io.github.tuscani712.lanyard.core.PeerServer
+import io.github.tuscani712.lanyard.core.Permissions
 import io.github.tuscani712.lanyard.core.PushApproval
 import io.github.tuscani712.lanyard.core.PushDestination
 import io.github.tuscani712.lanyard.core.ServerDiagnostics
@@ -244,10 +245,10 @@ object PeerService {
         TransferManager.failPushReceives("Interrupted")
     }
 
-    fun accept(id: String) {
+    fun accept(id: String, granted: Permissions) {
         val short = sessionStore.pending().firstOrNull { it.id == id }?.peerFp?.take(8) ?: "?"
-        diagnostics.record("[pairing] peer=$short accept source=phone id=$id result=ok")
-        sessionStore.accept(id)
+        diagnostics.record("[pairing] peer=$short accept source=phone id=$id granted=browse:${granted.browse},push:${granted.push} result=ok")
+        sessionStore.accept(id, granted)
         publish()
     }
 

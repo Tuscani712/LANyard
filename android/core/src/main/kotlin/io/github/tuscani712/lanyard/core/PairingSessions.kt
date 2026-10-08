@@ -161,12 +161,23 @@ class PairingSessions(
         return view(sess)
     }
 
-    /** The phone's person accepts the prompt; the granted set mirrors the request. */
+    /**
+     * The phone's person accepts the prompt with the permissions they chose.
+     * The grant may only narrow what the peer requested: each flag is
+     * intersected with the request, and the push size limits are carried over
+     * from the request only when push is actually granted.
+     */
     @Synchronized
-    fun accept(id: String): Boolean {
+    fun accept(id: String, granted: Permissions): Boolean {
         val sess = sessions[id] ?: return false
         if (sess.status != STATUS_PENDING) return false
-        sess.granted = sess.requested
+        val push = granted.push && sess.requested.push
+        sess.granted = Permissions(
+            browse = granted.browse && sess.requested.browse,
+            push = push,
+            pushMaxBytes = if (push) sess.requested.pushMaxBytes else 0,
+            askOver = if (push) sess.requested.askOver else 0,
+        )
         sess.status = STATUS_ACCEPTED
         sess.updatedAt = clock()
         diag("[pairing] peer=${Display.shortFp(sess.peerFp)} accepted id=$id granted=browse:${sess.granted.browse},push:${sess.granted.push}")
@@ -208,6 +219,8 @@ class PairingSessions(
                     browse = sess.granted.browse,
                     push = sess.granted.push,
                     pairedAt = clock(),
+                    pushMaxBytes = sess.granted.pushMaxBytes,
+                    askOver = sess.granted.askOver,
                 ),
             )
         }

@@ -14,16 +14,20 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.tuscani712.lanyard.IdentityHolder
 import io.github.tuscani712.lanyard.MainActivity
+import io.github.tuscani712.lanyard.PeerService
 import io.github.tuscani712.lanyard.SettingsHolder
-import io.github.tuscani712.lanyard.core.JsonFileTrustStore
+import io.github.tuscani712.lanyard.core.DiscoveredAddr
 import io.github.tuscani712.lanyard.core.Identity
 import io.github.tuscani712.lanyard.core.PairedPeer
+import io.github.tuscani712.lanyard.core.PeerAddresses
 import io.github.tuscani712.lanyard.core.ProbeClient
 import io.github.tuscani712.lanyard.core.PushSource
+import io.github.tuscani712.lanyard.core.SelfFilter
 import io.github.tuscani712.lanyard.core.ShareTarget
 import io.github.tuscani712.lanyard.core.ShareValidation
 import io.github.tuscani712.lanyard.core.ThemeMode
 import io.github.tuscani712.lanyard.net.AndroidMeteredNetwork
+import io.github.tuscani712.lanyard.net.NsdDiscovery
 import io.github.tuscani712.lanyard.transfer.TransferManager
 import io.github.tuscani712.lanyard.ui.theme.LanyardTheme
 import kotlinx.coroutines.CoroutineScope
@@ -33,7 +37,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.ByteArrayInputStream
-import java.io.File
 
 /**
  * Receives `ACTION_SEND`/`ACTION_SEND_MULTIPLE` from other apps, shows a small
@@ -61,6 +64,7 @@ class ShareReceiverActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         IdentityHolder.init(applicationContext)
         SettingsHolder.init(applicationContext)
+        PeerService.init(applicationContext)
         TransferManager.init(application, AndroidMeteredNetwork(applicationContext))
 
         val received = intent
@@ -193,10 +197,48 @@ class ShareReceiverActivity : ComponentActivity() {
 
     private fun loadTargets(): List<ShareTarget> {
         val identity = IdentityHolder.identity
-        val peers = JsonFileTrustStore(File(filesDir, "trust/peers.json")).list()
-        val online = peers.filter { peer -> identity != null && isOnline(peer, identity) }
+        // Use the app-scoped store so the address refreshed by discovery (or the
+        // Devices screen) is visible here, and write back anything discovery
+        // corrects before the reachability probe below runs.
+        val store = PeerService.trust
+        val peers = store.list()
+        if (identity != null && peers.isNotEmpty()) {
+            PeerAddresses.fillFromDiscovery(peers, discoverAddresses()).forEach { store.save(it) }
+        }
+        val refreshed = store.list()
+        val online = refreshed.filter { peer -> identity != null && isOnline(peer, identity) }
             .mapTo(HashSet()) { it.fingerprint.lowercase() }
-        return ShareValidation.shareTargets(peers, online)
+        return ShareValidation.shareTargets(refreshed, online)
+    }
+
+    /**
+     * A short mDNS browse to learn paired peers' current host/port before
+     * probing them. A desktop that paired to the phone is stored with no port
+     * (the pairing request carries none), and one that restarted may have a new
+     * port, so without this the share picker shows it permanently offline.
+     * Blocking, and bounded so a share is never held up for long.
+     */
+    private fun discoverAddresses(): List<DiscoveredAddr> {
+        val own = SelfFilter.ownShortId(IdentityHolder.identity?.deviceId.orEmpty())
+        val found = java.util.Collections.synchronizedList(ArrayList<DiscoveredAddr>())
+        val discovery = NsdDiscovery(this)
+        discovery.start(
+            onFound = { device ->
+                if (!SelfFilter.isSelf(device.shortId, own)) {
+                    found.add(DiscoveredAddr(device.shortId, device.host, device.port))
+                }
+            },
+            onLost = { },
+            trigger = "share",
+        )
+        try {
+            Thread.sleep(DISCOVERY_WINDOW_MS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        } finally {
+            discovery.stop()
+        }
+        return found.toList()
     }
 
     private fun isOnline(peer: PairedPeer, identity: Identity): Boolean = try {
@@ -237,5 +279,11 @@ class ShareReceiverActivity : ComponentActivity() {
     private sealed interface Resolved {
         data class Text(val text: String) : Resolved
         data class Files(val uris: List<Uri>) : Resolved
+    }
+
+    private companion object {
+        // How long to browse mDNS before probing, so a share is not delayed more
+        // than it must be while still catching a peer's current address.
+        const val DISCOVERY_WINDOW_MS = 1_200L
     }
 }

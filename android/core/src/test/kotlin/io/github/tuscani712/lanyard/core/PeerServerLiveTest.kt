@@ -69,7 +69,7 @@ class PeerServerLiveTest {
                 // The phone's person accepts.
                 val request = phone.sessions.pending().first()
                 assertTrue(request.sas.length == 6)
-                phone.sessions.accept(request.id)
+                phone.sessions.accept(request.id, request.requested)
 
                 assertTrue(await { peer.refreshSession(desktopSession).get("status").asString == "accepted" })
                 peer.confirmSession(desktopSession)

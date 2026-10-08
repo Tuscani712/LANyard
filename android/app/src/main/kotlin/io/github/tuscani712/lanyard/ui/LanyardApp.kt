@@ -2,6 +2,7 @@ package io.github.tuscani712.lanyard.ui
 
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
 import androidx.compose.material.icons.Icons
@@ -9,6 +10,7 @@ import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SwapVert
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -21,8 +23,11 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontFamily
@@ -35,6 +40,7 @@ import io.github.tuscani712.lanyard.PushApprovalRequest
 import io.github.tuscani712.lanyard.core.Display
 import io.github.tuscani712.lanyard.core.IncomingRequest
 import io.github.tuscani712.lanyard.core.PairingSessions
+import io.github.tuscani712.lanyard.core.Permissions
 
 private data class Tab(val label: String, val icon: ImageVector)
 
@@ -58,7 +64,7 @@ fun LanyardApp(viewModel: DevicesViewModel = viewModel()) {
     pending.firstOrNull()?.let { request ->
         IncomingPairDialog(
             request = request,
-            onAccept = { PeerService.accept(request.id) },
+            onAccept = { granted -> PeerService.accept(request.id, granted) },
             onDecline = { PeerService.decline(request.id) },
         )
     }
@@ -130,8 +136,16 @@ private fun PushApprovalDialog(request: PushApprovalRequest, onAccept: () -> Uni
 
 /** The accept/decline prompt for an incoming Connect/Pair request, on any screen. */
 @Composable
-private fun IncomingPairDialog(request: IncomingRequest, onAccept: () -> Unit, onDecline: () -> Unit) {
+private fun IncomingPairDialog(
+    request: IncomingRequest,
+    onAccept: (Permissions) -> Unit,
+    onDecline: () -> Unit,
+) {
     val pairing = request.mode == PairingSessions.MODE_PAIR
+    // Browse follows the request; push is off unless the person turns it on.
+    var browse by remember(request.id) { mutableStateOf(request.requested.browse) }
+    var push by remember(request.id) { mutableStateOf(false) }
+    val anyPermission = request.requested.browse || request.requested.push
     AlertDialog(
         onDismissRequest = {},
         title = { Text(if (pairing) "Pair request" else "Connect request") },
@@ -153,9 +167,25 @@ private fun IncomingPairDialog(request: IncomingRequest, onAccept: () -> Unit, o
                         fontFamily = FontFamily.Monospace,
                     )
                 }
+                if (anyPermission) {
+                    Spacer(Modifier.height(12.dp))
+                    Text("Allow this device to:", style = MaterialTheme.typography.bodyMedium)
+                    PermissionToggle("Browse shared files", browse && request.requested.browse, request.requested.browse) { browse = it }
+                    PermissionToggle("Send files to this device", push && request.requested.push, request.requested.push) { push = it }
+                }
             }
         },
-        confirmButton = { TextButton(onClick = onAccept) { Text("Accept") } },
+        confirmButton = {
+            TextButton(onClick = { onAccept(Permissions(browse = browse, push = push)) }) { Text("Accept") }
+        },
         dismissButton = { TextButton(onClick = onDecline) { Text("Decline") } },
     )
+}
+
+@Composable
+private fun PermissionToggle(label: String, checked: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(checked = checked, onCheckedChange = onChange, enabled = enabled)
+        Text(label, style = MaterialTheme.typography.bodyMedium)
+    }
 }

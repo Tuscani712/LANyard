@@ -22,11 +22,23 @@ class PeerAddressesTest {
     }
 
     @Test
-    fun leavesPeersThatAlreadyHaveAPort() {
+    fun updatesAStoredPortWhenDiscoveryReportsANewOne() {
         val fp = "4d635a83f4033d53" + "a1b2c3d4e5f60718"
         val updates = PeerAddresses.fillFromDiscovery(
             listOf(peer(fp, host = "10.0.0.5", port = 47800)),
             listOf(DiscoveredAddr("4d635a83f4033d53", "192.168.1.20", 55555)),
+        )
+        assertEquals(1, updates.size, "a changed port must be refreshed, not only a missing one")
+        assertEquals("192.168.1.20", updates[0].host)
+        assertEquals(55555, updates[0].port)
+    }
+
+    @Test
+    fun leavesPeersWhoseAddressIsUnchanged() {
+        val fp = "4d635a83f4033d53" + "a1b2c3d4e5f60718"
+        val updates = PeerAddresses.fillFromDiscovery(
+            listOf(peer(fp, host = "192.168.1.20", port = 47800)),
+            listOf(DiscoveredAddr("4d635a83f4033d53", "192.168.1.20", 47800)),
         )
         assertTrue(updates.isEmpty())
     }

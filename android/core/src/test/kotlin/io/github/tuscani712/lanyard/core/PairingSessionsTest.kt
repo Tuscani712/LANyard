@@ -1,6 +1,7 @@
 package io.github.tuscani712.lanyard.core
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -25,13 +26,70 @@ class PairingSessionsTest {
         val v = s.createIncoming("pair", peer, "Bob", "bob-dev", "10.0.0.5", nonce(), Permissions(browse = true, push = true))
         assertEquals(PairingSessions.STATUS_PENDING, v.status)
         assertEquals(1, s.pending().size)
-        assertTrue(s.accept(v.id))
+        assertTrue(s.accept(v.id, Permissions(browse = true, push = true)))
         assertNull(trust.find(peer), "no trust entry before the initiator confirms")
         val active = s.confirm(v.id, peer)
         assertEquals(PairingSessions.STATUS_ACTIVE, active.status)
         val stored = trust.find(peer)
         assertNotNull(stored)
         assertTrue(stored!!.browse && stored.push)
+    }
+
+    @Test
+    fun browseOnlyAcceptStoresNoPush() {
+        val s = sessions()
+        val peer = "0a".repeat(32)
+        val v = s.createIncoming(
+            "pair", peer, "Desk", "desk", "10.0.0.5", nonce(),
+            Permissions(browse = true, push = true, pushMaxBytes = 4096, askOver = 1024),
+        )
+        // The person allows browse but leaves push off.
+        assertTrue(s.accept(v.id, Permissions(browse = true, push = false)))
+        s.confirm(v.id, peer)
+        val stored = trust.find(peer)!!
+        assertTrue(stored.browse, "browse must be granted")
+        assertFalse(stored.push, "push must stay off when the person did not choose it")
+        assertEquals(0L, stored.pushMaxBytes, "no push limit when push is not granted")
+        assertEquals(0L, stored.askOver, "no ask-over when push is not granted")
+    }
+
+    @Test
+    fun acceptWithPushStoresTheRequestedSizeLimits() {
+        val s = sessions()
+        val peer = "0b".repeat(32)
+        val v = s.createIncoming(
+            "pair", peer, "Desk", "desk", "10.0.0.5", nonce(),
+            Permissions(browse = true, push = true, pushMaxBytes = 8192, askOver = 2048),
+        )
+        assertTrue(s.accept(v.id, Permissions(browse = true, push = true)))
+        s.confirm(v.id, peer)
+        val stored = trust.find(peer)!!
+        assertTrue(stored.browse && stored.push)
+        assertEquals(8192L, stored.pushMaxBytes)
+        assertEquals(2048L, stored.askOver)
+    }
+
+    @Test
+    fun acceptCannotWidenWhatThePeerRequested() {
+        val s = sessions()
+        val peer = "0c".repeat(32)
+        val v = s.createIncoming("pair", peer, "Desk", "desk", "h", nonce(), Permissions(browse = true, push = false))
+        // The phone cannot grant a permission the peer never requested.
+        s.accept(v.id, Permissions(browse = true, push = true))
+        s.confirm(v.id, peer)
+        val stored = trust.find(peer)!!
+        assertTrue(stored.browse)
+        assertFalse(stored.push, "push must not be granted beyond the request")
+    }
+
+    @Test
+    fun refuseStoresNothing() {
+        val s = sessions()
+        val peer = "0d".repeat(32)
+        val v = s.createIncoming("pair", peer, "Desk", "desk", "h", nonce(), Permissions(browse = true, push = true))
+        s.decline(v.id)
+        assertNull(trust.find(peer), "a refused request must not be stored")
+        assertEquals(PairingSessions.STATUS_REJECTED, s.statusFor(v.id, peer).status)
     }
 
     @Test
@@ -58,7 +116,7 @@ class PairingSessionsTest {
         val s = sessions()
         val peer = "ee".repeat(32)
         val v = s.createIncoming("pair", peer, "E", "e", "h", nonce(), Permissions())
-        s.accept(v.id)
+        s.accept(v.id, Permissions())
         s.confirm(v.id, peer)
         assertThrows(PeerHttpException::class.java) { s.confirm(v.id, peer) }
     }
@@ -136,7 +194,7 @@ class PairingSessionsTest {
         val s = sessions()
         val peer = "12".repeat(32)
         val v = s.createIncoming("pair", peer, "P", "p", "h", nonce(), Permissions())
-        assertTrue(s.accept(v.id))
+        assertTrue(s.accept(v.id, Permissions()))
         now += PairingSessions.PAIRING_TTL_MS + 1
         assertEquals(PairingSessions.STATUS_EXPIRED, s.statusFor(v.id, peer).status)
         now += PairingSessions.TERMINAL_TTL_MS + 1

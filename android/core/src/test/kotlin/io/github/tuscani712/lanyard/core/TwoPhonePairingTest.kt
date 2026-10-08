@@ -78,7 +78,7 @@ class TwoPhonePairingTest {
             while (System.currentTimeMillis() < deadline) {
                 val p = sessions.pending()
                 if (p.isNotEmpty()) {
-                    sessions.accept(p.first().id)
+                    sessions.accept(p.first().id, p.first().requested)
                     return p.first().id
                 }
                 Thread.sleep(25)
@@ -249,6 +249,54 @@ class TwoPhonePairingTest {
                 )
                 assertNotNull(a.trust.find(b.identity.deviceId), "A must save B to its trust store")
 
+                client.closeSession(sessionId)
+            }
+        }
+    }
+
+    /**
+     * A desktop that dials the phone carries no port, so the phone stores it at
+     * port 0. Discovery must then fill (and write back) the real port whenever
+     * it changes, so the phone can reach the desktop -- the bug where a phone
+     * sharing to a desktop paired from the desktop showed it permanently offline.
+     */
+    @Test
+    @Timeout(60)
+    fun desktopInitiatedPairingPortZeroIsFilledFromDiscovery() {
+        Phone("Desktop").use { desk ->
+            Phone("Phone").use { phone ->
+                val client = PeerClient("127.0.0.1", phone.port, desk.identity, phone.identity.deviceId)
+                val session = client.startSession(
+                    mode = "pair",
+                    name = desk.label,
+                    deviceId = desk.identity.deviceId,
+                    nonce = randomNonce(),
+                    requested = Permissions(browse = true, push = true),
+                )
+                val sessionId = session.str("session_id")
+                assertTrue(sessionId.isNotEmpty(), "the phone must open a session: $session")
+
+                val acceptor = Thread { phone.acceptNextPending() }.also { it.start() }
+                awaitStatus(client, sessionId)
+                acceptor.join()
+                client.confirmSession(sessionId)
+
+                val stored = phone.trust.find(desk.identity.deviceId)
+                assertNotNull(stored, "the phone must store the desktop")
+                assertEquals(0, stored!!.port, "a desktop-initiated pairing stores no port")
+
+                // Discovery now sees the desktop's real port; the store is corrected.
+                val updates = PeerAddresses.fillFromDiscovery(
+                    phone.trust.list(),
+                    listOf(DiscoveredAddr(desk.shortId, "127.0.0.1", desk.port)),
+                )
+                updates.forEach { phone.trust.save(it) }
+                val refreshed = phone.trust.find(desk.identity.deviceId)!!
+                assertEquals(desk.port, refreshed.port, "the real port must be written back")
+
+                // With the refreshed address the share probe reaches the desktop.
+                val hello = PeerClient("127.0.0.1", refreshed.port, phone.identity, desk.identity.deviceId).hello()
+                assertEquals(desk.label, hello.name, "the share probe must reach the desktop after refresh")
                 client.closeSession(sessionId)
             }
         }

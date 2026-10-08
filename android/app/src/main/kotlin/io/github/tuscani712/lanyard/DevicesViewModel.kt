@@ -15,6 +15,7 @@ import io.github.tuscani712.lanyard.core.PeerStatusException
 import io.github.tuscani712.lanyard.core.ProbeClient
 import io.github.tuscani712.lanyard.core.SelfFilter
 import io.github.tuscani712.lanyard.core.TrustStore
+import io.github.tuscani712.lanyard.core.Unpair
 import io.github.tuscani712.lanyard.net.NearbyDevice
 import io.github.tuscani712.lanyard.net.NsdDiscovery
 import io.github.tuscani712.lanyard.share.SourceResult
@@ -69,6 +70,8 @@ data class DevicesUiState(
     val refreshing: Boolean = false,
     val pairing: PairingStatus? = null,
     val detail: PeerDetail? = null,
+    // Shown when an unpair removed the local entry but the peer could not be told.
+    val unpairNotice: String? = null,
 )
 
 /**
@@ -170,10 +173,11 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     fun dismissPairing() = _state.update { it.copy(pairing = null) }
 
     /**
-     * Removes a pairing. The peer is told to drop us too (best effort: it may be
-     * offline, and the local unpair still stands), the local trust entry is
-     * always removed, running transfers to it are cancelled, and the paired and
-     * open-detail state is refreshed.
+     * Removes a pairing. The peer is told to drop us too (best effort, and
+     * idempotent: a peer that already dropped us answers 403, which counts as
+     * success), the local trust entry is always removed, running transfers to it
+     * are cancelled, and the paired and open-detail state is refreshed. When the
+     * peer could not be notified the person is told rather than left in silence.
      */
     fun unpair(peer: PairedPeer) {
         viewModelScope.launch {
@@ -181,9 +185,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
             val remoteOk = withContext(Dispatchers.IO) {
                 var ok = false
                 if (identity != null) {
-                    ok = runCatching {
-                        PeerClient(peer.host, peer.port, identity, peer.fingerprint).revokeTrust()
-                    }.isSuccess
+                    ok = PeerClient(peer.host, peer.port, identity, peer.fingerprint).revokeTrustIdempotent()
                 }
                 store.remove(peer.fingerprint)
                 TransferManager.cancelForPeer(peer.fingerprint)
@@ -192,15 +194,18 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
             PeerService.diagnostics.record("[pairing] peer=${peer.fingerprint.take(8)} unpair source=phone remote=$remoteOk result=ok")
             _state.update { current ->
                 val detail = current.detail
-                if (detail != null && detail.peer.fingerprint.equals(peer.fingerprint, ignoreCase = true)) {
+                val cleared = if (detail != null && detail.peer.fingerprint.equals(peer.fingerprint, ignoreCase = true)) {
                     current.copy(detail = null)
                 } else {
                     current
                 }
+                cleared.copy(unpairNotice = if (remoteOk) null else Unpair.REMOTE_NOT_NOTIFIED)
             }
             refreshPaired()
         }
     }
+
+    fun dismissUnpairNotice() = _state.update { it.copy(unpairNotice = null) }
 
     fun openPeer(peer: PairedPeer) {
         _state.update { it.copy(detail = PeerDetail(peer = peer, loading = true)) }

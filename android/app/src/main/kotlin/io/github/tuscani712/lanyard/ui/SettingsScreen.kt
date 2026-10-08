@@ -273,6 +273,14 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
             onDismiss = { unpairTarget = null },
         )
     }
+    state.unpairNotice?.let { message ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissUnpairNotice() },
+            title = { Text("Unpaired") },
+            text = { Text(message) },
+            confirmButton = { TextButton(onClick = { vm.dismissUnpairNotice() }) { Text("OK") } },
+        )
+    }
 }
 
 @Composable

@@ -228,6 +228,22 @@ class PeerClient(
      */
     fun revokeTrust(): JsonObject = requestJson("POST", "/trust/revoke", "{}")
 
+    /**
+     * Notifies the peer of an unpair, idempotently. A `403`/"not paired" means
+     * the peer already has no entry for us, which is the state we wanted, so a
+     * repeated notification counts as success rather than an error. Returns true
+     * when the peer no longer trusts us (removed now, or already gone); false
+     * only when the peer could not be reached at all.
+     */
+    fun revokeTrustIdempotent(): Boolean = try {
+        revokeTrust()
+        true
+    } catch (e: PeerStatusException) {
+        e.code == 403
+    } catch (_: Exception) {
+        false
+    }
+
     fun listShares(): List<JsonObject> = requestArray("GET", "/shares").map { it.asJsonObject }
 
     fun tree(shareId: String, path: String): List<JsonObject> =
