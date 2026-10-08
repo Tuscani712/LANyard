@@ -54,12 +54,16 @@ type Permissions struct {
 }
 
 // Entry is one paired device. Permissions describe what that peer may do to us.
+// Addrs/Port remember the last address it answered at, so the desktop can probe
+// it directly when mDNS is silent.
 type Entry struct {
 	DeviceID    string      `json:"device_id"`
 	Name        string      `json:"name"`
 	Fingerprint string      `json:"cert_fingerprint"`
 	Mode        string      `json:"mode"`
 	Permissions Permissions `json:"permissions"`
+	Addrs       []string    `json:"addrs,omitempty"`
+	Port        int         `json:"port,omitempty"`
 	CreatedAt   time.Time   `json:"created_at"`
 }
 
@@ -298,6 +302,42 @@ func (s *Store) Entry(fp string) (Entry, bool) {
 		return Entry{}, false
 	}
 	return *e, true
+}
+
+// SetPeerAddr remembers the last address a paired device answered at, so the
+// desktop can probe it directly when mDNS is silent. It reports whether the
+// stored address changed.
+func (s *Store) SetPeerAddr(fp string, addrs []string, port int) bool {
+	if fp == "" || port <= 0 || len(addrs) == 0 {
+		return false
+	}
+	s.mu.Lock()
+	e, ok := s.paired[fp]
+	changed := false
+	if ok && (e.Port != port || !sameAddrs(e.Addrs, addrs)) {
+		e.Addrs = append([]string(nil), addrs...)
+		e.Port = port
+		changed = true
+	}
+	s.mu.Unlock()
+	if !changed {
+		return false
+	}
+	s.persist()
+	s.onChange()
+	return true
+}
+
+func sameAddrs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // Pair upserts a paired entry.

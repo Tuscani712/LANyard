@@ -26,6 +26,7 @@ import (
 	"unicode"
 
 	"lanyard/internal/config"
+	"lanyard/internal/identity"
 	"lanyard/internal/inbox"
 	"lanyard/internal/peerapi"
 	"lanyard/internal/shares"
@@ -781,6 +782,30 @@ func (m *Manager) Retry(ctx context.Context, id string) (*View, error) {
 	default:
 		return nil, errors.New("this transfer cannot be resent")
 	}
+}
+
+// ActiveTransfer reports whether a non-terminal, in-flight transfer is using
+// the peer identified by fingerprint (or its short ID, the first 16 hex
+// characters). Discovery uses it so a busy peer is not evicted on transient
+// probe misses. Paused and "waiting for peer" jobs do not count: no bytes are
+// moving then.
+func (m *Manager) ActiveTransfer(peerID string) bool {
+	if peerID == "" {
+		return false
+	}
+	short := identity.ShortID(peerID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, j := range m.jobs {
+		if j.PeerID != peerID && identity.ShortID(j.PeerID) != short {
+			continue
+		}
+		switch j.State {
+		case StateQueued, StateConnecting, StateTransferring, StateVerifying:
+			return true
+		}
+	}
+	return false
 }
 
 // PeerAvailable is called when discovery sees a verified peer. It refreshes

@@ -579,7 +579,6 @@ function renderDevice(body, p) {
     actions.appendChild(btn("Connect", () => startPair(p.device, peer.name, "connect")));
     actions.appendChild(btn("Pair", () => startPair(p.device, peer.name, "pair")));
   }
-  if (!online) for (const b of actions.querySelectorAll("button")) if (b.textContent !== "Unpair" && b.textContent !== "Disconnect") { b.disabled = true; b.title = "This device is offline"; }
   head.appendChild(actions);
   body.appendChild(head);
 
@@ -598,17 +597,16 @@ function renderDevice(body, p) {
       ta.value = "";
       toast("Text sent to " + (peer.name || "the device") + ".", "ok");
     });
-    if (!online) send.disabled = true;
+    if (!online) send.title = "This device may be offline; the send will report if it cannot be reached.";
     box.appendChild(ta); box.appendChild(send);
     body.appendChild(box);
   }
 
   body.appendChild(el("div", "section-title", "Shared with you"));
   const listBox = el("div", "stack");
-  listBox.appendChild(el("div", "empty", "Loading shares\u2026"));
+  listBox.appendChild(el("div", "empty", online ? "Loading shares\u2026" : "Checking this device\u2026"));
   body.appendChild(listBox);
 
-  if (!online) { clear(listBox); listBox.appendChild(el("div", "empty", "This device is offline. Its shares will appear here when it is back.")); return; }
   fetch(`/api/remote/shares?device=${encodeURIComponent(p.device)}`)
     .then((r) => r.ok ? r.json() : r.text().then((t) => Promise.reject(t.trim())))
     .then((list) => {
@@ -633,7 +631,7 @@ function renderDevice(body, p) {
         listBox.appendChild(row);
       }
     })
-    .catch((err) => { clear(listBox); listBox.appendChild(el("div", "empty", String(err))); });
+    .catch((err) => { clear(listBox); listBox.appendChild(el("div", "empty", "Could not reach this device: " + String(err))); });
 }
 
 // -- everything other devices share with this one --
@@ -799,7 +797,7 @@ function peerMenu(p) {
   const session = activeSession(p.device_id);
   const items = [{ label: "Open", icon: "monitor", onClick: () => navigate({ kind: "device", device: p.device_id, name: p.name }) }];
   if (paired || session) {
-    if (isOnline(p.device_id)) items.push({ label: "Push files\u2026", icon: "push", onClick: () => pushTo(p.device_id, p.name) });
+    items.push({ label: "Push files\u2026", icon: "push", onClick: () => pushTo(p.device_id, p.name) });
     if (paired) items.push({ label: "Unpair", icon: "x", onClick: () => unpair(p.device_id, paired) });
     else items.push({ label: "Disconnect", icon: "x", onClick: () => sessionAction(session.id, "close") });
   } else {
@@ -864,7 +862,6 @@ function renderPairedPage() {
     row.appendChild(m);
     const acts = el("div", "actions");
     const pushBtn = btn("Push files\u2026", () => pushTo(fpE, e.name), "ghost");
-    if (!onE) { pushBtn.disabled = true; pushBtn.title = "This device is offline"; }
     acts.appendChild(pushBtn);
     acts.appendChild(btn("Unpair", () => unpair(e.cert_fingerprint || e.device_id, e), "ghost"));
     row.appendChild(acts);

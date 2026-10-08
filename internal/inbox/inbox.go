@@ -218,6 +218,23 @@ func (m *Manager) Incoming() []IncomingView {
 	return out
 }
 
+// HasActivePush reports whether a push from peerFP is currently registered
+// (accepted, not cancelled or dead). Discovery uses it so a peer sending to us
+// is not evicted on transient probe misses.
+func (m *Manager) HasActivePush(peerFP string) bool {
+	if peerFP == "" {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.pushes {
+		if p.PeerFP == peerFP && !p.cancelled.Load() && !p.dead.Load() {
+			return true
+		}
+	}
+	return false
+}
+
 // Cancel stops an accepted push. Files already received stay; partial files
 // are removed. The sender's next request fails with ErrCancelled.
 func (m *Manager) Cancel(id string) bool {
