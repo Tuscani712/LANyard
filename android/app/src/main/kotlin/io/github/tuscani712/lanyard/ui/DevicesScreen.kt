@@ -72,7 +72,6 @@ fun DevicesScreen(padding: PaddingValues, vm: DevicesViewModel) {
     val context = LocalContext.current
     var showAdd by rememberSaveable { mutableStateOf(false) }
     var showQr by remember { mutableStateOf(false) }
-    var explain by remember { mutableStateOf<NearbyDevice?>(null) }
 
     val scanLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
         val data = result.data
@@ -151,7 +150,7 @@ fun DevicesScreen(padding: PaddingValues, vm: DevicesViewModel) {
         } else {
             state.nearby.forEach { device ->
                 val paired = state.paired.any { it.peer.host == device.host && it.peer.port == device.port }
-                NearbyRow(device, paired) { explain = device }
+                NearbyRow(device, paired) { vm.pairNearby(device) }
             }
         }
     }
@@ -173,18 +172,12 @@ fun DevicesScreen(padding: PaddingValues, vm: DevicesViewModel) {
         )
     }
 
-    explain?.let { device ->
-        AlertDialog(
-            onDismissRequest = { explain = null },
-            title = { Text("Pair with ${device.name}") },
-            text = {
-                Text(
-                    "Pairing needs a link from the other device (or its QR code). " +
-                        "Open LANyard on ${device.name}, choose \"Pair this device\", and " +
-                        "either scan its code or paste its link here.",
-                )
-            },
-            confirmButton = { TextButton(onClick = { explain = null }) { Text("Got it") } },
+    if (state.pairing is PairingStatus.Confirming) {
+        val confirming = state.pairing as PairingStatus.Confirming
+        ConfirmNearbyDialog(
+            confirming = confirming,
+            onMatch = vm::confirmNearby,
+            onCancel = vm::cancelNearby,
         )
     }
 
@@ -212,10 +205,10 @@ private fun PairingCard(status: PairingStatus, onDismiss: () -> Unit) {
             modifier = Modifier.fillMaxWidth().padding(16.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (status is PairingStatus.Running) {
+            if (status is PairingStatus.Running || status is PairingStatus.Confirming) {
                 CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                 Spacer(Modifier.width(12.dp))
-                Text("Pairing…")
+                Text(if (status is PairingStatus.Confirming) "Confirm the code on both devices…" else "Pairing…")
             } else if (status is PairingStatus.Done) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(if (status.ok) "Paired" else "Could not pair", style = MaterialTheme.typography.titleSmall)
@@ -226,6 +219,47 @@ private fun PairingCard(status: PairingStatus, onDismiss: () -> Unit) {
             }
         }
     }
+}
+
+@Composable
+private fun ConfirmNearbyDialog(
+    confirming: PairingStatus.Confirming,
+    onMatch: () -> Unit,
+    onCancel: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Confirm pairing") },
+        text = {
+            Column {
+                Text(
+                    confirming.peerName.ifEmpty { "A device" },
+                    style = MaterialTheme.typography.titleMedium,
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Pinned fingerprint",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    shortFingerprint(confirming.fingerprint),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+                if (confirming.sas.isNotEmpty()) {
+                    Spacer(Modifier.height(12.dp))
+                    Text("Both devices must show the same code:", style = MaterialTheme.typography.bodyMedium)
+                    Text(
+                        confirming.sas.chunked(3).joinToString(" "),
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = onMatch) { Text("Codes match") } },
+        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+    )
 }
 
 @Composable

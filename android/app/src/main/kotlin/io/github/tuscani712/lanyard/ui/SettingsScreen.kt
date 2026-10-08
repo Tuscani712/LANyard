@@ -20,7 +20,6 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -44,7 +43,9 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -59,30 +60,37 @@ import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.documentfile.provider.DocumentFile
-import io.github.tuscani712.lanyard.PeerService
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.tuscani712.lanyard.DevicesViewModel
 import io.github.tuscani712.lanyard.IdentityHolder
 import io.github.tuscani712.lanyard.PairedStatus
+import io.github.tuscani712.lanyard.PeerService
 import io.github.tuscani712.lanyard.SettingsHolder
+import io.github.tuscani712.lanyard.core.AppSettings
 import io.github.tuscani712.lanyard.core.Bandwidth
+import io.github.tuscani712.lanyard.core.Diagnostics
 import io.github.tuscani712.lanyard.core.InboxPaths
 import io.github.tuscani712.lanyard.core.PairedPeer
+import io.github.tuscani712.lanyard.core.SettingsCategory
 import io.github.tuscani712.lanyard.core.SpeedUnit
 import io.github.tuscani712.lanyard.core.ThemeMode
 import io.github.tuscani712.lanyard.transfer.TransferManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 private const val REPO_URL = "https://github.com/Tuscani712/LANyard"
+
+/** Applies a settings transform and persists it; shared by every tab. */
+private typealias SettingsUpdate = ((AppSettings) -> AppSettings) -> Unit
 
 @Composable
 fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
     val context = LocalContext.current
     val settings by SettingsHolder.settings.collectAsStateWithLifecycle()
+    val saveError by SettingsHolder.saveError.collectAsStateWithLifecycle()
     val state by vm.state.collectAsStateWithLifecycle()
     var name by rememberSaveable { mutableStateOf(IdentityHolder.deviceName) }
     var unpairTarget by remember { mutableStateOf<PairedPeer?>(null) }
@@ -91,6 +99,24 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
     var showLicenses by remember { mutableStateOf(false) }
     var showTroubleshoot by remember { mutableStateOf(false) }
 
+    // Hoisted above the Troubleshoot/Licenses early returns, so rotation or
+    // process death keeps the tab and Back from a sub-screen lands on it.
+    var selectedTab by rememberSaveable { mutableIntStateOf(0) }
+    var savedTab by rememberSaveable { mutableIntStateOf(-1) }
+
+    // Changing a persisted setting (or the device name) marks this tab saved.
+    // The first composition is not a change.
+    var lastSettings by remember { mutableStateOf(settings) }
+    var lastName by remember { mutableStateOf(name) }
+    LaunchedEffect(settings, name) {
+        if (settings != lastSettings || name != lastName) {
+            lastSettings = settings
+            lastName = name
+            savedTab = selectedTab
+        }
+    }
+
+    val onSettings: SettingsUpdate = { block -> SettingsHolder.update(block) }
     val folderUri = settings.downloadFolder?.let(Uri::parse)
     val folderName = remember(folderUri) { folderUri?.let { DocumentFile.fromTreeUri(context, it)?.name } }
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
@@ -116,133 +142,59 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
         return
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(padding)
-            .verticalScroll(rememberScrollState())
-            .imePadding()
-            .padding(24.dp),
-    ) {
-        SectionLabel("Device")
-        Text("Device name", style = MaterialTheme.typography.bodyMedium)
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = name,
-            onValueChange = {
-                name = it
-                IdentityHolder.setDeviceName(it)
-            },
-            singleLine = true,
-            keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
-            modifier = Modifier.fillMaxWidth(),
-        )
-        Spacer(Modifier.height(12.dp))
-        val deviceId = IdentityHolder.identity?.deviceId
-        IdRow("Device ID", deviceId ?: "—")
-        IdRow("Fingerprint", deviceId?.chunked(4)?.joinToString(" ") ?: "—")
-        Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = {
-                if (deviceId != null) copyToClipboard(context, "LANyard identity", deviceId)
-            }, enabled = deviceId != null) { Text("Copy") }
-            OutlinedButton(onClick = {
-                if (deviceId != null) shareText(context, "LANyard Device ID", "$deviceId")
-            }, enabled = deviceId != null) { Text("Share") }
-        }
-
-        SectionLabel("Appearance")
-        ChoiceRow(
-            label = "Theme",
-            options = ThemeMode.entries,
-            selected = settings.theme,
-            optionLabel = { it.name },
-            onSelect = { choice -> SettingsHolder.update { it.copy(theme = choice) } },
-        )
-        Spacer(Modifier.height(12.dp))
-        ChoiceRow(
-            label = "Speed unit",
-            options = SpeedUnit.entries,
-            selected = settings.speedUnit,
-            optionLabel = { if (it == SpeedUnit.MBps) "MB/s" else "Mbps" },
-            onSelect = { choice -> SettingsHolder.update { it.copy(speedUnit = choice) } },
-        )
-
-        SectionLabel("Notifications")
-        SwitchRow(
-            title = "Notifications",
-            subtitle = "When a transfer finishes or fails",
-            checked = settings.notifications,
-            onCheckedChange = { on -> SettingsHolder.update { it.copy(notifications = on) } },
-        )
-        SwitchRow(
-            title = "Sound when a transfer finishes",
-            subtitle = null,
-            checked = settings.soundOnComplete,
-            onCheckedChange = { on -> SettingsHolder.update { it.copy(soundOnComplete = on) } },
-        )
-        NotificationPermissionRow()
-
-        SectionLabel("Transfers")
-        SwitchRow(
-            title = "Wi-Fi only",
-            subtitle = "Refuse transfers on a metered or mobile connection",
-            checked = settings.wifiOnly,
-            onCheckedChange = { on -> SettingsHolder.update { it.copy(wifiOnly = on) } },
-        )
-        Spacer(Modifier.height(8.dp))
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text("Default download folder", style = MaterialTheme.typography.bodyLarge)
-                Text(
-                    folderName ?: "${InboxPaths.DEFAULT_LABEL} (default)",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (folderUri != null) {
-                TextButton(onClick = {
-                    SettingsHolder.update { it.copy(downloadFolder = null) }
-                }) { Text("Use default") }
-            }
-            OutlinedButton(onClick = { folderPicker.launch(folderUri) }) {
-                Text(if (folderUri == null) "Choose" else "Change")
-            }
-        }
-        BandwidthRow(settings.bandwidthLimitMBps) { mbps ->
-            SettingsHolder.update { it.copy(bandwidthLimitMBps = mbps) }
-        }
-        Spacer(Modifier.height(8.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = { confirmClear = true }) { Text("Clear history") }
-            OutlinedButton(onClick = { confirmCancel = true }) { Text("Cancel all") }
-        }
-
-        SectionLabel("Paired devices")
-        if (state.paired.isEmpty()) {
-            Text(
-                "No paired devices.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+    SettingsTabs(
+        selectedTab = selectedTab,
+        onTabSelected = { selectedTab = it },
+        savedTab = savedTab,
+        saveError = saveError,
+        modifier = Modifier.padding(padding),
+    ) { category ->
+        when (category) {
+            SettingsCategory.GENERAL -> GeneralTab(
+                name = name,
+                onNameChange = {
+                    name = it
+                    IdentityHolder.setDeviceName(it)
+                },
+                settings = settings,
+                onSettings = onSettings,
             )
-        } else {
-            state.paired.forEach { paired ->
-                PairedSettingRow(paired, onUnpair = { unpairTarget = paired.peer })
-                HorizontalDivider()
-            }
+
+            SettingsCategory.RECEIVING -> ReceivingTab(
+                settings = settings,
+                onSettings = onSettings,
+                folderUri = folderUri,
+                folderName = folderName,
+                onPickFolder = { folderPicker.launch(folderUri) },
+                onClearFolder = { onSettings { it.copy(downloadFolder = null) } },
+                onClearHistory = { confirmClear = true },
+                onCancelAll = { confirmCancel = true },
+            )
+
+            SettingsCategory.NETWORK_DISCOVERY -> NetworkDiscoveryTab(
+                settings = settings,
+                onSettings = onSettings,
+            )
+
+            SettingsCategory.NOTIFICATIONS -> NotificationsTab(
+                settings = settings,
+                onSettings = onSettings,
+            )
+
+            SettingsCategory.PAIRING_SECURITY -> PairingSecurityTab(
+                paired = state.paired,
+                onUnpair = { unpairTarget = it },
+            )
+
+            SettingsCategory.LOGS_DIAGNOSTICS -> LogsDiagnosticsTab(
+                context = context,
+                onOpenTroubleshoot = { showTroubleshoot = true },
+            )
+
+            SettingsCategory.ABOUT -> AboutTab(
+                onOpenLicenses = { showLicenses = true },
+            )
         }
-
-        SectionLabel("About")
-        AboutRow()
-        Spacer(Modifier.height(8.dp))
-        TextButton(onClick = { showTroubleshoot = true }) { Text("Troubleshoot") }
-        TextButton(onClick = { showLicenses = true }) { Text("Third-party licenses") }
-
-        SectionLabel("Shared with paired devices")
-        ShareSection()
     }
 
     if (confirmClear) {
@@ -283,6 +235,230 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
             confirmButton = { TextButton(onClick = { vm.dismissUnpairNotice() }) { Text("OK") } },
         )
     }
+}
+
+@Composable
+private fun GeneralTab(
+    name: String,
+    onNameChange: (String) -> Unit,
+    settings: AppSettings,
+    onSettings: SettingsUpdate,
+) {
+    val context = LocalContext.current
+    SectionLabel("Device")
+    Text("Device name", style = MaterialTheme.typography.bodyMedium)
+    Spacer(Modifier.height(8.dp))
+    OutlinedTextField(
+        value = name,
+        onValueChange = onNameChange,
+        singleLine = true,
+        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+        modifier = Modifier.fillMaxWidth(),
+    )
+    Spacer(Modifier.height(12.dp))
+    val deviceId = IdentityHolder.identity?.deviceId
+    IdRow("Device ID", deviceId ?: "—")
+    IdRow("Fingerprint", deviceId?.chunked(4)?.joinToString(" ") ?: "—")
+    Spacer(Modifier.height(8.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(onClick = {
+            if (deviceId != null) copyToClipboard(context, "LANyard identity", deviceId)
+        }, enabled = deviceId != null) { Text("Copy") }
+        OutlinedButton(onClick = {
+            if (deviceId != null) shareText(context, "LANyard Device ID", "$deviceId")
+        }, enabled = deviceId != null) { Text("Share") }
+    }
+
+    SectionLabel("Appearance")
+    ChoiceRow(
+        label = "Theme",
+        options = ThemeMode.entries,
+        selected = settings.theme,
+        optionLabel = { it.name },
+        onSelect = { choice -> onSettings { it.copy(theme = choice) } },
+    )
+    Spacer(Modifier.height(12.dp))
+    ChoiceRow(
+        label = "Speed unit",
+        options = SpeedUnit.entries,
+        selected = settings.speedUnit,
+        optionLabel = { if (it == SpeedUnit.MBps) "MB/s" else "Mbps" },
+        onSelect = { choice -> onSettings { it.copy(speedUnit = choice) } },
+    )
+}
+
+@Composable
+private fun ReceivingTab(
+    settings: AppSettings,
+    onSettings: SettingsUpdate,
+    folderUri: Uri?,
+    folderName: String?,
+    onPickFolder: () -> Unit,
+    onClearFolder: () -> Unit,
+    onClearHistory: () -> Unit,
+    onCancelAll: () -> Unit,
+) {
+    SectionLabel("Downloads")
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text("Default download folder", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                folderName ?: "${InboxPaths.DEFAULT_LABEL} (default)",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (folderUri != null) {
+            TextButton(onClick = onClearFolder) { Text("Use default") }
+        }
+        OutlinedButton(onClick = onPickFolder) {
+            Text(if (folderUri == null) "Choose" else "Change")
+        }
+    }
+    BandwidthRow(settings.bandwidthLimitMBps) { mbps ->
+        onSettings { it.copy(bandwidthLimitMBps = mbps) }
+    }
+
+    SectionLabel("Transfer history")
+    Text(
+        "Finished transfers are kept until you clear them. Running transfers can always be stopped.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(8.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        OutlinedButton(onClick = onClearHistory) { Text("Clear history") }
+        OutlinedButton(onClick = onCancelAll) { Text("Cancel all") }
+    }
+}
+
+@Composable
+private fun NetworkDiscoveryTab(
+    settings: AppSettings,
+    onSettings: SettingsUpdate,
+) {
+    SectionLabel("Network")
+    SwitchRow(
+        title = "Wi-Fi only",
+        subtitle = "Refuse transfers on a metered or mobile connection",
+        checked = settings.wifiOnly,
+        onCheckedChange = { on -> onSettings { it.copy(wifiOnly = on) } },
+    )
+    Spacer(Modifier.height(12.dp))
+    PortRow(settings.preferredPort) { onSettings { it.copy(preferredPort = 0) } }
+
+    SectionLabel("Discovery")
+    Text(
+        "Paired devices find this phone automatically on the local network (mDNS). " +
+            "The listener port is remembered so a paired desktop's saved address keeps working.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+}
+
+@Composable
+private fun PortRow(port: Int, onReset: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text("Listener port", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                if (port == 0) "Automatic" else "Preferred: $port",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        if (port != 0) {
+            TextButton(onClick = onReset) { Text("Reset") }
+        }
+    }
+}
+
+@Composable
+private fun NotificationsTab(
+    settings: AppSettings,
+    onSettings: SettingsUpdate,
+) {
+    SectionLabel("Notifications")
+    SwitchRow(
+        title = "Notifications",
+        subtitle = "When a transfer finishes or fails",
+        checked = settings.notifications,
+        onCheckedChange = { on -> onSettings { it.copy(notifications = on) } },
+    )
+    SwitchRow(
+        title = "Sound when a transfer finishes",
+        subtitle = null,
+        checked = settings.soundOnComplete,
+        onCheckedChange = { on -> onSettings { it.copy(soundOnComplete = on) } },
+    )
+    NotificationPermissionRow()
+}
+
+@Composable
+private fun PairingSecurityTab(
+    paired: List<PairedStatus>,
+    onUnpair: (PairedPeer) -> Unit,
+) {
+    SectionLabel("Paired devices")
+    if (paired.isEmpty()) {
+        Text(
+            "No paired devices.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    } else {
+        paired.forEach { status ->
+            PairedSettingRow(status, onUnpair = { onUnpair(status.peer) })
+            HorizontalDivider()
+        }
+    }
+
+    SectionLabel("Shared with paired devices")
+    ShareSection()
+}
+
+@Composable
+private fun LogsDiagnosticsTab(
+    context: Context,
+    onOpenTroubleshoot: () -> Unit,
+) {
+    SectionLabel("Diagnostics")
+    Text(
+        "A rolling log of connection, pairing and transfer events. It never contains " +
+            "file contents, full fingerprints or secrets.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
+    Spacer(Modifier.height(8.dp))
+    Button(onClick = onOpenTroubleshoot) { Text("Troubleshoot") }
+    Spacer(Modifier.height(4.dp))
+    Row {
+        TextButton(onClick = {
+            copyToClipboard(
+                context,
+                "LANyard log",
+                Diagnostics.copyLog(
+                    PeerService.diagnostics.snapshot(),
+                    PeerService.diagnostics.persistedLog(),
+                ),
+            )
+        }) { Text("Copy log") }
+        TextButton(onClick = { shareLogFile(context) }) { Text("Share log") }
+    }
+}
+
+@Composable
+private fun AboutTab(onOpenLicenses: () -> Unit) {
+    SectionLabel("About")
+    AboutRow()
+    Spacer(Modifier.height(8.dp))
+    TextButton(onClick = onOpenLicenses) { Text("Third-party licenses") }
 }
 
 @Composable

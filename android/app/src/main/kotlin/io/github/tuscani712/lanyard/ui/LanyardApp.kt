@@ -81,7 +81,7 @@ fun LanyardApp(viewModel: DevicesViewModel = viewModel()) {
         AlertDialog(
             onDismissRequest = { PeerService.dismissInterrupted() },
             title = { Text("Transfer interrupted") },
-            text = { Text("A file transfer was interrupted when the app left the foreground. The sender can resume it.") },
+            text = { Text("A file transfer was interrupted when the app left the foreground. It will resume automatically from where it stopped once the other device is reachable.") },
             confirmButton = { TextButton(onClick = { PeerService.dismissInterrupted() }) { Text("OK") } },
         )
     }

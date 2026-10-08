@@ -200,7 +200,17 @@ class TransferBoardTest {
         b.add(row("d", "send", TransferState.Done))
         assertEquals(setOf("r", "q"), b.failInterrupted().map { it.id }.toSet())
         assertEquals(TransferState.Failed, b.firstOrNull("r")?.state)
-        assertEquals("Interrupted", b.firstOrNull("q")?.message)
+        assertEquals(ForegroundTransferPolicy.INTERRUPTED_MESSAGE, b.firstOrNull("q")?.message)
         assertEquals(TransferState.Done, b.firstOrNull("d")?.state)
+    }
+
+    @Test
+    fun interruptedRowsReadWillResume() {
+        val b = board()
+        b.add(row("r", "receive", TransferState.Running))
+        b.add(row("s", "send", TransferState.Queued))
+        b.failInterrupted()
+        assertEquals("Interrupted – will resume", b.firstOrNull("r")?.message)
+        assertEquals("Interrupted – will resume", b.firstOrNull("s")?.message)
     }
 }

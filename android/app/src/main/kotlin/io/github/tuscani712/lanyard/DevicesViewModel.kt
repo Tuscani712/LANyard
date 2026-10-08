@@ -23,6 +23,7 @@ import io.github.tuscani712.lanyard.net.NsdDiscovery
 import io.github.tuscani712.lanyard.share.SourceResult
 import io.github.tuscani712.lanyard.share.spoolShare
 import io.github.tuscani712.lanyard.transfer.TransferManager
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -30,7 +31,9 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** How long a paired peer's reachability result is reused before re-probing. */
 private const val ONLINE_PROBE_CACHE_MS = 5_000L
@@ -41,6 +44,12 @@ data class PairedStatus(val peer: PairedPeer, val online: Boolean)
 /** The pairing attempt's state, for the Add-device dialog. */
 sealed interface PairingStatus {
     data object Running : PairingStatus
+    /**
+     * A nearby (no-QR) pairing is waiting for the person to compare the SAS on
+     * both devices. [fingerprint] is the pinned certificate fingerprint from the
+     * probe (shown as a short form), never the mDNS id.
+     */
+    data class Confirming(val sas: String, val peerName: String, val fingerprint: String) : PairingStatus
     data class Done(val message: String, val ok: Boolean) : PairingStatus
 }
 
@@ -97,6 +106,13 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     // Last reachability probe per peer fingerprint, so a burst of mDNS events
     // does not re-probe (and re-log) the same peer. See [isOnline].
     private val onlineCache = HashMap<String, Pair<Long, Boolean>>()
+
+    // The nearby (SAS) pairing runs on Dispatchers.IO and blocks there until the
+    // person confirms the code; this is the same waiter pattern PeerService uses
+    // for a push approval. Guarded because the UI thread answers it.
+    private val nearbyLock = Any()
+    private var nearbyWaiter: CompletableDeferred<Boolean>? = null
+    private var nearbyCancelled = false
 
     // Folder hierarchy inside one open share, so a system Back press walks up one
     // folder at a time (and then back to the share list). The root entry is the
@@ -217,6 +233,75 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun dismissPairing() = _state.update { it.copy(pairing = null) }
+
+    /**
+     * Pairs with a nearby device without a QR code: the core probes it, pins the
+     * certificate it presents, and blocks on [confirmNearby]/[cancelNearby]
+     * until the person compares the SAS. Nothing is stored unless they confirm.
+     */
+    fun pairNearby(device: NearbyDevice) {
+        viewModelScope.launch {
+            val identity = IdentityHolder.identity
+            if (identity == null) {
+                _state.update { it.copy(pairing = PairingStatus.Done("This device has no identity yet.", false)) }
+                return@launch
+            }
+            val waiter = CompletableDeferred<Boolean>()
+            synchronized(nearbyLock) {
+                nearbyWaiter = waiter
+                nearbyCancelled = false
+            }
+            _state.update { it.copy(pairing = PairingStatus.Running) }
+            val result = try {
+                withContext(Dispatchers.IO) {
+                    PairingFlow.pairNearby(
+                        host = device.host,
+                        port = device.port,
+                        identity = identity,
+                        selfName = IdentityHolder.deviceName,
+                        store = store,
+                        awaitCodesMatch = { prompt ->
+                            _state.update {
+                                it.copy(pairing = PairingStatus.Confirming(prompt.sas, prompt.peerName, prompt.fingerprint))
+                            }
+                            runBlocking { withTimeoutOrNull(120_000) { waiter.await() } } ?: false
+                        },
+                        diag = { PeerService.diagnostics.record(it) },
+                    )
+                }
+            } finally {
+                synchronized(nearbyLock) { nearbyWaiter = null }
+            }
+            val cancelled = synchronized(nearbyLock) { nearbyCancelled }
+            _state.update {
+                if (cancelled) {
+                    it.copy(pairing = PairingStatus.Done("Pairing cancelled.", false))
+                } else {
+                    it.copy(pairing = PairingStatus.Done(resultMessage(result), result is PairResult.Paired))
+                }
+            }
+            if (result is PairResult.Paired) {
+                // A fresh pairing supersedes any unpair we queued for this peer.
+                PeerService.clearPendingUnpair(result.peer.fingerprint)
+                refreshPaired()
+            }
+        }
+    }
+
+    /** The person confirmed the SAS matches on both devices: commit the pairing. */
+    fun confirmNearby() {
+        val waiter = synchronized(nearbyLock) { nearbyWaiter }
+        waiter?.complete(true)
+    }
+
+    /** The person cancelled (or dismissed) the SAS dialog: refuse and store nothing. */
+    fun cancelNearby() {
+        val waiter = synchronized(nearbyLock) {
+            nearbyCancelled = true
+            nearbyWaiter
+        }
+        waiter?.complete(false)
+    }
 
     /**
      * Removes a pairing. The peer is told to drop us too (best effort, and

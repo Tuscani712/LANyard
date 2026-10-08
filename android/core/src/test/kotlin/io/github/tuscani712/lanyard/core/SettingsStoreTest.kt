@@ -91,4 +91,19 @@ class SettingsStoreTest {
         assertEquals("8.0 Mbps", formatSpeed(1_000_000.0, SpeedUnit.Mbps))
         assertEquals("0.0 MB/s", formatSpeed(0.0, SpeedUnit.MBps))
     }
+
+    @Test
+    fun saveReportsSuccess() {
+        val (store, _) = store()
+        assertTrue(store.save(AppSettings(theme = ThemeMode.Dark)).isSuccess)
+    }
+
+    @Test
+    fun saveReportsFailureInsteadOfThrowing() {
+        val dir = Files.createTempDirectory("settings-bad").toFile()
+        val blocker = File(dir, "not-a-directory").apply { writeText("x") }
+        val store = JsonFileSettingsStore(File(blocker, "settings.json"))
+        val result = store.save(AppSettings(theme = ThemeMode.Dark))
+        assertTrue(result.isFailure, "expected a failed Result, got $result")
+    }
 }

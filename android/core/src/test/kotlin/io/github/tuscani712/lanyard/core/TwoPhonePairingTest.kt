@@ -13,6 +13,7 @@ import java.net.ServerSocket
 import java.nio.file.Files
 import java.security.SecureRandom
 import java.security.cert.X509Certificate
+import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLSocket
 
 /**
@@ -27,7 +28,7 @@ import javax.net.ssl.SSLSocket
  */
 class TwoPhonePairingTest {
 
-    private class Phone(val label: String) : AutoCloseable {
+    private class Phone(val label: String, private val advertisedFingerprint: String? = null) : AutoCloseable {
         val identity: Identity = Identity.generate(label)
         private val trustFile = Files.createTempFile("lanyard-trust", ".json").toFile().also { it.delete() }
         val trust: TrustStore = JsonFileTrustStore(trustFile)
@@ -48,7 +49,7 @@ class TwoPhonePairingTest {
         val port: Int = server.start(identity) { p ->
             JsonObject().apply {
                 addProperty("device_id", identity.deviceId.take(16))
-                addProperty("fingerprint", identity.deviceId)
+                addProperty("fingerprint", advertisedFingerprint ?: identity.deviceId)
                 addProperty("name", label)
                 addProperty("os", "android")
                 addProperty("version", "test")
@@ -79,6 +80,34 @@ class TwoPhonePairingTest {
                 val p = sessions.pending()
                 if (p.isNotEmpty()) {
                     sessions.accept(p.first().id, p.first().requested)
+                    return p.first().id
+                }
+                Thread.sleep(25)
+            }
+            return null
+        }
+
+        /** The person taps Accept but keeps the responder's push permission off. */
+        fun acceptNextPendingBrowseOnly(timeoutMs: Long = 15_000): String? {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                val p = sessions.pending()
+                if (p.isNotEmpty()) {
+                    sessions.accept(p.first().id, Permissions(browse = true, push = false))
+                    return p.first().id
+                }
+                Thread.sleep(25)
+            }
+            return null
+        }
+
+        /** The person taps Decline on the next prompt. Returns the declined session id. */
+        fun declineNextPending(timeoutMs: Long = 15_000): String? {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            while (System.currentTimeMillis() < deadline) {
+                val p = sessions.pending()
+                if (p.isNotEmpty()) {
+                    sessions.decline(p.first().id)
                     return p.first().id
                 }
                 Thread.sleep(25)
@@ -744,6 +773,248 @@ class TwoPhonePairingTest {
                     refusalLog.contains("invite"),
                     "the refusal reason should name the invite:\n$refusalLog",
                 )
+            }
+        }
+    }
+
+    /**
+     * Batch 9: tap a nearby device and pair with no QR. The initiator pins the
+     * certificate the probe actually saw, both phones show the same SAS, the
+     * codes are confirmed, and only then are both trust stores written.
+     */
+    @Test
+    @Timeout(60)
+    fun nearbyPairingWithoutQrWritesTrustOnBothPhones() {
+        Phone("Pixel A").use { a ->
+            Phone("Pixel B").use { b ->
+                val prompt = AtomicReference<Prompt>()
+                val bSas = AtomicReference<String>()
+                val acceptor = Thread {
+                    val deadline = System.currentTimeMillis() + 15_000
+                    while (System.currentTimeMillis() < deadline) {
+                        val p = b.sessions.pending()
+                        if (p.isNotEmpty()) {
+                            bSas.set(p.first().sas)
+                            // The responder keeps push off by default.
+                            b.sessions.accept(p.first().id, Permissions(browse = true, push = false))
+                            return@Thread
+                        }
+                        Thread.sleep(25)
+                    }
+                }.also { it.start() }
+
+                val result = PairingFlow.pairNearby(
+                    host = "127.0.0.1",
+                    port = b.port,
+                    identity = a.identity,
+                    selfName = a.label,
+                    store = a.trust,
+                    awaitCodesMatch = { p -> prompt.set(p); true },
+                )
+                acceptor.join()
+
+                assertTrue(result is PairResult.Paired, "A expected Paired, got $result")
+                assertNotNull(prompt.get(), "the person must be shown the SAS")
+                assertEquals(bSas.get(), prompt.get().sas, "both phones must show the same SAS")
+                assertNotNull(a.trust.find(b.identity.deviceId), "A must save B")
+                assertNotNull(b.trust.find(a.identity.deviceId), "B must save A")
+                assertFalse(a.trust.find(b.identity.deviceId)!!.push, "the responder's default is push off")
+                assertFalse(b.trust.find(a.identity.deviceId)!!.push, "the responder's default is push off")
+            }
+        }
+    }
+
+    /**
+     * The responder declines the prompt: the initiator sees the refusal and
+     * neither store is written.
+     */
+    @Test
+    @Timeout(60)
+    fun nearbyPairingRefusedByTheResponderStoresNothing() {
+        Phone("Pixel A").use { a ->
+            Phone("Pixel B").use { b ->
+                val decliner = Thread { b.declineNextPending() }.also { it.start() }
+                val result = PairingFlow.pairNearby(
+                    "127.0.0.1", b.port, a.identity, a.label, a.trust,
+                    awaitCodesMatch = { true },
+                )
+                decliner.join()
+
+                assertTrue(result is PairResult.Refused, "expected Refused, got $result")
+                assertTrue(a.trust.list().isEmpty(), "A must store nothing")
+                assertTrue(b.trust.list().isEmpty(), "B must store nothing")
+            }
+        }
+    }
+
+    /**
+     * The initiator cancels the confirmation (the codes were not compared): the
+     * session is closed and neither store is written.
+     */
+    @Test
+    @Timeout(60)
+    fun nearbyPairingCancelledByTheInitiatorStoresNothing() {
+        Phone("Pixel A").use { a ->
+            Phone("Pixel B").use { b ->
+                val acceptor = Thread { b.acceptNextPending() }.also { it.start() }
+                val asked = AtomicReference(false)
+                val result = PairingFlow.pairNearby(
+                    "127.0.0.1", b.port, a.identity, a.label, a.trust,
+                    awaitCodesMatch = { asked.set(true); false },
+                )
+                acceptor.join()
+
+                assertTrue(asked.get(), "the initiator must be asked once the responder accepted")
+                assertTrue(result is PairResult.Refused, "a cancelled confirmation must refuse, got $result")
+                assertTrue(a.trust.list().isEmpty(), "A must store nothing")
+                assertTrue(b.trust.list().isEmpty(), "B must store nothing")
+            }
+        }
+    }
+
+    /**
+     * The person compares the two screens, the codes differ, and declines: the
+     * session on the responder is closed so a retry is not blocked by a
+     * lingering prompt, and neither store is written.
+     */
+    @Test
+    @Timeout(60)
+    fun nearbyPairingCodeMismatchClosesTheSessionAndStoresNothing() {
+        Phone("Pixel A").use { a ->
+            Phone("Pixel B").use { b ->
+                val accepted = AtomicReference<String>()
+                val acceptor = Thread { accepted.set(b.acceptNextPending() ?: "") }.also { it.start() }
+                // The person rejects because the two codes do not match.
+                val result = PairingFlow.pairNearby(
+                    "127.0.0.1", b.port, a.identity, a.label, a.trust,
+                    awaitCodesMatch = { false },
+                )
+                acceptor.join()
+
+                assertTrue(result is PairResult.Refused, "a code mismatch must refuse, got $result")
+                val id = accepted.get()
+                assertTrue(id.isNotEmpty(), "B must have accepted the session")
+                val deadline = System.currentTimeMillis() + 5_000
+                var status = ""
+                while (System.currentTimeMillis() < deadline) {
+                    status = b.sessions.statusFor(id, a.identity.deviceId).status
+                    if (status == "closed") break
+                    Thread.sleep(25)
+                }
+                assertEquals("closed", status, "the initiator's cancel must close the session")
+                assertTrue(a.trust.list().isEmpty(), "A must store nothing")
+                assertTrue(b.trust.list().isEmpty(), "B must store nothing")
+            }
+        }
+    }
+
+    /**
+     * A nearby request the responder never answers expires under the initiator's
+     * bound, leaving both stores untouched.
+     */
+    @Test
+    @Timeout(60)
+    fun nearbyPairingExpiresWhenTheResponderNeverAnswers() {
+        Phone("Pixel A").use { a ->
+            Phone("Pixel B").use { b ->
+                val result = PairingFlow.pairNearby(
+                    "127.0.0.1", b.port, a.identity, a.label, a.trust,
+                    awaitCodesMatch = { true },
+                    timeoutMs = 1_000,
+                )
+
+                assertTrue(result is PairResult.Expired, "an unanswered nearby request must expire, got $result")
+                assertTrue(a.trust.list().isEmpty(), "A must store nothing")
+                assertTrue(b.trust.list().isEmpty(), "B must store nothing")
+            }
+        }
+    }
+
+    /**
+     * The fingerprint pinned and stored is the one the TLS handshake actually
+     * presented, not the one a hello body claims. A peer advertising a decoy in
+     * its hello body is still stored under its real certificate fingerprint, and
+     * the SAS is derived from that real value.
+     */
+    @Test
+    @Timeout(60)
+    fun nearbyPairingStoresTheProbedCertificateFingerprintNotTheHelloBody() {
+        val decoy = "ab".repeat(32)
+        Phone("Pixel A").use { a ->
+            Phone("Pixel B", advertisedFingerprint = decoy).use { b ->
+                val prompt = AtomicReference<Prompt>()
+                val acceptor = Thread { b.acceptNextPending() }.also { it.start() }
+                val result = PairingFlow.pairNearby(
+                    "127.0.0.1", b.port, a.identity, a.label, a.trust,
+                    awaitCodesMatch = { p -> prompt.set(p); true },
+                )
+                acceptor.join()
+
+                assertTrue(result is PairResult.Paired, "expected Paired, got $result")
+                val stored = a.trust.list().single()
+                assertEquals(b.identity.deviceId.lowercase(), stored.fingerprint, "the certificate fingerprint must be stored")
+                assertFalse(stored.fingerprint == decoy, "the hello body's fingerprint must never be stored")
+                assertEquals(b.identity.deviceId.lowercase(), prompt.get().fingerprint, "the dialog must show the pinned fingerprint")
+            }
+        }
+    }
+
+    /**
+     * The per-peer flood cap: a request from this same initiator is already
+     * pending, so the nearby pair gets a 409 and stores nothing.
+     */
+    @Test
+    @Timeout(60)
+    fun nearbyPairingRefusedWhenThePeerAlreadyHasOurRequestPending() {
+        Phone("Pixel A").use { a ->
+            Phone("Pixel B").use { b ->
+                // A connect request is not superseded by a pair request, so the
+                // one-pending-per-peer rule answers 409 to the nearby pair.
+                b.sessions.createIncoming(
+                    mode = "connect",
+                    peerFp = a.identity.deviceId,
+                    peerName = a.label,
+                    peerDevice = a.identity.deviceId,
+                    peerHost = "127.0.0.1",
+                    peerNonce = randomNonce(),
+                    requested = Permissions(browse = true),
+                )
+                val result = PairingFlow.pairNearby(
+                    "127.0.0.1", b.port, a.identity, a.label, a.trust,
+                    awaitCodesMatch = { true },
+                )
+                assertTrue(result is PairResult.Refused, "a 409 per-peer must surface as Refused, got $result")
+                assertTrue(a.trust.list().isEmpty(), "A must store nothing")
+            }
+        }
+    }
+
+    /**
+     * The total flood cap: the responder already holds its maximum pending
+     * requests, so the nearby pair gets a 429 and stores nothing.
+     */
+    @Test
+    @Timeout(60)
+    fun nearbyPairingRefusedWhenThePeerHasTooManyPendingRequests() {
+        Phone("Pixel A").use { a ->
+            Phone("Pixel B").use { b ->
+                repeat(PairingSessions.MAX_PENDING_TOTAL) { i ->
+                    b.sessions.createIncoming(
+                        mode = "connect",
+                        peerFp = "%02x".format(i).repeat(32),
+                        peerName = "P$i",
+                        peerDevice = "p$i",
+                        peerHost = "127.0.0.1",
+                        peerNonce = randomNonce(),
+                        requested = Permissions(browse = true),
+                    )
+                }
+                val result = PairingFlow.pairNearby(
+                    "127.0.0.1", b.port, a.identity, a.label, a.trust,
+                    awaitCodesMatch = { true },
+                )
+                assertTrue(result is PairResult.Refused, "a 429 total must surface as Refused, got $result")
+                assertTrue(a.trust.list().isEmpty(), "A must store nothing")
             }
         }
     }

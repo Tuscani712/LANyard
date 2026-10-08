@@ -8,7 +8,12 @@ import io.github.tuscani712.lanyard.core.Display
 import io.github.tuscani712.lanyard.core.DownloadResult
 import io.github.tuscani712.lanyard.core.DownloadSession
 import io.github.tuscani712.lanyard.core.DownloadTarget
+import io.github.tuscani712.lanyard.core.ForegroundTransferPolicy
+import io.github.tuscani712.lanyard.core.InterruptedTransfer
+import io.github.tuscani712.lanyard.core.InterruptedTransferRetry
+import io.github.tuscani712.lanyard.core.InterruptedTransferStore
 import io.github.tuscani712.lanyard.core.JsonFileTransferHistoryStore
+import io.github.tuscani712.lanyard.core.JsonFileInterruptedTransferStore
 import io.github.tuscani712.lanyard.core.MeteredNetwork
 import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PeerClient
@@ -82,6 +87,36 @@ object TransferManager {
     private val pushReceives = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val rateDisplays = java.util.concurrent.ConcurrentHashMap<String, RateEtaDisplay>()
 
+    /**
+     * The persisted descriptors for transfers that stopped early. They survive a
+     * process death so the row can still be read ("Interrupted – will resume")
+     * and a pull can be rebuilt and continued from its `.part`.
+     */
+    private var interrupted: InterruptedTransferStore? = null
+    private var interruptedRetry: InterruptedTransferRetry? = null
+
+    /**
+     * In-process resume handles. A push (send) holds its [PushSource]s here; a
+     * download holds its share id/path/tree. A network change or a backgrounded
+     * app keeps this map, so the transfer can be re-run without the person
+     * re-selecting anything. Wired in [init].
+     */
+    private val resumables = java.util.concurrent.ConcurrentHashMap<String, Resumable>()
+
+    /** Rebuilds the live address of a paired peer by fingerprint (wired by PeerService). */
+    @Volatile
+    private var peerResolver: ((String) -> PairedPeer?)? = null
+
+    /** One resumable transfer's rebuild recipe, kept only while it is live. */
+    private class Resumable(
+        val peer: PairedPeer,
+        val kind: String, // "send" | "download"
+        val sources: List<PushSource> = emptyList(),
+        val shareId: String = "",
+        val path: String = "",
+        val tree: Uri? = null,
+    )
+
     /** When the last live progress update was published, for the ~1/s gate. */
     private var lastProgressPublishAt = 0L
     private val cleanups = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
@@ -118,10 +153,13 @@ object TransferManager {
         app = application
         meter = meteredNetwork
         history = JsonFileTransferHistoryStore(File(application.filesDir, "transfers.json"), cap = HISTORY_CAP)
+        interrupted = JsonFileInterruptedTransferStore(File(application.filesDir, "transfers-interrupted.json"))
+        interruptedRetry = InterruptedTransferRetry(interrupted!!)
         board.replaceAll(history?.load() ?: emptyList())
-        // A row left Running/Queued has no live work after a restart: fail it,
-        // then persist that, so it cannot come back Running on the next launch.
-        board.failInterrupted("Interrupted")
+        // A row left Running/Queued has no live work after a restart: mark it
+        // "Interrupted – will resume" and remember the descriptor so the partial
+        // can be continued when the peer is reachable again.
+        board.failInterrupted().forEach { rememberInterrupted(it) }
         publish()
         persist()
         sweepSpool()
@@ -190,6 +228,139 @@ object TransferManager {
         persist()
     }
 
+    // --- interrupted / resume ---
+
+    /** Wires the paired-peer lookup used to re-run a persisted download. */
+    fun onPeerResolver(resolve: (String) -> PairedPeer?) {
+        peerResolver = resolve
+    }
+
+    /**
+     * The app is back in the foreground: any interrupted transfer whose peer is
+     * reachable may resume now. Called from `PeerService.start`.
+     */
+    fun onAppForeground() {
+        resumeInterrupted(null)
+    }
+
+    /**
+     * A peer was seen (a hello, an inbound handshake, an mDNS sighting): resume
+     * any interrupted transfer to it immediately, without waiting for the timer.
+     */
+    fun onPeerReachable(shortId: String? = null) {
+        resumeInterrupted(shortId)
+    }
+
+    /**
+     * Re-runs every interrupted transfer named by [shortId] (or all of them when
+     * null), from its partial where one exists. A row is only reset to Queued
+     * once the work is actually re-enqueued, so an unreachable peer simply
+     * leaves the row marked for a later attempt.
+     */
+    fun resumeInterrupted(shortId: String? = null) {
+        val candidates = interruptedRetry?.onPeerReachable(shortId) ?: emptyList()
+        for (entry in candidates) {
+            val row = board.firstOrNull(entry.id)
+            if (row == null) {
+                interrupted?.remove(entry.id)
+                continue
+            }
+            if (row.state != TransferState.Failed || row.message != ForegroundTransferPolicy.INTERRUPTED_MESSAGE) {
+                // The row was dismissed or ended another way: drop the stale descriptor.
+                if (row.state != TransferState.Failed) interrupted?.remove(entry.id)
+                continue
+            }
+            if (resumeOne(entry)) interrupted?.remove(entry.id)
+        }
+    }
+
+    /** Rebuilds and relaunches one interrupted transfer; true when it was started. */
+    private fun resumeOne(entry: InterruptedTransfer): Boolean {
+        val live = resumables[entry.id]
+        // Decide the recipe before touching the board: a receive with no stored
+        // action (a push the receiver cannot restart by itself) must stay marked
+        // for resume, not be flipped to Queued with nothing driving it.
+        val download = live?.kind == "download" || (live == null && entry.direction == "receive" && entry.payload.startsWith("download"))
+        val share = if (download) {
+            when {
+                live?.tree != null -> Triple(live.shareId, live.path, live.tree)
+                else -> parseDownloadPayload(entry.payload) ?: return false
+            }
+        } else {
+            null
+        }
+        if (live?.kind != "send" && !download) return false
+        val peer = live?.peer ?: peerResolver?.invoke(entry.peerFingerprint) ?: return false
+
+        // Reset the row so the service shows it as live again and Cancel works.
+        board.update(entry.id) {
+            it.copy(
+                state = TransferState.Queued,
+                message = null,
+                speed = 0.0,
+                etaSeconds = null,
+                finishingBytes = null,
+                done = if (download) it.done else 0L,
+            )
+        }
+        publish()
+        persist()
+        TransferService.start(app)
+        val throttle = throttle()
+        when {
+            live?.kind == "send" -> scope.launch { runPush(entry.id, peer, live.sources, throttle) }
+            download && share != null ->
+                scope.launch { runDownload(entry.id, peer, share.first, share.second, share.third, throttle, resume = true) }
+            else -> return false
+        }
+        return true
+    }
+
+    /** Records [row] as interrupted so the descriptor survives a restart. */
+    private fun rememberInterrupted(row: TransferRecord) {
+        val live = resumables[row.id]
+        val existing = interrupted?.list()?.firstOrNull { it.id == row.id }?.payload.orEmpty()
+        val payload = when {
+            live?.kind == "download" && live.tree != null -> downloadPayload(live.shareId, live.path, live.tree)
+            else -> existing
+        }
+        interrupted?.upsert(
+            InterruptedTransfer(
+                id = row.id,
+                direction = row.direction,
+                peerFingerprint = row.peerFingerprint,
+                peerName = row.peerName,
+                label = row.label,
+                total = row.total,
+                done = row.done,
+                queuedAt = now(),
+                payload = payload,
+            ),
+        )
+    }
+
+    /**
+     * Marks a live row interrupted: it is `Failed` for the UI but carries the
+     * "will resume" text and keeps its `.part`/`.lanpart`, and its descriptor is
+     * persisted for the automatic resume.
+     */
+    private fun markInterrupted(id: String) {
+        val row = board.end(id, TransferState.Failed, ForegroundTransferPolicy.INTERRUPTED_MESSAGE) ?: return
+        freeFor(row)
+        rememberInterrupted(board.firstOrNull(id) ?: row)
+        publish()
+        persist()
+    }
+
+    private fun downloadPayload(shareId: String, path: String, tree: Uri): String =
+        "download\n$shareId\n$path\n$tree"
+
+    private fun parseDownloadPayload(payload: String): Triple<String, String, Uri>? {
+        val parts = payload.split('\n')
+        if (parts.size < 4 || parts[0] != "download") return null
+        return Triple(parts[1], parts[2], Uri.parse(parts[3]))
+    }
+
     // --- destination folder (SAF) ---
 
     fun rememberedTree(): Uri? = SettingsHolder.settings.value.downloadFolder?.let(Uri::parse)
@@ -213,6 +384,7 @@ object TransferManager {
             return id
         }
         if (onFinished != null) cleanups[id] = onFinished
+        resumables[id] = Resumable(peer, "send", sources = sources)
         add(TransferRecord(id, "send", peer.name, peer.fingerprint, label, sources.sumOf { it.size }, 0, TransferState.Queued, null, 0.0, now()))
         TransferService.start(app)
         val throttle = throttle()
@@ -227,6 +399,7 @@ object TransferManager {
             add(TransferRecord(id, "receive", peer.name, peer.fingerprint, label, 0, 0, TransferState.Failed, blocked, 0.0, now()))
             return id
         }
+        resumables[id] = Resumable(peer, "download", shareId = shareId, path = path, tree = tree)
         add(TransferRecord(id, "receive", peer.name, peer.fingerprint, label, 0, 0, TransferState.Queued, null, 0.0, now()))
         TransferService.start(app)
         val throttle = throttle()
@@ -258,6 +431,19 @@ object TransferManager {
 
     fun noteReceiveStarted(id: String, peerName: String, peerFp: String, label: String, total: Long) {
         if (board.firstOrNull(id) != null) return
+        // A fresh push from this peer supersedes any row still waiting to resume
+        // for it: the peer is retrying, so the old interrupted row is stale. Its
+        // `.lanpart` is shared by peer+path, so the new session resumes from it.
+        board.snapshot()
+            .filter {
+                it.direction == "receive" &&
+                    it.message == ForegroundTransferPolicy.INTERRUPTED_MESSAGE &&
+                    it.peerFingerprint.equals(peerFp, ignoreCase = true)
+            }
+            .forEach {
+                board.dismiss(it.id)
+                interrupted?.remove(it.id)
+            }
         pushReceives.add(id)
         add(TransferRecord(id, "receive", peerName, peerFp, label, total, 0, TransferState.Running, null, 0.0, now()))
         // An incoming push has no enqueue* call, so start the foreground service
@@ -300,14 +486,21 @@ object TransferManager {
     }
 
     /**
-     * Fails every push still being received. Called when the peer server stops
-     * (the app was backgrounded): a push cannot continue without it, so the row
-     * should not sit at Running until the next restart. Pull downloads are not
-     * touched, since those keep running in the background.
+     * Marks every push still being received as interrupted. Called when the peer
+     * server stops (the app was backgrounded): a push cannot continue without
+     * it, so the row must not sit at Running until the next restart. The
+     * `.lanpart` spool is deliberately kept, so a re-offer from the sender
+     * resumes from the partial. Pull downloads are not touched, since those keep
+     * running in the background.
      */
     fun failPushReceives(reason: String) {
         for (id in pushReceives.toList()) {
-            if (board.isLive(id)) end(id, TransferState.Failed, reason)
+            if (board.isLive(id)) {
+                board.end(id, TransferState.Failed, ForegroundTransferPolicy.INTERRUPTED_MESSAGE)?.let { freeFor(it) }
+                board.firstOrNull(id)?.let { rememberInterrupted(it) }
+                publish()
+                persist()
+            }
         }
         pushReceives.clear()
     }
@@ -315,6 +508,8 @@ object TransferManager {
     /** Removes a finished (Done/Failed/Cancelled) row from the list. */
     fun dismiss(id: String) {
         pushReceives.remove(id)
+        resumables.remove(id)
+        interrupted?.remove(id)
         board.dismiss(id)
         publish()
         persist()
@@ -383,7 +578,15 @@ object TransferManager {
         }
     }
 
-    private suspend fun runDownload(id: String, peer: PairedPeer, shareId: String, path: String, tree: Uri, throttle: Throttle) {
+    private suspend fun runDownload(
+        id: String,
+        peer: PairedPeer,
+        shareId: String,
+        path: String,
+        tree: Uri,
+        throttle: Throttle,
+        resume: Boolean = false,
+    ) {
         val identity = IdentityHolder.identity ?: return end(id, TransferState.Failed, "no identity on this device")
         val root = DocumentFile.fromTreeUri(app, tree) ?: return end(id, TransferState.Failed, "cannot open the destination folder")
         val cancel = AtomicBoolean(false)
@@ -396,7 +599,7 @@ object TransferManager {
                 shareId = shareId,
                 path = path,
                 targetFor = { file ->
-                    docTarget(root, file.path.ifEmpty { file.name })
+                    docTarget(root, file.path.ifEmpty { file.name }, resume)
                         ?: throw IllegalStateException("cannot create ${file.name}")
                 },
                 onProgress = { index, file, received, total ->
@@ -418,16 +621,21 @@ object TransferManager {
         finishDownload(id, result, DocumentFile.fromTreeUri(app, tree)?.name)
     }
 
-    private fun docTarget(root: DocumentFile, rel: String): DownloadTarget? {
+    /**
+     * The destination for one downloaded file. The `.part` name is reused, not
+     * re-created, so a resume continues the file already on disk: [resume] reads
+     * its present length as the starting offset and [DownloadTarget.openAt]
+     * appends past it. A fresh download truncates the `.part`. Only a fully
+     * verified file is renamed to its real name.
+     */
+    private fun docTarget(root: DocumentFile, rel: String, resume: Boolean): DownloadTarget? {
         val dir = ensureDirs(root, rel.substringBeforeLast('/', "")) ?: return null
         val name = rel.substringAfterLast('/').ifEmpty { "download" }
-        // Download under a clear `.part` name so a cancel or crash never leaves
-        // a normal-looking file. Only a fully verified file is renamed.
-        val partName = if (dir.findFile("$name.part") == null) "$name.part" else uniqueName(dir, "$name.part")
-        val part = dir.createFile("application/octet-stream", partName) ?: return null
+        val part = dir.findFile("$name.part") ?: dir.createFile("application/octet-stream", "$name.part") ?: return null
         return DownloadTarget(
-            existingSize = 0,
-            openAt = { app.contentResolver.openOutputStream(part.uri, "wt") ?: error("cannot open output") },
+            existingSize = if (resume) part.length() else 0L,
+            openAt = { offset -> app.contentResolver.openOutputStream(part.uri, if (offset > 0) "wa" else "wt") ?: error("cannot open output") },
+            openExisting = { app.contentResolver.openInputStream(part.uri) ?: error("cannot read output") },
             commit = {
                 val finalName = if (dir.findFile(name) == null) name else uniqueName(dir, name)
                 if (part.name != finalName && !part.renameTo(finalName)) {
@@ -494,7 +702,7 @@ object TransferManager {
             PushResult.Cancelled -> end(id, TransferState.Cancelled, "Cancelled")
             PushResult.CancelledByReceiver -> end(id, TransferState.Failed, "The other device cancelled")
             PushResult.Refused -> end(id, TransferState.Failed, "The other device is not accepting files")
-            is PushResult.Failed -> end(id, TransferState.Failed, result.message)
+            is PushResult.Failed -> if (isTransportFailure(result.message)) markInterrupted(id) else end(id, TransferState.Failed, result.message)
         }
     }
 
@@ -503,11 +711,26 @@ object TransferManager {
             is DownloadResult.Done -> end(id, TransferState.Done, "Received ${result.files} file(s)", folder)
             DownloadResult.Cancelled -> end(id, TransferState.Cancelled, "Cancelled")
             DownloadResult.ShareEnded -> end(id, TransferState.Failed, "The sender stopped this share")
-            DownloadResult.PeerUnreachable -> end(id, TransferState.Failed, "The other device is unreachable")
+            DownloadResult.PeerUnreachable -> markInterrupted(id)
             is DownloadResult.HashMismatch -> end(id, TransferState.Failed, "A file failed its checksum")
             DownloadResult.UnsafePath -> end(id, TransferState.Failed, "The share contained an unsafe path")
-            is DownloadResult.Failed -> end(id, TransferState.Failed, result.message)
+            is DownloadResult.Failed -> if (isTransportFailure(result.message)) markInterrupted(id) else end(id, TransferState.Failed, result.message)
         }
+    }
+
+    /**
+     * Whether a failure message describes a transport loss (the connection
+     * dropped, the peer went away, the network changed) rather than a definitive
+     * refusal. Only a transport loss is treated as "interrupted – will resume";
+     * a checksum mismatch or an unpair is final.
+     */
+    private fun isTransportFailure(message: String): Boolean {
+        val m = message.lowercase()
+        return listOf(
+            "reach", "connect", "connection", "timeout", "timed out", "reset", "closed",
+            "network", "socket", "refused", "unreachable", "stalled", "no route", "host",
+            "broken pipe", "eof",
+        ).any { m.contains(it) }
     }
 
     /** Ends a live row; a row already ended (e.g. by Cancel) is left alone. */
@@ -517,6 +740,8 @@ object TransferManager {
         cleanups.remove(id)?.invoke()
         cancels.remove(id)
         rateDisplays.remove(id)
+        resumables.remove(id)
+        interrupted?.remove(id)
         publish()
         persist()
         if (state == TransferState.Done) {

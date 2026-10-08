@@ -25,6 +25,19 @@ sealed class PairResult {
 }
 
 /**
+ * What the person is asked to confirm during a nearby (no-QR) pairing: the
+ * short-authentication string both devices show, the peer's advertised name,
+ * and the certificate fingerprint pinned from the probe. The fingerprint shown
+ * is the one the TLS handshake actually presented — never the mDNS short id and
+ * never the value from a hello body.
+ */
+data class Prompt(
+    val sas: String,
+    val peerName: String,
+    val fingerprint: String,
+)
+
+/**
  * Runs the client half of pairing: parse a [PairLink], find the peer among its
  * addresses, verify the certificate it presents really is the one the link
  * promised, then exchange the one-time invite for a trust entry.
@@ -40,6 +53,13 @@ object PairingFlow {
      * minutes. With this budget the phase always ends promptly.
      */
     const val PROBE_DEADLINE_MS = 12_000L
+
+    /**
+     * The default bound for a nearby (SAS) pairing: the responder's prompt lives
+     * for [PairingSessions.PAIRING_TTL_MS] (2 minutes), so polling past that
+     * could only ever see it expire.
+     */
+    const val NEARBY_TIMEOUT_MS = 2 * 60 * 1000L
 
     /** Connect/read timeout for a single probe attempt (see [ProbeClient]). */
     private const val PROBE_ATTEMPT_TIMEOUT_MS = ProbeClient.DEFAULT_TIMEOUT_MS
@@ -107,6 +127,124 @@ object PairingFlow {
         val sessionId = session.str("session_id")
         if (sessionId.isEmpty()) return PairResult.Refused
 
+        return runSession(
+            client = client,
+            sessionId = sessionId,
+            timeoutMs = timeoutMs,
+            short = short,
+            diag = diag,
+            // A QR pairing needs no SAS compare: scanning the code already
+            // proved the trust, so the person's confirmation is implied.
+            approved = { true },
+            persist = { status -> finish(client, sessionId, status, match, payload, selfName, store, diag) },
+        )
+    }
+
+    /**
+     * Pairs with a nearby device without a QR code. It probes [host]:[port],
+     * pins the full certificate fingerprint actually presented by the TLS
+     * handshake (never the mDNS short id and never the value a hello body
+     * claims), asks the responder to start a session, and shows the person on
+     * both devices the same [Prompt.sas]. Only when [awaitCodesMatch] returns
+     * true is the session confirmed and the peer written to [store]; nothing is
+     * persisted before that, and a declined prompt closes the session and leaves
+     * both stores untouched.
+     *
+     * Blocking (the prompt wait included); call it off the main thread.
+     */
+    fun pairNearby(
+        host: String,
+        port: Int,
+        identity: Identity,
+        selfName: String,
+        store: TrustStore,
+        awaitCodesMatch: (Prompt) -> Boolean,
+        timeoutMs: Long = NEARBY_TIMEOUT_MS,
+        probeTimeoutMs: Int = PROBE_ATTEMPT_TIMEOUT_MS,
+        diag: (String) -> Unit = {},
+    ): PairResult {
+        val hello: PeerHello
+        val probe = ProbeClient(host, port, identity, probeTimeoutMs, probeTimeoutMs)
+        try {
+            hello = probe.hello()
+        } catch (e: Exception) {
+            diag("[pairing] addr=${host}:${port} nearby probe failed error=${e.javaClass.simpleName}")
+            return PairResult.Unreachable
+        }
+        // The fingerprint to pin is whatever certificate answered the probe. A
+        // blank one means no handshake happened, so there is nothing to trust.
+        val observedFp = probe.observedFingerprint()
+        if (observedFp.isBlank()) {
+            diag("[pairing] addr=${host}:${port} nearby probe returned no fingerprint")
+            return PairResult.Unreachable
+        }
+        val short = Display.shortFp(observedFp)
+        // A nearby list can still surface this phone (mDNS race); pairing with
+        // ourselves can only ever fail, so refuse before dialing.
+        if (SelfFilter.isSelf(SelfFilter.ownShortId(observedFp), SelfFilter.ownShortId(identity.deviceId))) {
+            diag("[pairing] peer=$short nearby probe rejected as self")
+            return PairResult.Refused
+        }
+        diag("[pairing] peer=$short nearby probe ok addr=${host}:${port}")
+
+        val client = PeerClient(host, port, identity, observedFp)
+        val selfNonce = randomNonce()
+        val session = try {
+            client.startSession(
+                mode = "pair",
+                name = selfName,
+                deviceId = identity.deviceId,
+                nonce = selfNonce,
+                requested = Permissions(browse = true, push = true),
+                // No invite: this is the SAS path, confirmed by the person.
+                invite = "",
+            )
+        } catch (_: PeerStatusException) {
+            diag("[pairing] peer=$short nearby session refused")
+            return PairResult.Refused
+        } catch (_: Exception) {
+            diag("[pairing] peer=$short nearby session unreachable")
+            return PairResult.Unreachable
+        }
+        val sessionId = session.str("session_id")
+        if (sessionId.isEmpty()) return PairResult.Refused
+        // The start response carries the responder's nonce; both phones derive
+        // the same SAS from the two fingerprints and the two nonces.
+        val desktopNonce = session.str("nonce")
+        val sas = Sas.code(identity.deviceId, observedFp, selfNonce, desktopNonce)
+        diag("[pairing] peer=$short nearby session id=$sessionId")
+
+        val peerName = hello.name
+        return runSession(
+            client = client,
+            sessionId = sessionId,
+            timeoutMs = timeoutMs,
+            short = short,
+            diag = diag,
+            approved = { awaitCodesMatch(Prompt(sas, peerName, observedFp)) },
+            persist = { status ->
+                confirmAndStore(client, sessionId, status, host, port, observedFp, peerName, store, short, diag)
+            },
+        )
+    }
+
+    /**
+     * The shared poll→confirm state machine used by both pairing paths: it waits
+     * for the responder to accept the request, asks [approved] for the person's
+     * confirmation (always true on the QR path, the SAS compare on the nearby
+     * path), then [persist]s. The session is closed on every non-success path so
+     * it never lingers and blocks a retry, and nothing is written before
+     * [approved] says yes.
+     */
+    private fun runSession(
+        client: PeerClient,
+        sessionId: String,
+        timeoutMs: Long,
+        short: String,
+        diag: (String) -> Unit,
+        approved: () -> Boolean,
+        persist: (JsonObject) -> PairResult,
+    ): PairResult {
         // A session we start but never finish must be ended here. Otherwise the
         // responder keeps a pending prompt for its 2-minute TTL, and
         // MAX_PENDING_PER_PEER (1) rejects the very next request from this same
@@ -130,7 +268,11 @@ object PairingFlow {
             when (status.str("status")) {
                 "accepted" -> {
                     diag("[pairing] peer=$short accepted id=$sessionId")
-                    return finish(client, sessionId, status, match, payload, selfName, store, diag)
+                    if (!approved()) {
+                        diag("[pairing] peer=$short declined by person id=$sessionId")
+                        return abort(PairResult.Refused)
+                    }
+                    return persist(status)
                 }
                 "rejected", "closed" -> {
                     diag("[pairing] peer=$short refused id=$sessionId status=${status.str("status")}")
@@ -166,24 +308,74 @@ object PairingFlow {
             runCatching { client.closeSession(sessionId) }
             return PairResult.Unreachable
         }
-        val granted = status.get("granted")?.takeIf { !it.isJsonNull }?.asJsonObject
         val name = try {
             client.hello().name.ifEmpty { payload.name.ifEmpty { selfName } }
         } catch (_: Exception) {
             payload.name
         }
+        val (browse, push) = grantedFrom(status)
         val peer = PairedPeer(
             fingerprint = payload.fingerprint.lowercase(),
             name = name.ifEmpty { payload.name },
             host = match.host,
             port = match.port,
-            browse = granted?.get("browse")?.takeIf { !it.isJsonNull }?.asBoolean ?: true,
-            push = granted?.get("push")?.takeIf { !it.isJsonNull }?.asBoolean ?: false,
+            browse = browse,
+            push = push,
             pairedAt = System.currentTimeMillis(),
         )
         store.save(peer)
         diag("[pairing] peer=${Display.shortFp(peer.fingerprint)} confirmed id=$sessionId stored=true")
         return PairResult.Paired(peer)
+    }
+
+    /**
+     * Confirms an already-accepted nearby session and stores the peer under the
+     * fingerprint the probe pinned. Only called after the person confirmed the
+     * SAS, so a failure here leaves no trust entry behind.
+     */
+    private fun confirmAndStore(
+        client: PeerClient,
+        sessionId: String,
+        status: JsonObject,
+        host: String,
+        port: Int,
+        fingerprint: String,
+        peerName: String,
+        store: TrustStore,
+        short: String,
+        diag: (String) -> Unit,
+    ): PairResult {
+        try {
+            client.confirmSession(sessionId)
+        } catch (_: PeerStatusException) {
+            runCatching { client.closeSession(sessionId) }
+            return PairResult.Refused
+        } catch (_: Exception) {
+            runCatching { client.closeSession(sessionId) }
+            return PairResult.Unreachable
+        }
+        val (browse, push) = grantedFrom(status)
+        val peer = PairedPeer(
+            // The full certificate fingerprint from the probe, normalized — the
+            // only fingerprint we ever trust for a device found over mDNS.
+            fingerprint = fingerprint.lowercase(),
+            name = peerName,
+            host = host,
+            port = port,
+            browse = browse,
+            push = push,
+            pairedAt = System.currentTimeMillis(),
+        )
+        store.save(peer)
+        diag("[pairing] peer=$short confirmed id=$sessionId stored=true")
+        return PairResult.Paired(peer)
+    }
+
+    /** The responder's granted permissions from an accepted status poll. */
+    private fun grantedFrom(status: JsonObject): Pair<Boolean, Boolean> {
+        val granted = status.get("granted")?.takeIf { !it.isJsonNull }?.asJsonObject
+        return (granted?.get("browse")?.takeIf { !it.isJsonNull }?.asBoolean ?: true) to
+            (granted?.get("push")?.takeIf { !it.isJsonNull }?.asBoolean ?: false)
     }
 
     private data class HostPort(val host: String, val port: Int)

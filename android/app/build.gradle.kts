@@ -59,6 +59,13 @@ android {
         compose = true
     }
 
+    testOptions {
+        unitTests {
+            // Robolectric needs merged resources to inflate the Compose test host.
+            isIncludeAndroidResources = true
+        }
+    }
+
     sourceSets {
         getByName("main") {
             // THIRD_PARTY.md is copied here by copyLicenses below.
@@ -105,6 +112,14 @@ dependencies {
     implementation(libs.compose.material.icons.extended)
 
     debugImplementation(libs.compose.ui.tooling)
+    debugImplementation(libs.compose.ui.test.manifest)
+
+    testImplementation(platform(libs.compose.bom))
+    testImplementation(libs.compose.ui.test.junit4)
+    testImplementation(libs.junit4)
+    testImplementation(libs.robolectric)
+    testImplementation(libs.androidx.test.core)
+    testImplementation(libs.androidx.test.ext.junit)
 }
 
 // Bundle the repository's third-party notices as an asset for the About screen.

@@ -207,12 +207,16 @@ object PeerService {
      */
     fun onPeerReachable(shortId: String? = null, host: String? = null, port: Int? = null) {
         if (!initialized) return
+        // An interrupted transfer to this peer may now be continued.
+        TransferManager.onPeerReachable(shortId)
         lifetimeScope.launch(Dispatchers.IO) { unpairRetries.onPeerReachable(shortId, host, port) }
     }
 
     /** The app came to the foreground: pending unpairs may now be deliverable. */
     fun onAppForeground() {
         if (!initialized) return
+        // And any interrupted transfer whose peer is reachable may resume.
+        TransferManager.onAppForeground()
         lifetimeScope.launch(Dispatchers.IO) { unpairRetries.onPeerReachable() }
     }
 
@@ -227,6 +231,9 @@ object PeerService {
         diagnostics.file = writer
         diagnostics.markAppStart()
         trustStore = JsonFileTrustStore(File(app.filesDir, "trust/peers.json"))
+        // Lets an interrupted download resolve the peer's current address and
+        // resume from its partial when the peer is reachable again.
+        TransferManager.onPeerResolver { fp -> trustStore.find(fp) }
         pendingUnpairs = JsonFilePendingUnpairStore(File(app.filesDir, "trust/pending-unpair.json"))
         // Every delivery consults the current pairing, so a revoke queued before
         // a re-pair is refused instead of unpairing the fresh device.

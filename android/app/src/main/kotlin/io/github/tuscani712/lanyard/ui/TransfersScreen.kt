@@ -1,5 +1,6 @@
 package io.github.tuscani712.lanyard.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -42,6 +43,12 @@ import io.github.tuscani712.lanyard.transfer.TransferManager
 fun TransfersScreen(padding: PaddingValues) {
     val records by TransferManager.state.collectAsStateWithLifecycle()
     val settings by SettingsHolder.settings.collectAsStateWithLifecycle()
+
+    // Back never cancels a transfer: while anything is running, Back leaves the
+    // transfers alone (the foreground service keeps them going). Nothing here
+    // calls TransferManager.cancel on a navigation event.
+    val active = records.any { it.state == TransferState.Running || it.state == TransferState.Queued }
+    BackHandler(enabled = active) { /* keep transfers running; do not cancel */ }
 
     if (records.isEmpty()) {
         Column(

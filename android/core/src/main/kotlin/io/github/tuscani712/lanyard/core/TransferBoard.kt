@@ -185,8 +185,12 @@ class TransferBoard(
         return aged
     }
 
-    /** On restart a row that was Running/Queued has no live work: fail it. */
-    fun failInterrupted(message: String = "Interrupted"): List<TransferRecord> {
+    /**
+     * On restart a row that was Running/Queued has no live work: fail it, but
+     * with the "will resume" text, since the `.part`/`.lanpart` partial is kept
+     * for the automatic resume.
+     */
+    fun failInterrupted(message: String = ForegroundTransferPolicy.INTERRUPTED_MESSAGE): List<TransferRecord> {
         val interrupted = records.filter { it.state == TransferState.Running || it.state == TransferState.Queued }
         if (interrupted.isEmpty()) return emptyList()
         records = records.map {

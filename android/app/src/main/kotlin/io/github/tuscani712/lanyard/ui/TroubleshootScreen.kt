@@ -190,7 +190,7 @@ private fun copyToClipboard(context: Context, label: String, value: String) {
 }
 
 /** Sends the durable log file through the system share sheet via FileProvider. */
-private fun shareLogFile(context: Context) {
+internal fun shareLogFile(context: Context) {
     val file = PeerService.logFile()
     if (file == null || !file.exists()) {
         Toast.makeText(context, "No log file yet", Toast.LENGTH_SHORT).show()

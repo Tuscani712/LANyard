@@ -36,7 +36,12 @@ data class AppSettings(
 /** Persists [AppSettings]. Implementations must never throw on read. */
 interface SettingsStore {
     fun load(): AppSettings
-    fun save(settings: AppSettings)
+
+    /**
+     * Persists [settings]. Returns a failed [Result] rather than throwing so a
+     * caller can surface "couldn't save" without crashing the UI.
+     */
+    fun save(settings: AppSettings): Result<Unit>
 }
 
 /**
@@ -59,7 +64,7 @@ class JsonFileSettingsStore(private val file: File) : SettingsStore {
     }
 
     @Synchronized
-    override fun save(settings: AppSettings) {
+    override fun save(settings: AppSettings): Result<Unit> = runCatching {
         val dir = file.absoluteFile.parentFile
         dir?.mkdirs()
         val tmp = File(dir, file.name + ".tmp")

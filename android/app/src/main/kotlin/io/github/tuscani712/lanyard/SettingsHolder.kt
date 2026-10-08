@@ -20,6 +20,14 @@ object SettingsHolder {
     private val _settings = MutableStateFlow(AppSettings())
     val settings: StateFlow<AppSettings> = _settings.asStateFlow()
 
+    /**
+     * The message from the last failed save, or null once a save succeeds or
+     * the error has been dismissed. Settings still apply in memory: a failure
+     * means the change may not survive a restart, not that it was rejected.
+     */
+    private val _saveError = MutableStateFlow<String?>(null)
+    val saveError: StateFlow<String?> = _saveError.asStateFlow()
+
     fun init(context: Context) {
         if (store != null) return
         val s = JsonFileSettingsStore(File(context.applicationContext.filesDir, "settings.json"))
@@ -27,10 +35,22 @@ object SettingsHolder {
         _settings.value = s.load()
     }
 
-    /** Applies [block] to the current settings and persists the result. */
-    fun update(block: (AppSettings) -> AppSettings) {
+    /**
+     * Applies [block] to the current settings, updates the in-memory flow, and
+     * persists the result. The new settings are visible immediately; [saveError]
+     * carries any storage failure. Auto-save is unchanged.
+     */
+    fun update(block: (AppSettings) -> AppSettings): Result<Unit> {
         val next = block(_settings.value)
         _settings.value = next
-        store?.save(next)
+        val result = store?.save(next) ?: Result.success(Unit)
+        _saveError.value = result.exceptionOrNull()?.let { error ->
+            "Couldn't save settings: ${error.message ?: error::class.simpleName}"
+        }
+        return result
+    }
+
+    fun dismissSaveError() {
+        _saveError.value = null
     }
 }
