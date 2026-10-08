@@ -225,14 +225,15 @@ class InboxReceiver(
 
     /**
      * Removes an in-flight session that died on its own and reports it failed
-     * exactly once. Returns false when the session was already gone (finished or
+     * exactly once. The `.lanpart` spool is intentionally KEPT: a dropped
+     * connection is not a decline, so a re-offer for the same peer/file resumes
+     * from the existing partial's size. Only an explicit [cancel] deletes the
+     * spool. Returns false when the session was already gone (finished or
      * explicitly cancelled), so [onDone]/[onCancelled]/[onFailed] never double.
      */
     @Synchronized
     fun fail(id: String, reason: String): Boolean {
-        val s = sessions.remove(id) ?: return false
-        val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
-        for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
+        if (sessions.remove(id) == null) return false
         onChange()
         onFailed(id, reason)
         return true

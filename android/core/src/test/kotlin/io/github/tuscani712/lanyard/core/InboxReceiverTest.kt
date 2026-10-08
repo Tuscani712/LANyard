@@ -236,6 +236,22 @@ class InboxReceiverTest {
     }
 
     @Test
+    fun cancelDeletesTheSpoolUnlikeFailure() {
+        val r = receiver()
+        val o = r.offer("p", "P", listOf(req("a.bin", 10)), 0, 0)
+        r.writeChunk(o.pushId, "p", "a.bin", 0, byteArrayOf(1, 2, 3).inputStream())
+        assertTrue(
+            spool.walkTopDown().any { it.isFile && it.name == "a.bin.lanpart" },
+            "test setup: a partial spool should exist before cancel",
+        )
+        assertTrue(r.cancel(o.pushId, "p"))
+        assertFalse(
+            spool.walkTopDown().any { it.isFile && it.name == "a.bin.lanpart" },
+            "an explicit cancel must delete the spool",
+        )
+    }
+
+    @Test
     fun midBodyFailureFiresFailedExactlyOnceAndNeverDone() {
         val failures = mutableListOf<Pair<String, String>>()
         val dones = mutableListOf<String>()
@@ -257,6 +273,35 @@ class InboxReceiverTest {
         assertEquals(listOf(o.pushId), failures.map { it.first }, "exactly one onFailed for the session")
         assertEquals("Connection lost", failures.single().second)
         assertTrue(dones.isEmpty(), "a failed receive must never report done")
+        // A drop is not a decline: the partial spool must survive so a re-offer
+        // can resume from it. Only an explicit cancel deletes the spool.
+        assertTrue(
+            spool.walkTopDown().any { it.isFile && it.name == "a.bin.lanpart" },
+            "a failed receive must keep the .lanpart spool for resume",
+        )
+    }
+
+    @Test
+    fun droppedMidBodyKeepsTheSpoolAndReofferResumesFromThePartialSize() {
+        val r1 = receiver()
+        val first = r1.offer("p", "P", listOf(req("a.bin", 10)), 0, 0)
+        assertThrows(java.io.IOException::class.java) {
+            // 3 bytes, then the source throws: the body dies mid-file.
+            r1.writeChunk(first.pushId, "p", "a.bin", 0, ThrowingInput(3))
+        }
+        val part = spool.walkTopDown().first { it.isFile && it.name == "a.bin.lanpart" }
+        assertEquals(3L, part.length(), "a dropped receive must keep the partial .lanpart spool")
+
+        // The peer re-offers the same file; a fresh receiver (as after a reconnect)
+        // must report the partial as the resume offset.
+        val r2 = receiver()
+        val second = r2.offer("p", "P", listOf(req("a.bin", 10)), 0, 0)
+        assertEquals(3L, second.offsets["a.bin"], "a re-offer must resume from the partial size")
+
+        // Finish from that offset and verify the placed file is complete/correct.
+        r2.writeChunk(second.pushId, "p", "a.bin", 3, byteArrayOf(4, 5, 6, 7, 8, 9, 10).inputStream())
+        r2.complete(second.pushId, "p", "a.bin", sha(byteArrayOf(7, 7, 7, 4, 5, 6, 7, 8, 9, 10)))
+        assertEquals(10L, placed["a.bin"], "the resumed file must be placed whole")
     }
 
     @Test
