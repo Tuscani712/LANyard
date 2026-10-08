@@ -227,6 +227,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	// store; there is no bypass in a shipped build.
 	var auth peerapi.Authorizer = trustStore
 	inboxMgr := inbox.New(inboxDir(dataDir, st.InboxFolder), onChange)
+	defer inboxMgr.Close()   // stop the stall reaper on shutdown
 	_ = inboxMgr.EnsureDir() // the default ~/LANyard folder is created up front
 	trMgr.SetBandwidthLimit(st.BandwidthLimitMBps)
 	var peerSrv *peerapi.Server
@@ -346,6 +347,16 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	// the body before it reaches the desktop.
 	inboxMgr.SetOnSnippet(func(peerFP, text string) {
 		notifier.Notify(notify.Notice{Title: "LANyard text message", Body: resolvePeer(peerFP) + ": " + text})
+	})
+	// A push whose connection died or stalled before finishing is removed from
+	// the incoming list; tell the person and record a failed receive entry.
+	inboxMgr.SetOnFail(func(peerFP, reason string) {
+		peer := resolvePeer(peerFP)
+		log.Warn("incoming push failed", "peer", peer, "reason", reason)
+		if ui != nil {
+			ui.NotifyUser(uiserver.Notice{Kind: "receive-failed", Peer: peer, Error: reason})
+		}
+		trMgr.RecordReceiveFailed(peerFP, peer, reason)
 	})
 
 	// A device asking to Connect or Pair is shown even when the window is not

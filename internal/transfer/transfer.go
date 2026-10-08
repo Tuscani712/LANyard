@@ -524,6 +524,31 @@ func (m *Manager) RecordReceived(peerFP, peerName string, files []ReceivedFile, 
 	m.onChange()
 }
 
+// RecordReceiveFailed records a push that failed before any file landed (a
+// dropped or stalled connection) as a failed "receive" entry, so the Transfers
+// history reflects it instead of silently dropping it.
+func (m *Manager) RecordReceiveFailed(peerFP, peerName, reason string) {
+	now := time.Now()
+	job := &Job{
+		ID:         "r_" + randHex(6),
+		Direction:  "receive",
+		PeerID:     peerFP,
+		PeerName:   peerName,
+		ShareLabel: "Inbox",
+		StartedAt:  now,
+		UpdatedAt:  now,
+		FinishedAt: now,
+		State:      StateFailed,
+		Error:      reason,
+		wake:       make(chan struct{}, 1),
+	}
+	m.mu.Lock()
+	m.jobs[job.ID] = job
+	m.mu.Unlock()
+	m.persist()
+	m.onChange()
+}
+
 // Resume restarts a paused/failed/waiting job.
 func (m *Manager) Resume(id string) error {
 	m.mu.Lock()
