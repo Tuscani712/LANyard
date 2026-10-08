@@ -65,7 +65,11 @@ class PushSession(private val client: PeerClient, private val throttle: Throttle
                     offset = offset,
                     total = source.size,
                     source = source.open(),
-                    onBytes = { sent -> onProgress(index, sent, source.size) },
+                    // Live byte progress is held below 100% until the receiver
+                    // has acknowledged the file: the bytes are on the wire, but
+                    // the upload can still be refused. Honest 100% comes only
+                    // after pushCompleteFile() returns a 2xx (below).
+                    onBytes = { sent -> onProgress(index, SendProgress.whileSending(sent, source.size), source.size) },
                     isCancelled = isCancelled,
                     throttle = throttle,
                 )

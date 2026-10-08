@@ -1,0 +1,126 @@
+package io.github.tuscani712.lanyard.core
+
+import com.google.gson.JsonObject
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Timeout
+import java.io.ByteArrayInputStream
+import java.nio.file.Files
+
+/**
+ * Fix 3: send progress must be honest. A file is not shown at 100% merely
+ * because its bytes reached the socket's buffered stream; the true total is
+ * reported only once the receiver's response to the file has been read and is a
+ * 2xx success. Tests run against an in-process [PeerServer], no Go binary needed.
+ */
+class PushProgressTest {
+
+    private class Phone(destination: PushDestination) : AutoCloseable {
+        val identity: Identity = Identity.generate("Pixel")
+        private val trustFile = Files.createTempFile("lanyard-trust", ".json").toFile().also { it.delete() }
+        val trust: TrustStore = JsonFileTrustStore(trustFile)
+        private val sessions = PairingSessions(selfFp = { identity.deviceId }, trust = trust)
+        private val spool = Files.createTempDirectory("lanyard-spool").toFile()
+        private val receiver = InboxReceiver(
+            spoolRoot = spool,
+            destination = destination,
+            freeBytes = { 1L shl 40 },
+        )
+        private val server = PeerServer(
+            sessions = sessions,
+            receiver = receiver,
+            invites = PairInvites(),
+            isPaired = { trust.find(it) },
+        )
+        val port: Int = server.start(identity) { p ->
+            JsonObject().apply {
+                addProperty("device_id", identity.deviceId.take(16))
+                addProperty("fingerprint", identity.deviceId)
+                addProperty("name", "Pixel")
+                addProperty("os", "android")
+                addProperty("version", "test")
+                addProperty("port", p)
+            }
+        }
+
+        fun pair(clientFp: String) {
+            trust.save(PairedPeer(clientFp, "Desktop", "127.0.0.1", 0, browse = true, push = true, pairedAt = 1))
+        }
+
+        override fun close() = server.stop()
+    }
+
+    private fun clientFor(phone: Phone, client: Identity): PeerClient =
+        PeerClient("127.0.0.1", phone.port, client, phone.identity.deviceId)
+
+    private fun bytesOf(n: Int): ByteArray = ByteArray(n) { (it % 251).toByte() }
+
+    @Test
+    @Timeout(60)
+    fun liveProgressStaysBelowFullUntilTheReceiverAccepts() {
+        val placed = mutableListOf<String>()
+        Phone(PushDestination { rel, f, _ -> placed.add("$rel:${f.length()}"); rel.substringAfterLast('/') }).use { phone ->
+            val client = Identity.generate("Desktop")
+            phone.pair(client.deviceId)
+            val bytes = bytesOf(512 * 1024 + 7)
+            val total = bytes.size.toLong()
+            val events = mutableListOf<Pair<Long, Long>>()
+
+            val result = PushSession(clientFor(phone, client)).push(
+                listOf(PushSource("big.bin", total, 0) { ByteArrayInputStream(bytes) }),
+                onProgress = { _, sent, fileTotal -> events.add(sent to fileTotal) },
+            )
+
+            assertTrue(result is PushResult.Sent, "expected Sent, got $result")
+            val full = events.filter { it.first == total }
+            assertEquals(1, full.size, "exactly one 100% report, after acceptance: $events")
+            assertEquals(total to total, events.last(), "the 100% report must be the last one: $events")
+            assertTrue(
+                events.dropLast(1).all { it.first < total },
+                "no 100% may be reported before the response is read: $events",
+            )
+            assertTrue(placed.any { it == "big.bin:$total" }, "the receiver must have placed the file: $placed")
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun failedCompleteNeverReportsFull() {
+        // The file body streams fine, but the receiver rejects it when placing
+        // it (an unwritable inbox): the complete request is answered with 500.
+        Phone(PushDestination { _, _, _ -> throw RuntimeException("save location unavailable") }).use { phone ->
+            val client = Identity.generate("Desktop")
+            phone.pair(client.deviceId)
+            val bytes = bytesOf(64 * 1024)
+            val total = bytes.size.toLong()
+            val events = mutableListOf<Pair<Long, Long>>()
+
+            val result = PushSession(clientFor(phone, client)).push(
+                listOf(PushSource("big.bin", total, 0) { ByteArrayInputStream(bytes) }),
+                onProgress = { _, sent, fileTotal -> events.add(sent to fileTotal) },
+            )
+
+            assertTrue(result is PushResult.Failed, "expected Failed, got $result")
+            assertTrue(
+                events.none { it.first == total },
+                "a non-2xx response must never report 100%: $events",
+            )
+        }
+    }
+
+    @Test
+    fun unsentBytesAreReportedAsTheTrueFraction() {
+        assertEquals(50L, SendProgress.whileSending(50, 100))
+        assertEquals(0L, SendProgress.whileSending(0, 100))
+    }
+
+    @Test
+    fun aFileInFlightIsNeverReportedAsComplete() {
+        // Even once every byte is on the wire, the display holds one byte back
+        // until the receiver acknowledges the file.
+        assertEquals(99L, SendProgress.whileSending(100, 100))
+        assertEquals(0L, SendProgress.whileSending(1, 1))
+        assertEquals(0L, SendProgress.whileSending(0, 0))
+    }
+}

@@ -38,12 +38,17 @@ class MainActivity : ComponentActivity() {
     override fun onStart() {
         super.onStart()
         // The phone-side peer server runs while the app is in the foreground on
-        // any screen; there is no background service in this milestone.
+        // any screen. If it is backgrounded during a transfer, PeerService keeps
+        // it up (see onStop) until the transfer finishes.
         PeerService.start(applicationContext)
     }
 
     override fun onStop() {
-        PeerService.stop()
+        // Backgrounded: keep the peer listener and mDNS advertisement up while a
+        // transfer is running (the transfer foreground service keeps the process
+        // alive), so the phone is still reachable. PeerService stops it once the
+        // last transfer drains, or immediately when nothing is running.
+        PeerService.onAppBackgrounded()
         super.onStop()
     }
 }

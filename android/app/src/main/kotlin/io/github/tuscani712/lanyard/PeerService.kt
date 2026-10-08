@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import com.google.gson.JsonObject
 import io.github.tuscani712.lanyard.core.ApprovalOutcome
+import io.github.tuscani712.lanyard.core.BackgroundListenerPolicy
 import io.github.tuscani712.lanyard.core.Display
 import io.github.tuscani712.lanyard.core.Identity
 import io.github.tuscani712.lanyard.core.InboxReceiver
@@ -24,9 +25,14 @@ import io.github.tuscani712.lanyard.net.NetAddrs
 import io.github.tuscani712.lanyard.net.NsdAdvertiser
 import io.github.tuscani712.lanyard.transfer.TransferManager
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
@@ -65,6 +71,15 @@ object PeerService {
     private var appVersion: String = ""
     private var currentInvite: PairInvites.Invite? = null
     private var metered: AndroidMeteredNetwork? = null
+
+    /**
+     * How the listener lifetime survives backgrounding while a transfer runs.
+     * A dedicated scope observes [TransferManager.state] so a deferred teardown
+     * fires as soon as the last transfer drains.
+     */
+    private val lifetimePolicy = BackgroundListenerPolicy()
+    private val lifetimeScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var watchingLifetime = false
 
     private val _pending = MutableStateFlow<List<IncomingRequest>>(emptyList())
     val pending: StateFlow<List<IncomingRequest>> = _pending.asStateFlow()
@@ -142,11 +157,30 @@ object PeerService {
             app.packageManager.getPackageInfo(app.packageName, 0).versionName
         }.getOrNull().orEmpty()
         initialized = true
+        watchLifetime()
+    }
+
+    /**
+     * While a teardown is deferred (the app is backgrounded with a transfer in
+     * flight), stop the listener the moment the last transfer finishes. A
+     * transfer that is cancelled or fails counts too, since [TransferManager]
+     * drops it from its active set.
+     */
+    private fun watchLifetime() {
+        if (watchingLifetime) return
+        watchingLifetime = true
+        lifetimeScope.launch {
+            TransferManager.state.collect {
+                if (lifetimePolicy.shouldStop(TransferManager.running().isNotEmpty())) stop()
+            }
+        }
     }
 
     /** Starts advertising and the peer server; safe to call on every foreground. */
     fun start(context: Context) {
         if (!initialized) init(context)
+        // Foregrounded again before a deferred stop ran: keep listening.
+        lifetimePolicy.foreground()
         if (server != null) return
         val id = IdentityHolder.identity ?: return
         val app = context.applicationContext
@@ -174,7 +208,19 @@ object PeerService {
         advertiser = NsdAdvertiser(app).also { it.start(id.deviceId.take(16), txt(id, port), port) }
     }
 
+    /**
+     * The app was backgrounded (`onStop`). The listener stays up, served by the
+     * transfer foreground service, while any transfer is running (sending or
+     * receiving) so the phone remains reachable; otherwise it stops now, exactly
+     * as before. When deferred, [watchLifetime] stops it once the last transfer
+     * drains. No transfer ever means no extra notification.
+     */
+    fun onAppBackgrounded() {
+        if (!lifetimePolicy.background(TransferManager.running().isNotEmpty())) stop()
+    }
+
     fun stop() {
+        lifetimePolicy.foreground()
         server?.stop()
         server = null
         advertiser?.stop()
