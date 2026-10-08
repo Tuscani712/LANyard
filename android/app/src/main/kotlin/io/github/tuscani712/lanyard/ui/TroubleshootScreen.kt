@@ -128,6 +128,13 @@ fun TroubleshootScreen(padding: PaddingValues, vm: DevicesViewModel, onBack: () 
                     TextButton(onClick = {
                         copyToClipboard(
                             context,
+                            "LANyard log",
+                            Diagnostics.copyLog(io.github.tuscani712.lanyard.PeerService.diagnostics.snapshot()),
+                        )
+                    }) { Text("Copy log") }
+                    TextButton(onClick = {
+                        copyToClipboard(
+                            context,
                             "LANyard diagnostics",
                             Diagnostics.copyReport(results, io.github.tuscani712.lanyard.PeerService.diagnostics.snapshot()),
                         )

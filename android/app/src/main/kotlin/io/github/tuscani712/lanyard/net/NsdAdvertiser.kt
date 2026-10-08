@@ -12,12 +12,16 @@ import android.net.nsd.NsdServiceInfo
  * The instance name is the short Device ID; Android may rename it on a
  * conflict, which is fine because peers key on the `id` attribute.
  */
-class NsdAdvertiser(context: Context) {
+class NsdAdvertiser(
+    context: Context,
+    // One line per mDNS advertise event for the diagnostics report.
+    private val diag: (String) -> Unit = {},
+) {
     private val nsdManager =
         context.applicationContext.getSystemService(Context.NSD_SERVICE) as NsdManager
     private var listener: NsdManager.RegistrationListener? = null
 
-    fun start(instanceName: String, txt: Map<String, String>, port: Int) {
+    fun start(instanceName: String, txt: Map<String, String>, port: Int, trigger: String = "service") {
         stop()
         val info = NsdServiceInfo().apply {
             serviceName = instanceName
@@ -26,9 +30,12 @@ class NsdAdvertiser(context: Context) {
             txt.forEach { (k, v) -> if (v.isNotEmpty()) setAttribute(k, v) }
         }
         val l = object : NsdManager.RegistrationListener {
-            override fun onServiceRegistered(info: NsdServiceInfo) = Unit
+            override fun onServiceRegistered(info: NsdServiceInfo) =
+                diag("[discovery] mdns registered port=$port trigger=$trigger result=ok")
+
             override fun onRegistrationFailed(info: NsdServiceInfo, errorCode: Int) {
                 if (listener === this) listener = null
+                diag("[discovery] mdns registered port=$port trigger=$trigger result=failed error=$errorCode")
             }
 
             override fun onServiceUnregistered(info: NsdServiceInfo) = Unit
@@ -43,8 +50,10 @@ class NsdAdvertiser(context: Context) {
     }
 
     fun stop() {
+        val had = listener != null
         listener?.let { l -> runCatching { nsdManager.unregisterService(l) } }
         listener = null
+        if (had) diag("[discovery] mdns unregistered result=ok")
     }
 
     companion object {

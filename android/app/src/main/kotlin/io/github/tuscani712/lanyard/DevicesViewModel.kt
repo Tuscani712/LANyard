@@ -83,7 +83,7 @@ data class DevicesUiState(
 class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     // The same trust store the peer server writes to when a desktop pairs to us.
     private val store: TrustStore get() = PeerService.trust
-    private val discovery = NsdDiscovery(app)
+    private val discovery = NsdDiscovery(app, diag = { PeerService.diagnostics.record(it) })
 
     private val _state = MutableStateFlow(DevicesUiState())
     val state: StateFlow<DevicesUiState> = _state.asStateFlow()
@@ -117,6 +117,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 // lists itself and invites a pairing that cannot work.
                 val own = SelfFilter.ownShortId(IdentityHolder.identity?.deviceId.orEmpty())
                 if (!SelfFilter.isSelf(device.shortId, own)) {
+                    PeerService.diagnostics.record("[discovery] peer=${device.shortId.take(8)} seen addr=${device.host}:${device.port} source=mdns result=ok")
                     _state.update { current ->
                         current.copy(nearby = (current.nearby.filterNot { it.shortId == device.shortId } + device))
                     }
@@ -125,8 +126,10 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 }
             },
             onLost = { shortId ->
+                PeerService.diagnostics.record("[discovery] peer=${shortId.take(8)} lost source=mdns result=evicted miss=1")
                 _state.update { current -> current.copy(nearby = current.nearby.filterNot { it.shortId == shortId }) }
             },
+            trigger = "screen",
         )
     }
 
@@ -155,7 +158,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 return@launch
             }
             val result = withContext(Dispatchers.IO) {
-                PairingFlow.pair(link.trim(), identity, IdentityHolder.deviceName, store)
+                PairingFlow.pair(link.trim(), identity, IdentityHolder.deviceName, store, diag = { PeerService.diagnostics.record(it) })
             }
             _state.update {
                 it.copy(pairing = PairingStatus.Done(resultMessage(result), result is PairResult.Paired))
@@ -175,15 +178,18 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     fun unpair(peer: PairedPeer) {
         viewModelScope.launch {
             val identity = IdentityHolder.identity
-            withContext(Dispatchers.IO) {
+            val remoteOk = withContext(Dispatchers.IO) {
+                var ok = false
                 if (identity != null) {
-                    runCatching {
+                    ok = runCatching {
                         PeerClient(peer.host, peer.port, identity, peer.fingerprint).revokeTrust()
-                    }
+                    }.isSuccess
                 }
                 store.remove(peer.fingerprint)
                 TransferManager.cancelForPeer(peer.fingerprint)
+                ok
             }
+            PeerService.diagnostics.record("[pairing] peer=${peer.fingerprint.take(8)} unpair source=phone remote=$remoteOk result=ok")
             _state.update { current ->
                 val detail = current.detail
                 if (detail != null && detail.peer.fingerprint.equals(peer.fingerprint, ignoreCase = true)) {
@@ -316,11 +322,16 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun isOnline(peer: PairedPeer): Boolean {
         val identity = IdentityHolder.identity ?: return false
+        val started = System.currentTimeMillis()
+        val short = peer.fingerprint.take(8)
         return try {
             val probe = ProbeClient(peer.host, peer.port, identity)
             probe.hello()
-            probe.observedFingerprint().equals(peer.fingerprint, ignoreCase = true)
-        } catch (_: Exception) {
+            val match = probe.observedFingerprint().equals(peer.fingerprint, ignoreCase = true)
+            PeerService.diagnostics.record("[discovery] peer=$short hello addr=${peer.host}:${peer.port} result=${if (match) "online" else "mismatch"} elapsed=${System.currentTimeMillis() - started}ms")
+            match
+        } catch (e: Exception) {
+            PeerService.diagnostics.record("[discovery] peer=$short hello addr=${peer.host}:${peer.port} result=offline elapsed=${System.currentTimeMillis() - started}ms error=${e.javaClass.simpleName}")
             false
         }
     }

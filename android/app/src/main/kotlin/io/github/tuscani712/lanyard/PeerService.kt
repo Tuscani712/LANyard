@@ -116,6 +116,7 @@ object PeerService {
             selfFp = { IdentityHolder.identity?.deviceId.orEmpty() },
             trust = trustStore,
             onChange = { publish() },
+            diag = { diagnostics.record(it) },
         )
         inviteStore = PairInvites()
         spoolDir = File(app.filesDir, "spool").apply { mkdirs() }
@@ -148,7 +149,11 @@ object PeerService {
                 val uri = SettingsHolder.settings.value.downloadFolder?.let { Uri.parse(it) } ?: return@ready true
                 runCatching { DocumentFile.fromTreeUri(app, uri)?.canWrite() == true }.getOrDefault(false)
             },
+            diag = { diagnostics.record(it) },
         )
+        // The Transfers screen's Cancel on a receive row must reach the peer
+        // server that owns the live push session.
+        TransferManager.onReceiveCancel { id -> receiver.cancelLocal(id) }
         shareStore = ShareStore(app)
         shareSource = SafShareSource(app, shareStore)
         _shares.value = shareStore.list()
@@ -171,7 +176,10 @@ object PeerService {
         watchingLifetime = true
         lifetimeScope.launch {
             TransferManager.state.collect {
-                if (lifetimePolicy.shouldStop(TransferManager.running().isNotEmpty())) stop()
+                if (lifetimePolicy.shouldStop(TransferManager.running().isNotEmpty())) {
+                    diagnostics.record("[discovery] listener stopped transfers-drained")
+                    stop()
+                }
             }
         }
     }
@@ -196,7 +204,7 @@ object PeerService {
             wifiOnly = { SettingsHolder.settings.value.wifiOnly },
             approval = pushApproval,
             onUnpair = { trustStore.remove(it) },
-            shares = ShareServer(shareSource).also { shareServer = it },
+            shares = ShareServer(shareSource, diag = { diagnostics.record(it) }).also { shareServer = it },
             diagnostics = diagnostics,
         )
         val port = try {
@@ -205,7 +213,9 @@ object PeerService {
             return
         }
         server = srv
-        advertiser = NsdAdvertiser(app).also { it.start(id.deviceId.take(16), txt(id, port), port) }
+        diagnostics.record("[discovery] peer-server started port=$port")
+        advertiser = NsdAdvertiser(app, diag = { diagnostics.record(it) })
+            .also { it.start(id.deviceId.take(16), txt(id, port), port, trigger = "lifecycle") }
     }
 
     /**
@@ -216,7 +226,11 @@ object PeerService {
      * drains. No transfer ever means no extra notification.
      */
     fun onAppBackgrounded() {
-        if (!lifetimePolicy.background(TransferManager.running().isNotEmpty())) stop()
+        if (lifetimePolicy.background(TransferManager.running().isNotEmpty())) {
+            diagnostics.record("[discovery] keep-listener transfer-active")
+        } else {
+            stop()
+        }
     }
 
     fun stop() {
@@ -231,11 +245,15 @@ object PeerService {
     }
 
     fun accept(id: String) {
+        val short = sessionStore.pending().firstOrNull { it.id == id }?.peerFp?.take(8) ?: "?"
+        diagnostics.record("[pairing] peer=$short accept source=phone id=$id result=ok")
         sessionStore.accept(id)
         publish()
     }
 
     fun decline(id: String) {
+        val short = sessionStore.pending().firstOrNull { it.id == id }?.peerFp?.take(8) ?: "?"
+        diagnostics.record("[pairing] peer=$short refuse source=phone id=$id reason=declined")
         sessionStore.decline(id)
         publish()
     }

@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import io.github.tuscani712.lanyard.core.Display
 
 /**
  * Browses for `_lanyard._tcp` services with [NsdManager], decoding the same TXT
@@ -13,7 +14,11 @@ import android.net.wifi.WifiManager
  * A [WifiManager.MulticastLock] is held only while discovering, so the radio
  * can deliver multicast packets; it is always released by [stop].
  */
-class NsdDiscovery(context: Context) {
+class NsdDiscovery(
+    context: Context,
+    // One line per discovery event for the diagnostics report.
+    private val diag: (String) -> Unit = {},
+) {
     private val appContext = context.applicationContext
     private val nsdManager = appContext.getSystemService(Context.NSD_SERVICE) as NsdManager
     private val wifiManager = appContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
@@ -23,17 +28,21 @@ class NsdDiscovery(context: Context) {
     private val resolving = HashSet<String>()
     private val shortByService = HashMap<String, String>()
 
-    fun start(onFound: (NearbyDevice) -> Unit, onLost: (String) -> Unit) {
+    fun start(onFound: (NearbyDevice) -> Unit, onLost: (String) -> Unit, trigger: String = "screen") {
         if (listener != null) return
         lock = wifiManager.createMulticastLock("lanyard-mdns").apply {
             setReferenceCounted(true)
             acquire()
         }
+        diag("[discovery] mdns browse start trigger=$trigger result=ok")
 
         val discovery = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) = Unit
             override fun onDiscoveryStopped(serviceType: String) = Unit
-            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) = stop()
+            override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                diag("[discovery] mdns browse start result=failed error=$errorCode")
+                stop()
+            }
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = stop()
 
             override fun onServiceFound(info: NsdServiceInfo) {
@@ -67,6 +76,7 @@ class NsdDiscovery(context: Context) {
                 // already stopped
             }
         }
+        if (listener != null) diag("[discovery] mdns browse stop result=ok")
         listener = null
         resolving.clear()
         lock?.let {
@@ -82,6 +92,7 @@ class NsdDiscovery(context: Context) {
     private fun resolver(onFound: (NearbyDevice) -> Unit) = object : NsdManager.ResolveListener {
         override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
             resolving.remove(info.serviceName)
+            diag("[discovery] mdns resolve service=${info.serviceName} result=failed error=$errorCode")
         }
 
         override fun onServiceResolved(info: NsdServiceInfo) {
@@ -89,6 +100,7 @@ class NsdDiscovery(context: Context) {
             val attrs = info.attributes.mapValues { String(it.value) }
             val shortId = attrs["id"] ?: info.serviceName
             shortByService[info.serviceName] = shortId
+            diag("[discovery] mdns resolved id=${Display.shortFp(shortId)} addr=$host:${attrs["p"]?.toIntOrNull() ?: info.port} source=mdns result=ok")
             onFound(
                 NearbyDevice(
                     shortId = shortId,

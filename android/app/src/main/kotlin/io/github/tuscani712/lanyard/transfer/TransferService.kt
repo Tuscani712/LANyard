@@ -13,6 +13,8 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import io.github.tuscani712.lanyard.SettingsHolder
+import io.github.tuscani712.lanyard.core.TransferRecord
+import io.github.tuscani712.lanyard.core.TransferState
 import io.github.tuscani712.lanyard.core.formatSpeed
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers

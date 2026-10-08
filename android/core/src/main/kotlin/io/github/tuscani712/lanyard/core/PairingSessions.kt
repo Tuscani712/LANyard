@@ -45,6 +45,9 @@ class PairingSessions(
     private val onChange: () -> Unit = {},
     private val clock: () -> Long = System::currentTimeMillis,
     random: SecureRandom = SecureRandom(),
+    // One line per pairing event for the diagnostics report:
+    // `[pairing] peer=<short> <event> ...`.
+    private val diag: (String) -> Unit = {},
 ) {
     companion object {
         const val MODE_CONNECT = "connect"
@@ -146,6 +149,7 @@ class PairingSessions(
             updatedAt = now,
         )
         sessions[sess.id] = sess
+        diag("[pairing] peer=${Display.shortFp(peerFp)} request id=${sess.id} mode=$mode ${if (viaQr) "qr" else "sas"} requested=browse:${requested.browse},push:${requested.push}")
         onChange()
         return view(sess)
     }
@@ -165,6 +169,7 @@ class PairingSessions(
         sess.granted = sess.requested
         sess.status = STATUS_ACCEPTED
         sess.updatedAt = clock()
+        diag("[pairing] peer=${Display.shortFp(sess.peerFp)} accepted id=$id granted=browse:${sess.granted.browse},push:${sess.granted.push}")
         onChange()
         return true
     }
@@ -176,6 +181,7 @@ class PairingSessions(
         if (sess.status == STATUS_PENDING || sess.status == STATUS_ACCEPTED) {
             sess.status = STATUS_REJECTED
             sess.updatedAt = clock()
+            diag("[pairing] peer=${Display.shortFp(sess.peerFp)} refused id=$id reason=declined")
             onChange()
         }
         return true
@@ -205,6 +211,7 @@ class PairingSessions(
                 ),
             )
         }
+        diag("[pairing] peer=${Display.shortFp(sess.peerFp)} confirmed id=$id stored=${sess.mode == MODE_PAIR}")
         onChange()
         return view(sess)
     }
@@ -215,6 +222,7 @@ class PairingSessions(
         val sess = requirePeer(id, callerFp)
         sess.status = STATUS_CLOSED
         sess.updatedAt = clock()
+        diag("[pairing] peer=${Display.shortFp(sess.peerFp)} closed id=$id")
         onChange()
         return true
     }
@@ -290,12 +298,14 @@ class PairingSessions(
                     if (now - s.updatedAt > PAIRING_TTL_MS) {
                         s.status = STATUS_EXPIRED
                         s.updatedAt = now
+                        diag("[pairing] peer=${Display.shortFp(s.peerFp)} expired id=${s.id}")
                         changed = true
                     }
                 STATUS_ACTIVE ->
                     if (now - s.updatedAt > SESSION_INACTIVITY_MS) {
                         s.status = STATUS_CLOSED
                         s.updatedAt = now
+                        diag("[pairing] peer=${Display.shortFp(s.peerFp)} closed id=${s.id} reason=inactive")
                         changed = true
                     }
                 STATUS_REJECTED, STATUS_CLOSED, STATUS_EXPIRED ->

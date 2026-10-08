@@ -217,6 +217,12 @@ object Diagnostics {
         }
         return Redaction.redact(checks + events)
     }
+
+    /**
+     * The full in-memory event log on its own, redacted, for the "Copy log"
+     * action on the troubleshoot screen.
+     */
+    fun copyLog(serverEvents: List<String>): String = Redaction.redact(serverEvents.joinToString("\n"))
 }
 
 /** Removes secrets from report text: tokens, invites and full fingerprints. */

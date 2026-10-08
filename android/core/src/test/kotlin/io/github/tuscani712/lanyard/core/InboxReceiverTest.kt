@@ -96,6 +96,50 @@ class InboxReceiverTest {
     }
 
     @Test
+    fun cancelLocalFreesTheSpoolAndTheStaleSessionGuard() {
+        val failures = mutableListOf<Pair<String, String>>()
+        val cancels = mutableListOf<Pair<String, String>>()
+        val r = InboxReceiver(
+            spoolRoot = spool,
+            destination = PushDestination { rel, _, _ -> rel },
+            freeBytes = { 1L shl 40 },
+            onFailed = { id, reason -> failures.add(id to reason) },
+            onCancelled = { id, reason -> cancels.add(id to reason) },
+        )
+        val o = r.offer("peerA", "A", listOf(req("photo.jpg", 100)), 0, 0)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val writer = Thread {
+            runCatching { r.writeChunk(o.pushId, "peerA", "photo.jpg", 0, BlockingInput(3, release)) }
+        }.apply { isDaemon = true; start() }
+        try {
+            assertTrue(
+                waitFor(2_000) { spool.walkTopDown().any { it.isFile && it.name == "photo.jpg.lanpart" && it.length() >= 3 } },
+                "test setup: a body should be in flight",
+            )
+            // A live body blocks a fresh offer (the stale-session guard).
+            assertEquals(
+                409,
+                assertThrows(PeerHttpException::class.java) {
+                    r.offer("peerA", "A", listOf(req("photo.jpg", 100)), 0, 0)
+                }.code,
+            )
+            // Cancel from this phone's UI frees it.
+            assertEquals("peerA", r.cancelLocal(o.pushId))
+        } finally {
+            release.countDown()
+            writer.join(2_000)
+        }
+        assertEquals(0, r.count(), "a locally cancelled receive must leave the incoming list")
+        assertFalse(
+            spool.walkTopDown().any { it.isFile && it.name == "photo.jpg.lanpart" },
+            "cancel must delete the .lanpart spool",
+        )
+        // The stale-session guard is gone: the same peer may offer again.
+        val again = r.offer("peerA", "A", listOf(req("photo.jpg", 100)), 0, 0)
+        assertTrue(again.pushId != o.pushId, "a re-offer after cancel must get a fresh session")
+    }
+
+    @Test
     fun resumeReportsTheBytesAlreadyOnDisk() {
         val r = receiver()
         val first = r.offer("p", "P", listOf(req("a.bin", 10)), 0, 0)
@@ -141,13 +185,142 @@ class InboxReceiverTest {
     }
 
     @Test
-    fun secondInFlightSamePeerAndNameIsRefused() {
+    fun secondOfferSamePeerAndNameWhileBodyInFlightIsRefused() {
+        // A body genuinely in flight is a legitimate concurrent push: the new
+        // offer must not clobber the shared spool, so it is still refused.
         val r = receiver()
-        r.offer("peerA", "A", listOf(req("photo.jpg", 3)), 0, 0)
-        val ex = assertThrows(PeerHttpException::class.java) {
-            r.offer("peerA", "A", listOf(req("photo.jpg", 3)), 0, 0)
+        val first = r.offer("peerA", "A", listOf(req("photo.jpg", 100)), 0, 0)
+        val release = java.util.concurrent.CountDownLatch(1)
+        val writer = Thread {
+            runCatching {
+                r.writeChunk(first.pushId, "peerA", "photo.jpg", 0, BlockingInput(3, release))
+            }
+        }.apply { isDaemon = true; start() }
+        assertTrue(
+            waitFor(2_000) { spool.walkTopDown().any { it.isFile && it.name == "photo.jpg.lanpart" && it.length() >= 3 } },
+            "test setup: a body should be in flight",
+        )
+        try {
+            val ex = assertThrows(PeerHttpException::class.java) {
+                r.offer("peerA", "A", listOf(req("photo.jpg", 100)), 0, 0)
+            }
+            assertEquals(409, ex.code)
+        } finally {
+            release.countDown()
+            writer.join(2_000)
         }
-        assertEquals(409, ex.code)
+    }
+
+    @Test
+    fun staleOfferSamePeerAndNameIsReplacedNotRefused() {
+        val failures = mutableListOf<Pair<String, String>>()
+        val r = InboxReceiver(
+            spoolRoot = spool,
+            destination = PushDestination { rel, f, _ -> placed[rel] = f.length(); rel },
+            freeBytes = { 1L shl 40 },
+            onFailed = { id, reason -> failures.add(id to reason) },
+        )
+        val first = r.offer("peerA", "A", listOf(req("photo.jpg", 10)), 0, 0)
+        // No body was ever started, so the first session is stale (idle). The
+        // re-offer must replace it rather than return 409.
+        val second = r.offer("peerA", "A", listOf(req("photo.jpg", 10)), 0, 0)
+        assertTrue(second.pushId != first.pushId, "a re-offer must create a fresh session")
+        assertEquals(1, r.count(), "the stale session must be gone")
+        assertEquals(listOf(first.pushId to "replaced by a new offer from the same device"), failures)
+
+        // The replacement is a normal session: a fresh write/complete works.
+        val data = byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+        r.writeChunk(second.pushId, "peerA", "photo.jpg", 0, data.inputStream())
+        r.complete(second.pushId, "peerA", "photo.jpg", sha(data))
+        assertEquals(10L, placed["photo.jpg"])
+    }
+
+    @Test
+    fun staleInFlightReceiveIsReapedAfterTheStallTimeoutAndKeepsItsSpool() {
+        val failures = mutableListOf<Pair<String, String>>()
+        val r = InboxReceiver(
+            spoolRoot = spool,
+            destination = PushDestination { rel, _, _ -> rel },
+            freeBytes = { 1L shl 40 },
+            onFailed = { id, reason -> failures.add(id to reason) },
+            stallTimeoutMillis = 80,
+            idleTimeoutMillis = 3_000,
+        )
+        val o = r.offer("p", "P", listOf(req("a.bin", 1L shl 20)), 0, 0)
+        val release = java.util.concurrent.CountDownLatch(1)
+        // A body that delivers a few bytes and then makes no further progress.
+        val writer = Thread {
+            runCatching { r.writeChunk(o.pushId, "p", "a.bin", 0, BlockingInput(8, release)) }
+        }.apply { isDaemon = true; start() }
+        try {
+            assertTrue(waitFor(3_000) { failures.isNotEmpty() }, "a stalled body must be failed by the reaper")
+            assertEquals(o.pushId, failures.single().first)
+            assertEquals("the connection stalled", failures.single().second)
+            assertEquals(0, r.count(), "a stalled session must leave the incoming list")
+        } finally {
+            release.countDown()
+            writer.join(2_000)
+            r.close()
+        }
+        assertTrue(
+            spool.walkTopDown().any { it.isFile && it.name == "a.bin.lanpart" },
+            "a stalled receive must keep its .lanpart so a re-offer can resume",
+        )
+    }
+
+    @Test
+    fun idleReceiveIsNotReapedBeforeTheIdleTimeout() {
+        val failures = mutableListOf<Pair<String, String>>()
+        val r = InboxReceiver(
+            spoolRoot = spool,
+            destination = PushDestination { rel, _, _ -> rel },
+            freeBytes = { 1L shl 40 },
+            onFailed = { id, reason -> failures.add(id to reason) },
+            stallTimeoutMillis = 60,
+            idleTimeoutMillis = 700,
+        )
+        try {
+            r.offer("p", "P", listOf(req("a.bin", 10)), 0, 0)
+            // Past the short stall timeout but before the idle timeout: an idle
+            // push (no body in flight) must still be alive.
+            Thread.sleep(250)
+            assertEquals(1, r.count(), "an idle push must not be reaped by the stall timeout")
+            assertTrue(failures.isEmpty(), "an idle push must not be failed before its idle timeout")
+            // After the idle timeout it is reaped like the desktop.
+            assertTrue(waitFor(2_000) { failures.isNotEmpty() }, "an idle push must be reaped after the idle timeout")
+            assertEquals(0, r.count())
+        } finally {
+            r.close()
+        }
+    }
+
+    /** A byte source that yields [prefix] bytes then blocks until [release]. */
+    private class BlockingInput(private var prefix: Int, private val release: java.util.concurrent.CountDownLatch) : InputStream() {
+        override fun read(): Int {
+            if (prefix > 0) { prefix--; return 7 }
+            release.await()
+            return -1
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (prefix > 0) {
+                val n = minOf(len, prefix)
+                for (i in 0 until n) b[off + i] = 7
+                prefix -= n
+                return n
+            }
+            release.await()
+            return -1
+        }
+    }
+
+    private fun waitFor(timeoutMs: Long, cond: () -> Boolean): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (cond()) return true
+            Thread.sleep(15)
+        }
+        return cond()
     }
 
     @Test

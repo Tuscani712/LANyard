@@ -91,6 +91,9 @@ class ShareServer(
     private val maxConcurrent: Int = 4,
     private val stallTimeoutMillis: Long = 30_000,
     private val clock: () -> Long = System::currentTimeMillis,
+    // One line per pull event for the diagnostics report. Format:
+    // `[pull] peer=<short> <event> ...`, never a file name, only a path class.
+    private val diag: (String) -> Unit = {},
 ) {
     private val global = Semaphore(maxConcurrent)
     private val perPeer = ConcurrentHashMap<String, Semaphore>()
@@ -127,16 +130,26 @@ class ShareServer(
         progress: () -> Unit,
     ) {
         val rest = path.removePrefix("/api/v1/shares").trimStart('/')
+        val fp = Display.shortFp(peer.fingerprint)
         when {
-            path == "/api/v1/shares" && method == "GET" -> writeJson(out, 200, listJson())
-            rest.endsWith("/manifest") && method == "GET" ->
+            path == "/api/v1/shares" && method == "GET" -> {
+                writeJson(out, 200, listJson())
+                diag("[pull] peer=$fp share-list count=${source.list().size}")
+            }
+            rest.endsWith("/manifest") && method == "GET" -> {
+                diag("[pull] peer=$fp browse share=${rest.removeSuffix("/manifest")} cls=${Display.pathClass(query["path"] ?: "")} kind=manifest")
                 manifestResponse(out, rest.removeSuffix("/manifest"), query["path"] ?: "")
-            rest.endsWith("/tree") && method == "GET" ->
+            }
+            rest.endsWith("/tree") && method == "GET" -> {
+                diag("[pull] peer=$fp browse share=${rest.removeSuffix("/tree")} cls=${Display.pathClass(query["path"] ?: "")} kind=tree")
                 treeResponse(out, rest.removeSuffix("/tree"), query["path"] ?: "")
+            }
             rest.endsWith("/file") && (method == "GET" || method == "HEAD") ->
-                fileResponse(out, rest.removeSuffix("/file"), query["path"] ?: "", method, rangeHeader, ifRange, peer, progress)
-            rest.endsWith("/hash") && method == "GET" ->
+                fileResponse(out, rest.removeSuffix("/file"), query["path"] ?: "", method, rangeHeader, ifRange, peer, progress, fp)
+            rest.endsWith("/hash") && method == "GET" -> {
+                diag("[pull] peer=$fp hash share=${rest.removeSuffix("/hash")} cls=${Display.pathClass(query["path"] ?: "")}")
                 hashResponse(out, rest.removeSuffix("/hash"), query["path"] ?: "", peer)
+            }
             rest.endsWith("/complete") && method == "POST" ->
                 writeJson(out, 200, """{"consumed":false}""")
             else -> writeJson(out, 404, errorJson("not found"))
@@ -238,6 +251,7 @@ class ShareServer(
         ifRange: String?,
         peer: PairedPeer,
         progress: () -> Unit,
+        fp: String,
     ) {
         if (!shareGate(out, shareId)) return
         if (!SafePath.validRel(rel) || rel.isEmpty()) {
@@ -247,6 +261,7 @@ class ShareServer(
         val file = source.resolve(shareId, rel) ?: run { writeJson(out, 404, errorJson("not found")); return }
         val etag = validator(file.size, file.mtimeMillis)
         if (!acquire(peer.fingerprint)) {
+            diag("[pull] peer=$fp download refused share=$shareId cls=${Display.pathClass(rel)} reason=busy")
             retryLater(out)
             return
         }
@@ -267,8 +282,12 @@ class ShareServer(
             headers["Content-Type"] = "application/octet-stream"
             val code = if (parsed.partial) 206 else 200
             if (parsed.partial) headers["Content-Range"] = "bytes $start-${start + length - 1}/${file.size}"
+            diag("[pull] peer=$fp download share=$shareId cls=${Display.pathClass(rel)} range=$start-${start + length - 1} bytes=$length")
             writeHead(out, code, length, headers)
-            if (method == "GET") streamWithDeadline(out, file, start, length, etag, progress, shareId)
+            if (method == "GET") {
+                val sent = streamWithDeadline(out, file, start, length, etag, progress, shareId)
+                diag("[pull] peer=$fp served share=$shareId cls=${Display.pathClass(rel)} bytes=$sent of=$length")
+            }
         } finally {
             release(peer.fingerprint)
         }
@@ -278,14 +297,15 @@ class ShareServer(
      * Streams on a worker and abandons the handler if the client stops reading,
      * releasing its concurrency slot. (Java cannot interrupt a blocked TCP
      * write, so the handler must not wait on it; PeerServer closes the socket,
-     * which lets the worker die.)
+     * which lets the worker die.) Returns bytes actually handed to the socket.
      */
-    private fun streamWithDeadline(out: OutputStream, file: ResolvedFile, start: Long, length: Long, etag: String, progress: () -> Unit, shareId: String) {
+    private fun streamWithDeadline(out: OutputStream, file: ResolvedFile, start: Long, length: Long, etag: String, progress: () -> Unit, shareId: String): Long {
         val last = java.util.concurrent.atomic.AtomicLong(clock())
+        val sent = java.util.concurrent.atomic.AtomicLong(0)
         val done = java.util.concurrent.CountDownLatch(1)
         val worker = Thread({
             try {
-                streamFile(out, file, start, length, etag, { last.set(clock()); progress() }, shareId)
+                streamFile(out, file, start, length, etag, { last.set(clock()); progress() }, shareId) { sent.set(it) }
             } catch (_: Exception) {
                 // socket closed / abandoned
             } finally {
@@ -294,11 +314,12 @@ class ShareServer(
         }, "lanyard-share-stream").apply { isDaemon = true }
         worker.start()
         while (!done.await(50, java.util.concurrent.TimeUnit.MILLISECONDS)) {
-            if (clock() - last.get() > stallTimeoutMillis) return // abandon; PeerServer closes the socket
+            if (clock() - last.get() > stallTimeoutMillis) return sent.get() // abandon; PeerServer closes the socket
         }
+        return sent.get()
     }
 
-    private fun streamFile(out: OutputStream, file: ResolvedFile, start: Long, length: Long, etag: String, progress: () -> Unit, shareId: String) {
+    private fun streamFile(out: OutputStream, file: ResolvedFile, start: Long, length: Long, etag: String, progress: () -> Unit, shareId: String, onSent: (Long) -> Unit) {
         val digest = MessageDigest.getInstance("SHA-256")
         var sent = 0L
         file.openAt(start).use { input ->
@@ -312,6 +333,7 @@ class ShareServer(
                 digest.update(buf, 0, n)
                 sent += n
                 remaining -= n
+                onSent(sent)
                 progress()
             }
         }

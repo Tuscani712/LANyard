@@ -10,7 +10,7 @@ package io.github.tuscani712.lanyard.core
  * Not persisted: it is diagnostic breadcrumbs for the current app run only.
  */
 class ServerDiagnostics(
-    private val capacity: Int = 200,
+    private val capacity: Int = 1000,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val events = ArrayDeque<String>()

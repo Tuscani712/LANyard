@@ -230,4 +230,39 @@ class DiagnosticsTest {
         assertFalse(out.contains("note.txt"))
         assertTrue(out.contains("IOException"))
     }
+
+    @Test
+    fun copiedLogContainsNoSecretsOrFullPathsOrFingerprints() {
+        val fullFp = "ab12cd34".repeat(8)
+        val token = "deadbeefdeadbeefdeadbeefdeadbeef"
+        val invite = "lanyard://pair?fp=$fullFp&addr=192.168.1.5:47800&n=$token"
+        val events = listOf(
+            "00:00:01.000 [pairing] peer=ab12cd34 session request id=c_1 mode=pair",
+            "00:00:01.010 [pull] peer=ab12cd34 download share=s_1 cls=*.jpg range=0-1023 bytes=1024",
+            "00:00:02.000 [push] peer=ab12cd34 file id=p_1 offset=0 size=2048 resume=false",
+            "00:00:02.100 secret invite $invite token ?t=$token",
+            "00:00:02.200 path /storage/emulated/0/Download/photo.jpg",
+            "00:00:02.300 fingerprint $fullFp",
+        )
+        val out = Diagnostics.copyLog(events)
+
+        assertTrue(out.contains("[pairing]"))
+        assertTrue(out.contains("[pull]"))
+        assertTrue(out.contains("[push]"))
+        assertFalse(out.contains(token))
+        assertFalse(out.contains(fullFp))
+        assertFalse(out.contains("/storage/emulated/0"))
+        assertFalse(out.contains("photo.jpg"))
+        // The short fingerprint stays so the log is still diagnosable.
+        assertTrue(out.contains("ab12cd34"))
+    }
+
+    @Test
+    fun defaultDiagnosticsRingHoldsOneThousandEvents() {
+        val d = ServerDiagnostics(clock = { 0 })
+        repeat(1005) { d.record("event-$it") }
+        assertEquals(1000, d.snapshot().size)
+        assertTrue(d.snapshot().last().endsWith("event-1004"))
+        assertFalse(d.snapshot().any { it.endsWith("event-4") })
+    }
 }

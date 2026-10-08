@@ -3,6 +3,9 @@ package io.github.tuscani712.lanyard.core
 import java.io.File
 import java.io.InputStream
 import java.security.MessageDigest
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 
 /**
  * Places a verified spooled file into the user's destination (the SAF download
@@ -61,6 +64,19 @@ class InboxReceiver(
     // is set and writable). When false, an offer is refused up front with a clear
     // reason instead of being accepted and failing later mid-transfer (Task 30).
     private val destinationReady: () -> Boolean = { true },
+    // How long a body that is actually being read may make no progress before
+    // the reaper fails the session (mirrors the desktop). It only applies while
+    // a body is in flight: a slow LAN transfer keeps resetting the deadline on
+    // every read. Injectable for tests.
+    private val stallTimeoutMillis: Long = 60_000,
+    // How long a push with no body in flight may sit untouched before the
+    // reaper fails it. Senders legitimately pause between files (hashing the
+    // next one can take a while), so this is far more generous than the stall
+    // timeout. Injectable for tests.
+    private val idleTimeoutMillis: Long = 10 * 60_000,
+    // One line per push event for the diagnostics report. Format:
+    // `[push] peer=<short> <event> ...`. Never a file name, only a path class.
+    private val diag: (String) -> Unit = {},
 ) {
     class Session(
         val id: String,
@@ -69,11 +85,76 @@ class InboxReceiver(
         val files: LinkedHashMap<String, PushFileState>,
         var total: Long,
         val createdAt: Long,
-    )
+    ) {
+        /** True while a body is actually being read for this push. */
+        @Volatile var inFlight: Boolean = false
+
+        /** Set by the reaper so a read still blocked aborts on its next byte. */
+        @Volatile var dead: Boolean = false
+
+        /** The time of the last byte parsed, or the last body start/end. */
+        @Volatile var lastProgress: Long = createdAt
+    }
 
     private val sessions = LinkedHashMap<String, Session>()
     private val cancelled = HashSet<String>()
     private val placeLock = Any()
+
+    // A daemon reaper sweeps stalled/idle pushes, mirroring the desktop. The
+    // sweep interval tracks the shorter timeout so a test-sized timeout is
+    // noticed promptly. Disabled when both timeouts are non-positive.
+    private val reaper: ScheduledExecutorService? =
+        if (stallTimeoutMillis > 0 || idleTimeoutMillis > 0) {
+            Executors.newSingleThreadScheduledExecutor { r ->
+                Thread(r, "lanyard-inbox-reaper").apply { isDaemon = true }
+            }
+        } else {
+            null
+        }
+
+    init {
+        val reaper = this.reaper
+        if (reaper != null) {
+            val shorter = listOf(stallTimeoutMillis, idleTimeoutMillis).filter { it > 0 }.minOrNull() ?: 0L
+            val interval = maxOf(shorter / 4, 10L)
+            reaper.scheduleWithFixedDelay({ runCatching { reapStalled() } }, interval, interval, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    /** Stops the reaper. Safe to call more than once. */
+    fun close() {
+        reaper?.shutdownNow()
+    }
+
+    /**
+     * Fails every session whose body has made no progress for the short stall
+     * timeout, or that has sat idle with no body in flight for the much longer
+     * idle timeout. The `.lanpart` spool is deliberately kept so a re-offer can
+     * resume. Returns how many were reaped.
+     */
+    fun reapStalled(now: Long = clock()): Int {
+        val reaped = ArrayList<Triple<String, String, String>>()
+        synchronized(this) {
+            val it = sessions.entries.iterator()
+            while (it.hasNext()) {
+                val s = it.next().value
+                val limit = if (s.inFlight) stallTimeoutMillis else idleTimeoutMillis
+                if (limit <= 0) continue
+                if (now - s.lastProgress > limit) {
+                    it.remove()
+                    s.dead = true
+                    reaped.add(Triple(s.id, s.peerFp, "the connection stalled"))
+                }
+            }
+        }
+        if (reaped.isEmpty()) return 0
+        for ((id, fp, reason) in reaped) {
+            diag("[push] peer=${Display.shortFp(fp)} stalled id=$id reason=$reason")
+        }
+        onChange()
+        for ((id, _, reason) in reaped) onFailed(id, reason)
+        return reaped.size
+    }
 
     @Synchronized
     fun offer(
@@ -110,11 +191,28 @@ class InboxReceiver(
         val free = freeBytes()
         if (free in 1 until need) throw PeerHttpException(507, "insufficient storage")
 
-        // One in-flight offer per peer and relative path: two peers (or two
-        // pushes) sharing a spool file would corrupt each other's data.
-        for (existing in sessions.values) {
-            if (existing.peerFp.equals(peerFp, ignoreCase = true) && existing.files.keys.any { it in files.keys }) {
-                throw PeerHttpException(409, "a push with that name is already in progress")
+        // A new offer from the same peer for the same file supersedes a stale
+        // session instead of being refused: the peer is retrying after a dropped
+        // connection, and the peer-keyed .lanpart spool is shared, so two live
+        // writers would corrupt it. A session whose body is genuinely in flight
+        // is still guarded (409), so a concurrent legitimate push cannot be
+        // clobbered. The superseded session is failed (its .lanpart kept), so
+        // the new one resumes from the partial size.
+        val superseded = sessions.values.filter {
+            it.peerFp.equals(peerFp, ignoreCase = true) && it.files.keys.any { k -> k in files.keys }
+        }
+        if (superseded.any { it.inFlight }) {
+            for (old in superseded) {
+                diag("[push] peer=${Display.shortFp(peerFp)} offer refused 409 conflict session=${old.id} age=${clock() - old.createdAt}ms inflight=${old.inFlight}")
+            }
+            throw PeerHttpException(409, "a push with that name is already in progress")
+        }
+        for (old in superseded) {
+            if (sessions.remove(old.id) != null) {
+                old.dead = true
+                diag("[push] peer=${Display.shortFp(peerFp)} offer superseded session=${old.id} age=${clock() - old.createdAt}ms")
+                onChange()
+                onFailed(old.id, "replaced by a new offer from the same device")
             }
         }
 
@@ -130,6 +228,7 @@ class InboxReceiver(
         }
         val sess = Session(id, peerFp, Display.safeName(peerName), files, total, clock())
         sessions[id] = sess
+        diag("[push] peer=${Display.shortFp(peerFp)} offer accepted id=$id files=${files.size} bytes=$total resumed=${files.values.count { it.done > 0 }}")
         onChange()
         onOffer(id, peerFp, files.size, total)
         val offsets = files.mapValues { it.value.done }
@@ -148,6 +247,7 @@ class InboxReceiver(
     fun writeChunk(id: String, peerFp: String, rel: String, offset: Long, input: InputStream): Long {
         val s = session(id, peerFp)
         val st = s.files[rel] ?: throw PeerHttpException(404, "no such file in push")
+        diag("[push] peer=${Display.shortFp(peerFp)} file id=$id cls=${Display.pathClass(rel)} offset=$offset size=${st.size} resume=${offset > 0}")
         return try {
             writeStream(s, st, offset, input, null)
         } catch (e: Exception) {
@@ -161,6 +261,7 @@ class InboxReceiver(
         val s = session(id, peerFp)
         val st = s.files[rel] ?: throw PeerHttpException(404, "no such file in push")
         if (st.done != 0L) throw PeerHttpException(409, "file already partly received")
+        diag("[push] peer=${Display.shortFp(peerFp)} file id=$id cls=${Display.pathClass(rel)} offset=0 size=${st.size} whole=true")
         return try {
             writeStream(s, st, 0, input, sha256)
             st.placedName = place(st)
@@ -193,6 +294,7 @@ class InboxReceiver(
         if (!got.equals(sha256, ignoreCase = true)) throw PeerHttpException(409, "checksum mismatch")
         st.placedName = place(st)
         synchronized(this) { st.done = st.size }
+        diag("[push] peer=${Display.shortFp(peerFp)} file complete id=$id cls=${Display.pathClass(rel)} size=${st.size}")
         onChange()
         return st
     }
@@ -205,6 +307,7 @@ class InboxReceiver(
         sessions.remove(id)
         val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
         for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
+        diag("[push] peer=${Display.shortFp(peerFp)} complete id=$id files=${s.files.size} bytes=${s.total}")
         onChange()
         onDone(id, peerFp, s.files.size, s.total)
         return true
@@ -218,9 +321,30 @@ class InboxReceiver(
         sessions.remove(id)
         val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
         for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
+        diag("[push] peer=${Display.shortFp(peerFp)} cancelled id=$id spool=deleted")
         onChange()
         onCancelled(id, "The transfer was cancelled")
         return true
+    }
+
+    /**
+     * Cancels a push from this device's own UI, whatever peer owns it. The
+     * `.lanpart` spool is deleted and the session removed, so the stale-session
+     * guard no longer blocks a fresh offer. An in-flight body is marked dead so
+     * its read aborts on the next byte. Returns the peer fingerprint when a live
+     * session was cancelled, else null.
+     */
+    @Synchronized
+    fun cancelLocal(id: String): String? {
+        val s = sessions.remove(id) ?: return null
+        cancelled.add(id)
+        s.dead = true
+        val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
+        for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
+        diag("[push] peer=${Display.shortFp(s.peerFp)} cancelled id=$id source=local spool=deleted")
+        onChange()
+        onCancelled(id, "The transfer was cancelled")
+        return s.peerFp
     }
 
     /**
@@ -233,7 +357,8 @@ class InboxReceiver(
      */
     @Synchronized
     fun fail(id: String, reason: String): Boolean {
-        if (sessions.remove(id) == null) return false
+        val s = sessions.remove(id) ?: return false
+        diag("[push] peer=${Display.shortFp(s.peerFp)} failed id=$id reason=$reason")
         onChange()
         onFailed(id, reason)
         return true
@@ -296,12 +421,18 @@ class InboxReceiver(
         val out = java.io.FileOutputStream(st.part, offset > 0)
         val limit = st.size - offset
         var written = 0L
+        // Mark the body in flight so the reaper judges it by the short stall
+        // timeout, and touch the deadline on every byte so a slow (but live)
+        // transfer is never reaped.
+        s.inFlight = true
+        s.lastProgress = clock()
         try {
             val buf = ByteArray(256 * 1024)
             // Cap while reading: a client (or a chunked stream) must never write
             // more than the offered size, or it could fill the disk first and be
             // rejected only afterwards.
             while (written < limit) {
+                if (s.dead) throw java.io.IOException("the connection stalled")
                 if (wasCancelled(s.id)) throw PushCancelledException()
                 val want = minOf(buf.size.toLong(), limit - written).toInt()
                 val n = input.read(buf, 0, want)
@@ -309,7 +440,7 @@ class InboxReceiver(
                 out.write(buf, 0, n)
                 digest.update(buf, 0, n)
                 written += n
-                synchronized(this) { st.done = offset + written }
+                synchronized(this) { st.done = offset + written; s.lastProgress = clock() }
                 onProgress(s.id, offset + written, st.size)
             }
             if (written >= limit && input.read() >= 0) {
@@ -322,6 +453,8 @@ class InboxReceiver(
             out.fd.sync()
         } finally {
             runCatching { out.close() }
+            s.inFlight = false
+            s.lastProgress = clock()
         }
         if (offset == 0L && st.size > 0 && st.part.length() != st.size && wantSha != null) {
             throw PeerHttpException(409, "size mismatch")

@@ -31,10 +31,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.tuscani712.lanyard.SettingsHolder
 import io.github.tuscani712.lanyard.core.SpeedUnit
+import io.github.tuscani712.lanyard.core.TransferRecord
+import io.github.tuscani712.lanyard.core.TransferState
 import io.github.tuscani712.lanyard.core.formatSpeed
 import io.github.tuscani712.lanyard.transfer.TransferManager
-import io.github.tuscani712.lanyard.transfer.TransferRecord
-import io.github.tuscani712.lanyard.transfer.TransferState
 
 @Composable
 fun TransfersScreen(padding: PaddingValues) {

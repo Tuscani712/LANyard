@@ -3,6 +3,7 @@ package io.github.tuscani712.lanyard.core
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -24,6 +25,7 @@ class PeerServerTest {
         maxReq: Int = 10,
         maxBody: Int = 64 * 1024,
         selfFpOverride: (() -> String)? = null,
+        val diagnostics: ServerDiagnostics? = null,
     ) : AutoCloseable {
         val identity: Identity = Identity.generate("Phone")
         private val trustFile = File.createTempFile("lanyard-trust", ".json").also { it.delete() }
@@ -42,6 +44,7 @@ class PeerServerTest {
             maxRequestsPerConnection = 64,
             maxSessionRequestsPerMinute = maxReq,
             maxBodyBytes = maxBody,
+            diagnostics = diagnostics,
         )
         val port: Int = server.start(identity) { p ->
             JsonObject().apply {
@@ -389,5 +392,51 @@ class PeerServerTest {
             val elapsed = System.currentTimeMillis() - start
             assertTrue(elapsed < 3_000, "connection was not closed by the deadline (took ${elapsed}ms)")
         }
+    }
+
+    @Test
+    @Timeout(60)
+    fun diagnosticsRecordRequestResponseAndCloseLines() {
+        val diag = ServerDiagnostics()
+        Harness(idleMs = 400, diagnostics = diag).use { h ->
+            val resp = h.request(h.identity, "GET /api/v1/hello HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            assertEquals(200, status(resp))
+            val events = diag.snapshot()
+            assertTrue(
+                events.any { it.contains("req GET /api/v1/hello") && it.contains("peer=") },
+                "a request line with the peer fingerprint should be logged: $events",
+            )
+            assertTrue(
+                events.any { it.contains("resp 200 GET /api/v1/hello") && it.contains("elapsed=") },
+                "a response line with status and elapsed ms should be logged: $events",
+            )
+            assertTrue(
+                waitFor(3_000) { diag.snapshot().any { it.contains("conn close") && it.contains("reason=") } },
+                "a close line with a reason should be logged: ${diag.snapshot()}",
+            )
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun diagnosticsNeverLogQueryValues() {
+        val diag = ServerDiagnostics()
+        Harness(diagnostics = diag).use { h ->
+            h.request(h.identity, "GET /api/v1/hello?token=SECRETTOKEN HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            val joined = diag.snapshot().joinToString("\n")
+            assertTrue(joined.contains("/api/v1/hello"), "the path should be logged: $joined")
+            assertFalse(joined.contains("SECRETTOKEN"), "a query value must never be logged: $joined")
+            // The report-level redaction is the second line of defence.
+            assertFalse(Diagnostics.copyReport(emptyList(), diag.snapshot()).contains("SECRETTOKEN"))
+        }
+    }
+
+    private fun waitFor(timeoutMs: Long, cond: () -> Boolean): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (cond()) return true
+            Thread.sleep(15)
+        }
+        return cond()
     }
 }

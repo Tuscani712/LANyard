@@ -55,12 +55,17 @@ object PairingFlow {
         probeAttemptTimeoutMs: Int = PROBE_ATTEMPT_TIMEOUT_MS,
         localAddresses: () -> List<String> = { defaultLocalAddresses() },
         clock: () -> Long = System::currentTimeMillis,
+        // One line per pairing event for the diagnostics report:
+        // `[pairing] peer=<short> <event> ...`.
+        diag: (String) -> Unit = {},
     ): PairResult {
         val payload = try {
             PairLink.parse(link)
         } catch (_: PairLink.ParseException) {
             return PairResult.InvalidLink
         }
+        val short = Display.shortFp(payload.fingerprint)
+        diag("[pairing] peer=$short link parsed addrs=${payload.addrs.size}")
 
         val outcome = probeAddresses(
             addrs = payload.addrs,
@@ -70,11 +75,17 @@ object PairingFlow {
             deadlineMs = probeDeadlineMs,
             perAttemptMs = probeAttemptTimeoutMs,
             clock = clock,
+            short = short,
+            diag = diag,
         )
         val match = outcome.match
-            ?: return if (outcome.mismatch) PairResult.FingerprintMismatch else PairResult.Unreachable
+            ?: run {
+                diag("[pairing] peer=$short probe failed ${if (outcome.mismatch) "identity mismatch" else "unreachable"}")
+                return if (outcome.mismatch) PairResult.FingerprintMismatch else PairResult.Unreachable
+            }
 
         val client = PeerClient(match.host, match.port, identity, payload.fingerprint)
+        diag("[pairing] peer=$short session request to ${match.host}:${match.port}")
 
         val session = try {
             client.startSession(
@@ -86,8 +97,10 @@ object PairingFlow {
                 invite = payload.nonce,
             )
         } catch (_: PeerStatusException) {
+            diag("[pairing] peer=$short session refused")
             return PairResult.Refused
         } catch (_: Exception) {
+            diag("[pairing] peer=$short session unreachable")
             return PairResult.Unreachable
         }
 
@@ -115,12 +128,22 @@ object PairingFlow {
                 return abort(PairResult.Unreachable)
             }
             when (status.str("status")) {
-                "accepted" -> return finish(client, sessionId, status, match, payload, selfName, store)
-                "rejected", "closed" -> return PairResult.Refused
-                "expired" -> return PairResult.Expired
+                "accepted" -> {
+                    diag("[pairing] peer=$short accepted id=$sessionId")
+                    return finish(client, sessionId, status, match, payload, selfName, store, diag)
+                }
+                "rejected", "closed" -> {
+                    diag("[pairing] peer=$short refused id=$sessionId status=${status.str("status")}")
+                    return PairResult.Refused
+                }
+                "expired" -> {
+                    diag("[pairing] peer=$short expired id=$sessionId")
+                    return PairResult.Expired
+                }
             }
             Thread.sleep(200)
         }
+        diag("[pairing] peer=$short expired id=$sessionId reason=timeout")
         return abort(PairResult.Expired)
     }
 
@@ -132,6 +155,7 @@ object PairingFlow {
         payload: PairLink.Payload,
         selfName: String,
         store: TrustStore,
+        diag: (String) -> Unit,
     ): PairResult {
         try {
             client.confirmSession(sessionId)
@@ -158,6 +182,7 @@ object PairingFlow {
             pairedAt = System.currentTimeMillis(),
         )
         store.save(peer)
+        diag("[pairing] peer=${Display.shortFp(peer.fingerprint)} confirmed id=$sessionId stored=true")
         return PairResult.Paired(peer)
     }
 
@@ -173,6 +198,8 @@ object PairingFlow {
         deadlineMs: Long,
         perAttemptMs: Int,
         clock: () -> Long,
+        short: String,
+        diag: (String) -> Unit,
     ): ProbeOutcome {
         var mismatch = false
         val startedAt = clock()
@@ -181,14 +208,19 @@ object PairingFlow {
             if (!isDialable(hp.host)) continue
             val remaining = deadlineMs - (clock() - startedAt)
             if (remaining <= 0 || remaining < perAttemptMs) break
+            val attemptStart = clock()
             try {
                 val probe = ProbeClient(hp.host, hp.port, identity, perAttemptMs, perAttemptMs)
                 probe.hello()
+                val elapsed = clock() - attemptStart
                 if (probe.observedFingerprint().equals(expected, ignoreCase = true)) {
+                    diag("[pairing] peer=$short probe ok addr=${hp.host}:${hp.port} elapsed=${elapsed}ms")
                     return ProbeOutcome(hp, mismatch)
                 }
+                diag("[pairing] peer=$short probe mismatch addr=${hp.host}:${hp.port} elapsed=${elapsed}ms")
                 mismatch = true
-            } catch (_: Exception) {
+            } catch (e: Exception) {
+                diag("[pairing] peer=$short probe failed addr=${hp.host}:${hp.port} elapsed=${clock() - attemptStart}ms error=${e.javaClass.simpleName}")
                 // try the next address
             }
         }

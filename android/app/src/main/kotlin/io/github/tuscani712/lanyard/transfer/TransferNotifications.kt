@@ -12,6 +12,8 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import io.github.tuscani712.lanyard.MainActivity
 import io.github.tuscani712.lanyard.SettingsHolder
+import io.github.tuscani712.lanyard.core.TransferRecord
+import io.github.tuscani712.lanyard.core.TransferState
 
 /**
  * The two notification channels transfers use: an ongoing, silent progress

@@ -20,51 +20,51 @@ import io.github.tuscani712.lanyard.core.RateThrottle
 import io.github.tuscani712.lanyard.core.ShareValidation
 import io.github.tuscani712.lanyard.core.SpoolEntry
 import io.github.tuscani712.lanyard.core.Throttle
+import io.github.tuscani712.lanyard.core.TransferBoard
 import io.github.tuscani712.lanyard.core.TransferPolicy
+import io.github.tuscani712.lanyard.core.TransferRecord
+import io.github.tuscani712.lanyard.core.TransferState
 import io.github.tuscani712.lanyard.SettingsHolder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import java.io.File
 import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
-
-enum class TransferState { Queued, Running, Done, Failed, Cancelled }
-
-/** One row on the Transfers screen. */
-data class TransferRecord(
-    val id: String,
-    val direction: String, // "send" | "receive"
-    val peerName: String,
-    val peerFingerprint: String = "",
-    val label: String,
-    val total: Long,
-    val done: Long,
-    val state: TransferState,
-    val message: String? = null,
-    val speed: Double = 0.0, // bytes per second, smoothed
-    val startedAt: Long,
-)
 
 /**
  * The single owner of transfers. Both the send and receive paths run here on
  * [Dispatchers.IO]; the Transfers screen observes [state], and [TransferService]
  * mirrors it into a notification. The last 100 records persist to app-private
  * storage.
+ *
+ * All row state transitions go through [TransferBoard] (pure, in :core), so the
+ * cancel and no-progress-aging rules are testable without Android. This object
+ * adds the side effects: stopping the network work, deleting the send spool, and
+ * cancelling a live receive on the peer server.
  */
 object TransferManager {
     private const val HISTORY_CAP = 100
+
+    /** A running row with no progress for this long is failed as "No progress". */
+    const val STALLED_AFTER_MS = 10 * 60_000L
+
+    /** How often the aging sweep runs. */
+    private const val AGE_SWEEP_MS = 60_000L
 
     private lateinit var app: Application
     private var meter: MeteredNetwork = MeteredNetwork { false }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val gson: Gson = GsonBuilder().create()
     private val historyType = object : TypeToken<MutableList<TransferRecord>>() {}.type
+
+    private val board = TransferBoard(stalledAfterMillis = STALLED_AFTER_MS)
 
     private val _state = MutableStateFlow<List<TransferRecord>>(emptyList())
     val state: StateFlow<List<TransferRecord>> = _state.asStateFlow()
@@ -74,11 +74,31 @@ object TransferManager {
     private val speedSamples = java.util.concurrent.ConcurrentHashMap<String, SpeedSample>()
     private val cleanups = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
 
+    /**
+     * Cancels a live receive on the peer server (deletes its `.lanpart` spool and
+     * clears the stale-session guard). Wired by [io.github.tuscani712.lanyard.PeerService],
+     * which owns the [io.github.tuscani712.lanyard.core.InboxReceiver].
+     */
+    @Volatile
+    private var receiveCanceller: ((String) -> Unit)? = null
+
+    fun onReceiveCancel(action: (String) -> Unit) {
+        receiveCanceller = action
+    }
+
     fun init(application: Application, meteredNetwork: MeteredNetwork = MeteredNetwork { false }) {
         app = application
         meter = meteredNetwork
-        _state.value = loadHistory()
+        board.replaceAll(loadHistory())
+        board.failInterrupted("Interrupted")
+        publish()
         sweepSpool()
+        scope.launch {
+            while (isActive) {
+                delay(AGE_SWEEP_MS)
+                ageNow()
+            }
+        }
     }
 
     /** The current Wi-Fi-only refusal, or null when a transfer may start. */
@@ -97,26 +117,44 @@ object TransferManager {
         }
     }
 
-    fun running(): List<TransferRecord> = _state.value.filter { it.state == TransferState.Running || it.state == TransferState.Queued }
+    fun running(): List<TransferRecord> = board.running()
 
+    /**
+     * Cancels a row. Always ends a live row as Cancelled and frees everything it
+     * held: the send spool (via the enqueue cleanup), a live push receive on the
+     * peer server (spool + stale-session guard), and the cancel flag. A row that
+     * already finished is left alone.
+     */
     fun cancel(id: String) {
         cancels[id]?.set(true)
+        val row = board.cancel(id) ?: run { cancels.remove(id); return }
+        freeFor(row)
+        publish()
+        persist()
+    }
+
+    /** Stops live work and releases resources for a row that just ended. */
+    private fun freeFor(row: TransferRecord) {
+        if (pushReceives.remove(row.id)) receiveCanceller?.invoke(row.id)
+        cleanups.remove(row.id)?.invoke()
+        cancels.remove(row.id)
+        speedSamples.remove(row.id)
     }
 
     fun cancelAllRunning() {
-        cancels.values.forEach { it.set(true) }
+        board.running().map { it.id }.forEach { cancel(it) }
     }
 
     /** Cancels every running or queued transfer to the peer with [fingerprint]. */
     fun cancelForPeer(fingerprint: String) {
-        _state.value
+        board.running()
             .filter { it.peerFingerprint.equals(fingerprint, ignoreCase = true) }
-            .filter { it.state == TransferState.Running || it.state == TransferState.Queued }
-            .forEach { cancels[it.id]?.set(true) }
+            .forEach { cancel(it.id) }
     }
 
     fun clearFinished() {
-        _state.value = _state.value.filter { it.state == TransferState.Running || it.state == TransferState.Queued }
+        board.clearFinished()
+        publish()
         persist()
     }
 
@@ -187,7 +225,7 @@ object TransferManager {
     // turned into a Failed "Interrupted" row by loadHistory().
 
     fun noteReceiveStarted(id: String, peerName: String, peerFp: String, label: String, total: Long) {
-        if (_state.value.any { it.id == id }) return
+        if (board.firstOrNull(id) != null) return
         pushReceives.add(id)
         add(TransferRecord(id, "receive", peerName, peerFp, label, total, 0, TransferState.Running, null, 0.0, now()))
         // An incoming push has no enqueue* call, so start the foreground service
@@ -197,21 +235,22 @@ object TransferManager {
     }
 
     fun noteReceiveProgress(id: String, done: Long, total: Long) {
-        if (_state.value.none { it.id == id }) return
-        update(id) { it.copy(done = maxOf(done, it.done), total = maxOf(total, it.total), speed = sampleSpeed(id, done)) }
+        if (!board.isLive(id)) return
+        board.progress(id, done, total, sampleSpeed(id, done))
+        publish()
     }
 
     fun noteReceiveDone(id: String, message: String) {
         pushReceives.remove(id)
-        if (_state.value.none { it.id == id }) return
-        complete(id, message)
+        if (!board.isLive(id)) return
+        end(id, TransferState.Done, message)
     }
 
     /** Marks a push this phone abandoned (declined or cut off) as failed. */
     fun noteReceiveFailed(id: String, reason: String) {
         pushReceives.remove(id)
-        if (_state.value.none { it.id == id }) return
-        fail(id, reason)
+        if (!board.isLive(id)) return
+        end(id, TransferState.Failed, reason)
     }
 
     /**
@@ -222,7 +261,7 @@ object TransferManager {
      */
     fun failPushReceives(reason: String) {
         for (id in pushReceives.toList()) {
-            if (_state.value.any { it.id == id }) fail(id, reason)
+            if (board.isLive(id)) end(id, TransferState.Failed, reason)
         }
         pushReceives.clear()
     }
@@ -230,12 +269,30 @@ object TransferManager {
     /** Removes a finished (Done/Failed/Cancelled) row from the list. */
     fun dismiss(id: String) {
         pushReceives.remove(id)
-        _state.value = _state.value.filterNot { it.id == id }
+        board.dismiss(id)
+        publish()
+        persist()
+    }
+
+    /**
+     * Fails Running rows with no progress for [STALLED_AFTER_MS]. This is what
+     * unsticks a row whose connection died: it ends as Failed("No progress") and
+     * its live work is stopped. Runs on a timer ([AGE_SWEEP_MS]); exposed for
+     * tests.
+     */
+    fun ageNow() {
+        val aged = board.age()
+        if (aged.isEmpty()) return
+        for (row in aged) {
+            freeFor(row)
+            notifyCompletion(row.id)
+        }
+        publish()
         persist()
     }
 
     private suspend fun runSnippet(id: String, peer: PairedPeer, text: String) {
-        val identity = IdentityHolder.identity ?: return fail(id, "no identity on this device")
+        val identity = IdentityHolder.identity ?: return end(id, TransferState.Failed, "no identity on this device")
         setState(id, TransferState.Running)
         val failure = try {
             PeerClient(peer.host, peer.port, identity, peer.fingerprint).sendSnippet(text)
@@ -243,14 +300,15 @@ object TransferManager {
         } catch (e: Exception) {
             e.message ?: "could not send text"
         }
-        if (failure == null) complete(id, "Text sent") else fail(id, failure)
+        if (failure == null) end(id, TransferState.Done, "Text sent") else end(id, TransferState.Failed, failure)
     }
 
     private suspend fun runPush(id: String, peer: PairedPeer, sources: List<PushSource>, throttle: Throttle) {
         try {
-            val identity = IdentityHolder.identity ?: return fail(id, "no identity on this device")
+            val identity = IdentityHolder.identity ?: return end(id, TransferState.Failed, "no identity on this device")
             val cancel = AtomicBoolean(false)
             cancels[id] = cancel
+            if (!board.isLive(id)) { cancels.remove(id); return } // cancelled before it started
             setState(id, TransferState.Running)
             val sent = LongArray(sources.size)
             val result = try {
@@ -259,7 +317,10 @@ object TransferManager {
                     onProgress = { index, bytes, _ ->
                         sent[index] = bytes
                         val done = sent.sum()
-                        update(id) { it.copy(done = done, total = maxOf(it.total, done), speed = sampleSpeed(id, done)) }
+                        if (board.isLive(id)) {
+                            board.progress(id, done, maxOf(board.firstOrNull(id)?.total ?: 0, done), sampleSpeed(id, done))
+                            publish()
+                        }
                     },
                     isCancelled = { cancel.get() },
                 )
@@ -274,10 +335,11 @@ object TransferManager {
     }
 
     private suspend fun runDownload(id: String, peer: PairedPeer, shareId: String, path: String, tree: Uri, throttle: Throttle) {
-        val identity = IdentityHolder.identity ?: return fail(id, "no identity on this device")
-        val root = DocumentFile.fromTreeUri(app, tree) ?: return fail(id, "cannot open the destination folder")
+        val identity = IdentityHolder.identity ?: return end(id, TransferState.Failed, "no identity on this device")
+        val root = DocumentFile.fromTreeUri(app, tree) ?: return end(id, TransferState.Failed, "cannot open the destination folder")
         val cancel = AtomicBoolean(false)
         cancels[id] = cancel
+        if (!board.isLive(id)) { cancels.remove(id); return }
         setState(id, TransferState.Running)
         val sent = HashMap<Int, Long>()
         val result = try {
@@ -291,7 +353,10 @@ object TransferManager {
                 onProgress = { index, file, received, total ->
                     sent[index] = received
                     val done = sent.values.sum()
-                    update(id) { it.copy(done = done, total = maxOf(it.total, total, done), speed = sampleSpeed(id, done)) }
+                    if (board.isLive(id)) {
+                        board.progress(id, done, maxOf(total, done), sampleSpeed(id, done))
+                        publish()
+                    }
                 },
                 isCancelled = { cancel.get() },
             )
@@ -339,55 +404,57 @@ object TransferManager {
     // --- state plumbing ---
 
     private fun add(record: TransferRecord) {
-        _state.value = (listOf(record) + _state.value).take(HISTORY_CAP)
+        board.add(record)
+        publish()
         persist()
     }
 
-    private fun setState(id: String, state: TransferState) = update(id) { it.copy(state = state) }
+    private fun setState(id: String, state: TransferState) {
+        board.update(id) { it.copy(state = state) }
+        publish()
+    }
 
-    private fun update(id: String, block: (TransferRecord) -> TransferRecord) {
-        _state.value = _state.value.map { if (it.id == id) block(it) else it }
+    private fun publish() {
+        _state.value = board.snapshot()
     }
 
     private fun finish(id: String, result: PushResult) {
         when (result) {
-            is PushResult.Sent -> complete(id, "Sent ${result.files} file(s)")
-            PushResult.Cancelled -> complete(id, "Cancelled", TransferState.Cancelled)
-            PushResult.CancelledByReceiver -> fail(id, "The other device cancelled")
-            PushResult.Refused -> fail(id, "The other device is not accepting files")
-            is PushResult.Failed -> fail(id, result.message)
+            is PushResult.Sent -> end(id, TransferState.Done, "Sent ${result.files} file(s)")
+            PushResult.Cancelled -> end(id, TransferState.Cancelled, "Cancelled")
+            PushResult.CancelledByReceiver -> end(id, TransferState.Failed, "The other device cancelled")
+            PushResult.Refused -> end(id, TransferState.Failed, "The other device is not accepting files")
+            is PushResult.Failed -> end(id, TransferState.Failed, result.message)
         }
     }
 
     private fun finishDownload(id: String, result: DownloadResult) {
         when (result) {
-            is DownloadResult.Done -> complete(id, "Received ${result.files} file(s)")
-            DownloadResult.Cancelled -> complete(id, "Cancelled", TransferState.Cancelled)
-            DownloadResult.ShareEnded -> fail(id, "The sender stopped this share")
-            DownloadResult.PeerUnreachable -> fail(id, "The other device is unreachable")
-            is DownloadResult.HashMismatch -> fail(id, "A file failed its checksum")
-            DownloadResult.UnsafePath -> fail(id, "The share contained an unsafe path")
-            is DownloadResult.Failed -> fail(id, result.message)
+            is DownloadResult.Done -> end(id, TransferState.Done, "Received ${result.files} file(s)")
+            DownloadResult.Cancelled -> end(id, TransferState.Cancelled, "Cancelled")
+            DownloadResult.ShareEnded -> end(id, TransferState.Failed, "The sender stopped this share")
+            DownloadResult.PeerUnreachable -> end(id, TransferState.Failed, "The other device is unreachable")
+            is DownloadResult.HashMismatch -> end(id, TransferState.Failed, "A file failed its checksum")
+            DownloadResult.UnsafePath -> end(id, TransferState.Failed, "The share contained an unsafe path")
+            is DownloadResult.Failed -> end(id, TransferState.Failed, result.message)
         }
     }
 
-    private fun complete(id: String, message: String, state: TransferState = TransferState.Done) {
-        update(id) { it.copy(state = state, message = message, speed = 0.0, done = if (state == TransferState.Done) it.total else it.done) }
-        persist()
+    /** Ends a live row; a row already ended (e.g. by Cancel) is left alone. */
+    private fun end(id: String, state: TransferState, message: String) {
+        if (board.end(id, state, message) == null) return
+        pushReceives.remove(id)
+        cleanups.remove(id)?.invoke()
+        cancels.remove(id)
         speedSamples.remove(id)
+        publish()
+        persist()
         if (state == TransferState.Done) notifyCompletion(id)
-    }
-
-    private fun fail(id: String, message: String) {
-        update(id) { it.copy(state = TransferState.Failed, message = message, speed = 0.0) }
-        persist()
-        speedSamples.remove(id)
-        notifyCompletion(id)
     }
 
     /** Posts a finished/failed notification, honoring the user's setting. */
     private fun notifyCompletion(id: String) {
-        val record = _state.value.firstOrNull { it.id == id } ?: return
+        val record = board.firstOrNull(id) ?: return
         runCatching { TransferNotifications.completion(app, record) }
     }
 
@@ -421,15 +488,14 @@ object TransferManager {
     private fun loadHistory(): List<TransferRecord> = try {
         val f = historyFile()
         if (!f.isFile) emptyList()
-        else (gson.fromJson<MutableList<TransferRecord>>(f.readText(), historyType) ?: mutableListOf())
-            .map { if (it.state == TransferState.Running || it.state == TransferState.Queued) it.copy(state = TransferState.Failed, message = "Interrupted") else it }
+        else gson.fromJson<MutableList<TransferRecord>>(f.readText(), historyType) ?: mutableListOf()
     } catch (_: Exception) {
         emptyList()
     }
 
     private fun persist() {
         runCatching {
-            historyFile().writeText(gson.toJson(_state.value.take(HISTORY_CAP), historyType))
+            historyFile().writeText(gson.toJson(board.snapshot().take(HISTORY_CAP), historyType))
         }
     }
 }
