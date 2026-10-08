@@ -111,6 +111,25 @@ class TransferBoardTest {
     }
 
     @Test
+    fun finishingWithDoneRecordsTheAverageSpeed() {
+        val b = board()
+        b.add(row("t_send", "send", TransferState.Running, startedAt = 1_000))
+        now = 3_000 // 2 seconds for 100 bytes
+        b.end("t_send", TransferState.Done, "Sent 1 file(s)")
+        assertEquals(50.0, b.firstOrNull("t_send")?.averageSpeed ?: 0.0, 0.001)
+        assertEquals(100L, b.firstOrNull("t_send")?.done)
+    }
+
+    @Test
+    fun aFailedRowHasNoAverageSpeed() {
+        val b = board()
+        b.add(row("t_send", "send", TransferState.Running, startedAt = 1_000))
+        now = 3_000
+        b.end("t_send", TransferState.Failed, "Connection lost")
+        assertEquals(0.0, b.firstOrNull("t_send")?.averageSpeed ?: -1.0, 0.001)
+    }
+
+    @Test
     fun restartFailsInterruptedRows() {
         val b = board()
         b.add(row("r", "receive", TransferState.Running))

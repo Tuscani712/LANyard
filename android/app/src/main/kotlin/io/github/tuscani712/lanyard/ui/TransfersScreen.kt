@@ -96,10 +96,15 @@ private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: 
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Spacer(Modifier.height(4.dp))
-                val speed = if (record.state == TransferState.Running && record.speed > 0) {
-                    " · " + formatSpeed(record.speed, speedUnit)
-                } else {
-                    ""
+                // Live speed while running (blank when the meter has no honest
+                // rate, e.g. just after a resume); the whole-transfer average
+                // once finished, so a receive row shows its speed too.
+                val speed = when {
+                    record.state == TransferState.Running && record.speed > 0 ->
+                        " · " + formatSpeed(record.speed, speedUnit)
+                    record.state == TransferState.Done && record.averageSpeed > 0 ->
+                        " · avg " + formatSpeed(record.averageSpeed, speedUnit)
+                    else -> ""
                 }
                 Text(
                     "${humanSize(record.done)} / ${humanSize(record.total)}$speed",

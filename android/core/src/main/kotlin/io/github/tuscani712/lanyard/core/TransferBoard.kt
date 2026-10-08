@@ -17,9 +17,10 @@ data class TransferRecord(
     val done: Long,
     val state: TransferState,
     val message: String? = null,
-    val speed: Double = 0.0, // bytes per second, smoothed
+    val speed: Double = 0.0, // bytes per second, smoothed live rate
     val startedAt: Long,
     val lastProgressAt: Long = startedAt,
+    val averageSpeed: Double = 0.0, // bytes per second, whole-transfer average (set when Done)
 )
 
 /**
@@ -87,11 +88,17 @@ class TransferBoard(
     fun end(id: String, state: TransferState, message: String): TransferRecord? {
         val row = records.firstOrNull { it.id == id } ?: return null
         if (row.state != TransferState.Running && row.state != TransferState.Queued) return null
+        val finishedAt = clock()
         update(id) {
             it.copy(
                 state = state,
                 message = message,
                 speed = 0.0,
+                averageSpeed = if (state == TransferState.Done && finishedAt > it.startedAt) {
+                    it.total * 1000.0 / (finishedAt - it.startedAt)
+                } else {
+                    0.0
+                },
                 done = if (state == TransferState.Done) it.total else it.done,
             )
         }

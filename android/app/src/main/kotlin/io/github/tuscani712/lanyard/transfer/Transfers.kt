@@ -7,6 +7,7 @@ import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.reflect.TypeToken
 import io.github.tuscani712.lanyard.IdentityHolder
+import io.github.tuscani712.lanyard.core.Display
 import io.github.tuscani712.lanyard.core.DownloadResult
 import io.github.tuscani712.lanyard.core.DownloadSession
 import io.github.tuscani712.lanyard.core.DownloadTarget
@@ -19,6 +20,7 @@ import io.github.tuscani712.lanyard.core.PushSource
 import io.github.tuscani712.lanyard.core.RateThrottle
 import io.github.tuscani712.lanyard.core.ShareValidation
 import io.github.tuscani712.lanyard.core.SpoolEntry
+import io.github.tuscani712.lanyard.core.SpeedMeter
 import io.github.tuscani712.lanyard.core.Throttle
 import io.github.tuscani712.lanyard.core.TransferBoard
 import io.github.tuscani712.lanyard.core.TransferPolicy
@@ -71,8 +73,20 @@ object TransferManager {
 
     private val cancels = HashMap<String, AtomicBoolean>()
     private val pushReceives = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-    private val speedSamples = java.util.concurrent.ConcurrentHashMap<String, SpeedSample>()
+    private val speedMeters = java.util.concurrent.ConcurrentHashMap<String, SpeedMeter>()
     private val cleanups = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
+
+    /**
+     * Where one-line transfer events go: the phone's [ServerDiagnostics] ring
+     * buffer. Wired by [io.github.tuscani712.lanyard.PeerService]. The finish
+     * log (average speed) is written here.
+     */
+    @Volatile
+    private var diagnostic: ((String) -> Unit)? = null
+
+    fun onDiagnostic(sink: (String) -> Unit) {
+        diagnostic = sink
+    }
 
     /**
      * Cancels a live receive on the peer server (deletes its `.lanpart` spool and
@@ -138,7 +152,7 @@ object TransferManager {
         if (pushReceives.remove(row.id)) receiveCanceller?.invoke(row.id)
         cleanups.remove(row.id)?.invoke()
         cancels.remove(row.id)
-        speedSamples.remove(row.id)
+        speedMeters.remove(row.id)
     }
 
     fun cancelAllRunning() {
@@ -446,10 +460,27 @@ object TransferManager {
         pushReceives.remove(id)
         cleanups.remove(id)?.invoke()
         cancels.remove(id)
-        speedSamples.remove(id)
+        speedMeters.remove(id)
         publish()
         persist()
-        if (state == TransferState.Done) notifyCompletion(id)
+        if (state == TransferState.Done) {
+            board.firstOrNull(id)?.let { logFinished(it) }
+            notifyCompletion(id)
+        }
+    }
+
+    /**
+     * One diagnostics line when a transfer finishes, carrying its average speed
+     * (whole-transfer bytes over elapsed time). Never a file name or a full
+     * fingerprint.
+     */
+    private fun logFinished(row: TransferRecord) {
+        val sink = diagnostic ?: return
+        val elapsed = (now() - row.startedAt).coerceAtLeast(0)
+        sink(
+            "[transfer] peer=${Display.shortFp(row.peerFingerprint)} direction=${row.direction} " +
+                "id=${row.id} bytes=${row.total} avg_bps=${"%.0f".format(row.averageSpeed)} elapsed_ms=$elapsed",
+        )
     }
 
     /** Posts a finished/failed notification, honoring the user's setting. */
@@ -458,20 +489,13 @@ object TransferManager {
         runCatching { TransferNotifications.completion(app, record) }
     }
 
-    private fun sampleSpeed(id: String, done: Long): Double {
-        val at = now()
-        val sample = speedSamples.getOrPut(id) { SpeedSample(done, at, 0.0) }
-        val dt = (at - sample.at) / 1000.0
-        if (dt >= 0.4) {
-            val instant = (done - sample.bytes).coerceAtLeast(0) / dt
-            sample.ema = if (sample.ema <= 0.0) instant else sample.ema * 0.6 + instant * 0.4
-            sample.bytes = done
-            sample.at = at
-        }
-        return sample.ema
-    }
-
-    private class SpeedSample(var bytes: Long, var at: Long, var ema: Double)
+    /**
+     * The smoothed live rate for [id], or 0.0 to show nothing. A stall followed
+     * by a resume returns null from [SpeedMeter] and becomes 0.0 here, so the
+     * row and notification go blank rather than flashing a spike.
+     */
+    private fun sampleSpeed(id: String, done: Long): Double =
+        speedMeters.getOrPut(id) { SpeedMeter() }.sample(now(), done) ?: 0.0
 
     private fun newId(): String {
         val buf = ByteArray(6)

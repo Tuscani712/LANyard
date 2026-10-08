@@ -14,6 +14,7 @@ import io.github.tuscani712.lanyard.MainActivity
 import io.github.tuscani712.lanyard.SettingsHolder
 import io.github.tuscani712.lanyard.core.TransferRecord
 import io.github.tuscani712.lanyard.core.TransferState
+import io.github.tuscani712.lanyard.core.formatSpeed
 
 /**
  * The two notification channels transfers use: an ongoing, silent progress
@@ -68,6 +69,10 @@ object TransferNotifications {
         val text = buildString {
             append(if (record.direction == "send") "Sent " else "Received ")
             append(record.label.ifEmpty { "file" })
+            if (ok && record.averageSpeed > 0) {
+                append(" · ")
+                append(formatSpeed(record.averageSpeed, SettingsHolder.settings.value.speedUnit))
+            }
             if (!ok) record.message?.takeIf { it.isNotBlank() }?.let { append(" · "); append(it) }
         }
         val open = PendingIntent.getActivity(

@@ -155,6 +155,9 @@ object PeerService {
         // The Transfers screen's Cancel on a receive row must reach the peer
         // server that owns the live push session.
         TransferManager.onReceiveCancel { id -> receiver.cancelLocal(id) }
+        // Transfer finish lines (with average speed) join the same diagnostics
+        // ring the server uses, so one paste shows the whole story.
+        TransferManager.onDiagnostic { diagnostics.record(it) }
         shareStore = ShareStore(app)
         shareSource = SafShareSource(app, shareStore)
         _shares.value = shareStore.list()

@@ -76,7 +76,12 @@ class TransferService : Service() {
                 val speed = if (a.speed > 0) " · " + formatSpeed(a.speed, SettingsHolder.settings.value.speedUnit) else ""
                 (if (sending) "Sending " else "Receiving ") + a.label + speed
             }
-            else -> "${active.size} transfers"
+            else -> {
+                // Keep a rate visible even with several transfers in flight.
+                val combined = active.sumOf { it.speed }
+                val speed = if (combined > 0) " · " + formatSpeed(combined, SettingsHolder.settings.value.speedUnit) else ""
+                "${active.size} transfers$speed"
+            }
         }
         val cancel = PendingIntent.getBroadcast(
             this, 0,
