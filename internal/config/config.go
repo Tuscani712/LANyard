@@ -3,9 +3,21 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
+)
+
+// WriteFileAtomic retries a rename that failed with a sharing violation (a
+// Windows process holds the destination without FILE_SHARE_DELETE) this many
+// times, waiting renameRetryDelay between attempts. They are vars so tests can
+// shorten them.
+var (
+	renameRetries    = 5
+	renameRetryDelay = 50 * time.Millisecond
 )
 
 const (
@@ -158,7 +170,10 @@ func mustJSON(v any) []byte {
 	return b
 }
 
-// WriteFileAtomic writes via temp file + rename so a crash never leaves a torn file.
+// WriteFileAtomic writes via temp file + rename so a crash never leaves a torn
+// file. When the destination is held without FILE_SHARE_DELETE (Windows), the
+// rename is retried briefly; if it still cannot replace the file the error is
+// returned and logged, never discarded.
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
@@ -181,8 +196,32 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	}
 	_ = os.Chmod(name, perm)
 	if err := os.Rename(name, path); err != nil {
+		if renameRetries > 0 && isSharingViolation(err) {
+			if rerr := retryRename(name, path); rerr == nil {
+				return nil
+			} else {
+				err = rerr
+			}
+		}
 		os.Remove(name)
-		return err
+		slog.Error("config: could not replace file", "path", path, "err", err)
+		return fmt.Errorf("replace %s: %w", path, err)
 	}
 	return nil
+}
+
+// retryRename retries a rename that failed with a sharing violation. It stops
+// early if the error changes to a non-transient one.
+func retryRename(src, dst string) error {
+	var err error
+	for i := 0; i < renameRetries; i++ {
+		time.Sleep(renameRetryDelay)
+		if err = os.Rename(src, dst); err == nil {
+			return nil
+		}
+		if !isSharingViolation(err) {
+			return err
+		}
+	}
+	return err
 }

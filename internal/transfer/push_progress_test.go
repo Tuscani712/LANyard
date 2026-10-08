@@ -108,6 +108,32 @@ func TestPushCountingReaderResumeDoesNotDoubleCount(t *testing.T) {
 	}
 }
 
+// TestViewMarksPushFinishingWhenEveryByteHasLeft: once a push's bytes are all
+// sent but the receiver has not confirmed the finalize, the row must report
+// Finishing rather than a 100% bar with a stale speed. A push still sending and
+// a download (whose finalize is already Verifying) are not Finishing.
+func TestViewMarksPushFinishingWhenEveryByteHasLeft(t *testing.T) {
+	m := &Manager{onChange: func() {}}
+	newJob := func(direction string, done, total int64) *Job {
+		f := &FileJob{Rel: "a.bin", Size: total, Done: done, State: FilePartial}
+		return &Job{ID: "j_test", Direction: direction, State: StateTransferring, Files: []*FileJob{f}, Total: total, Done: done}
+	}
+	if v := m.view(newJob("push", 10, 10)); !v.Finishing {
+		t.Error("a fully sent push still Transferring must report Finishing")
+	}
+	if v := m.view(newJob("push", 4, 10)); v.Finishing {
+		t.Error("a push still sending bytes must not report Finishing")
+	}
+	if v := m.view(newJob("download", 10, 10)); v.Finishing {
+		t.Error("a download finalizes via Verifying and must not report Finishing")
+	}
+	done := newJob("push", 10, 10)
+	done.State = StateDone
+	if v := m.view(done); v.Finishing {
+		t.Error("a Done push must not report Finishing")
+	}
+}
+
 // failAfterReader yields its data and then fails, standing in for a connection
 // dropped mid-upload.
 type failAfterReader struct {

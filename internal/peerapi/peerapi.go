@@ -68,6 +68,11 @@ type Server struct {
 	// main; nil is a valid no-op. It is called before the trust entry is removed
 	// so the last-known address is still available for the fallback.
 	onRevoke func(fp string, wasPaired bool)
+	// onSeen, when set, runs whenever a peer proves reachable by calling us: a
+	// successful /hello or an inbound handshake from that certificate. It lets a
+	// device unpaired while offline be told to drop us as soon as it reappears.
+	// It runs off the request path and must not block; nil is a valid no-op.
+	onSeen func(fp string)
 	// mu guards srv and port, which Listen and Serve write while Shutdown and
 	// Port may read from other goroutines.
 	mu        sync.Mutex
@@ -89,6 +94,20 @@ func (s *Server) SetXferLog(r *xferlog.Recorder) { s.xlog = r }
 // SetOnRevoke registers the local cleanup that runs when a peer revokes the
 // pairing over the peer API. It must be safe to call repeatedly.
 func (s *Server) SetOnRevoke(fn func(fp string, wasPaired bool)) { s.onRevoke = fn }
+
+// SetOnPeerSeen registers a callback invoked (off the request path) whenever a
+// peer proves reachable to us — a successful /hello or an inbound handshake.
+// It is how a pending unpair is retried as soon as the device is seen.
+func (s *Server) SetOnPeerSeen(fn func(fp string)) { s.onSeen = fn }
+
+// notePeerSeen tells the host a peer just proved reachable. The callback runs in
+// its own goroutine so a slow retry cannot stall the peer's request.
+func (s *Server) notePeerSeen(fp string) {
+	if fp == "" || s.onSeen == nil {
+		return
+	}
+	go s.onSeen(fp)
+}
 
 // xfer records one transfer entry and mirrors it into the desktop log. Push
 // and pull entries default to their area at the call site.
@@ -211,6 +230,9 @@ func (s *Server) withPeer(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
+	// A peer reaching our hello endpoint is proof it is online; retry any
+	// pending unpair for it.
+	s.notePeerSeen(PeerID(r.Context()))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.hello())
 }

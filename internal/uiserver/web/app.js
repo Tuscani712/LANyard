@@ -6,6 +6,26 @@ const $ = (id) => document.getElementById(id);
 let incomingList = []; // pushes this device is receiving
 let snippetsList = []; // text snippets this device has received
 
+// Mirrored from Go (internal/inbox/rate.go): the one shared definition of the
+// transfer-rate smoothing window and the displayed speed/ETA refresh cadence.
+const RATE_WINDOW_MS = 5000; // inbox.RateWindow
+const RATE_DISPLAY_MS = 1000; // inbox.RateDisplayEvery
+
+// gatedSpeedText formats the speed/ETA shown on a row, but lets the text change
+// at most once per RATE_DISPLAY_MS. The server already gates the numbers; this
+// is a second guard so a burst of SSE frames cannot repaint the text faster.
+// The percentage and byte counts are not gated and keep updating.
+const _speedText = new Map();
+function gatedSpeedText(id, mbps, etaSeconds) {
+  const now = Date.now();
+  const prev = _speedText.get(id);
+  if (prev && now - prev.at < RATE_DISPLAY_MS) return prev.text;
+  const text = (mbps > 0 ? ` \u00b7 ${fmtSpeed(mbps)}` : "") +
+    (etaSeconds > 0 ? ` \u00b7 ETA ${fmtETA(etaSeconds)}` : "");
+  _speedText.set(id, { at: now, text });
+  return text;
+}
+
 function el(tag, cls, text) {
   const e = document.createElement(tag);
   if (cls) e.className = cls;
@@ -218,7 +238,8 @@ function renderNav() {
     item.innerHTML = I[n.icon];
     item.appendChild(el("span", null, n.label));
     if (n.id === "transfers") {
-      const live = transfersList.filter((t) => t.state !== "Done").length + incomingList.length + snippetsList.length;
+      const terminal = (t) => t.state === "Done" || t.state === "Failed" || t.state === "Cancelled";
+      const live = transfersList.filter((t) => !terminal(t)).length + incomingList.length + snippetsList.length;
       if (live) item.appendChild(el("span", "nav-badge", String(live)));
     }
     if (n.id === "paired" && S.actionable) {
@@ -616,7 +637,7 @@ function renderDevice(body, p) {
     actions.appendChild(pf);
     actions.appendChild(pd);
     actions.appendChild(btn("Mount as drive", () => mountDevice(p.device, peer.name), "ghost"));
-    actions.appendChild(btn("Unpair", () => unpair(p.device, paired), "ghost"));
+    actions.appendChild(btn("Unpair this device", () => unpair(p.device, paired), "ghost"));
   } else if (session) {
     actions.appendChild(btn("Push files\u2026", () => pushTo(p.device, peer.name)));
     actions.appendChild(btn("Push folder\u2026", () => pushTo(p.device, peer.name, true), "ghost"));
@@ -975,8 +996,9 @@ function shareLifetimeText(s) {
 function renderTransfersPage() {
   const box = $("transfers-body");
   clear(box);
-  const history = transfersList.filter((t) => t.state === "Done" || t.state === "Failed");
-  const activeTransfers = transfersList.filter((t) => t.state !== "Done" && t.state !== "Failed");
+  const isDone = (t) => t.state === "Done" || t.state === "Failed" || t.state === "Cancelled";
+  const history = transfersList.filter(isDone);
+  const activeTransfers = transfersList.filter((t) => !isDone(t));
   $("clear-finished").hidden = !history.length;
   const stack = el("div", "stack");
   for (const sp of snippetsList) {
@@ -997,16 +1019,24 @@ function renderTransfersPage() {
     stack.appendChild(row);
   }
   if (!transfersList.length && !incomingList.length && !snippetsList.length) stack.appendChild(el("div", "empty", "No transfers."));  for (const inc of incomingList) {
+    const fin = !!inc.finishing;
     const row = el("div", "row col");
     const top = el("div", "row"); top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
     top.appendChild(el("div", "grow name", "\u2193 Receiving from " + (inc.peer_name || prettyId(inc.peer_fp) || "a device")));
-    top.appendChild(el("span", "badge", "Receiving"));
+    top.appendChild(el("span", "badge" + (fin ? " warn" : ""), fin ? "Finishing" : "Receiving"));
     row.appendChild(top);
     const pct = inc.total ? Math.min(100, (inc.done / inc.total) * 100) : 0;
     const bar = el("div", "bar"); const fill = el("div", "fill"); fill.style.width = pct.toFixed(1) + "%"; bar.appendChild(fill); row.appendChild(bar);
-    const spd = inc.speed_mbps > 0 ? ` \u00b7 ${fmtSpeed(inc.speed_mbps)}` : "";
-    row.appendChild(el("div", "meta", `${pct.toFixed(0)}%${spd} \u00b7 ${fmtBytes(inc.done)} / ${fmtBytes(inc.total)} \u00b7 ${inc.files_done} of ${inc.files_total} file${inc.files_total === 1 ? "" : "s"} \u00b7 saved to your Inbox`));
-    if (inc.current) row.appendChild(el("div", "meta", inc.current));
+    if (fin) {
+      // Every byte has arrived; the .lanpart is being hashed and renamed (or the
+      // whole push is awaiting its final complete). Say so instead of showing a
+      // meaningless speed/ETA on a full bar.
+      row.appendChild(el("div", "meta", `100% \u00b7 ${fmtBytes(inc.total)} \u00b7 ${inc.files_total} file${inc.files_total === 1 ? "" : "s"} \u00b7 finishing \u2014 verifying and saving to your Inbox`));
+    } else {
+      const spd = gatedSpeedText(inc.id, inc.speed_mbps, inc.eta_seconds);
+      row.appendChild(el("div", "meta", `${pct.toFixed(0)}%${spd} \u00b7 ${fmtBytes(inc.done)} / ${fmtBytes(inc.total)} \u00b7 ${inc.files_done} of ${inc.files_total} file${inc.files_total === 1 ? "" : "s"} \u00b7 saved to your Inbox`));
+      if (inc.current) row.appendChild(el("div", "meta", inc.current));
+    }
     const acts = el("div", "actions");
     acts.appendChild(btn("Cancel", async () => {
       if (!confirm("Stop receiving these files? Files already received stay in your Inbox.")) return;
@@ -1018,13 +1048,14 @@ function renderTransfersPage() {
   }
   for (const t of activeTransfers) {
     const row = el("div", "row col");
+    const fin = !!t.finishing;
     const files = t.files || [];
     const cur = files[t.current_index] || null;
     const name = t.state === "Done" ? (t.share_label || t.share_id) : (cur ? cur.local : (t.share_label || t.share_id));
     const top = el("div", "row");
     top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
     top.appendChild(el("div", "grow name", `${t.direction === "download" ? "\u2193" : "\u2191"} ${name}`));
-    top.appendChild(el("span", "badge " + stateClass(t.state), t.state));
+    top.appendChild(el("span", "badge " + (fin ? "warn" : stateClass(t.state)), fin ? "Finishing" : t.state));
     row.appendChild(top);
 
     const pct = t.total ? Math.min(100, (t.done / t.total) * 100) : (t.state === "Done" ? 100 : 0);
@@ -1037,7 +1068,8 @@ function renderTransfersPage() {
     const live = t.state === "Transferring" || t.state === "Verifying";
     const meta = el("div", "meta");
     meta.textContent = `${pct.toFixed(0)}%` +
-      (live ? ` \u00b7 ${fmtSpeed(t.speed_mbps)} \u00b7 ETA ${fmtETA(t.eta_seconds)}` : "") +
+      (fin ? " \u00b7 finishing \u2014 the other device is verifying and saving"
+        : (live ? ` \u00b7 ${fmtSpeed(t.speed_mbps)} \u00b7 ETA ${fmtETA(t.eta_seconds)}` : "")) +
       ` \u00b7 ${fmtBytes(t.done)} / ${fmtBytes(t.total)}` +
       ` \u00b7 ${t.files_done} of ${n} file${n === 1 ? "" : "s"}` +
       (t.state === "Done" && t.finished_at ? ` \u00b7 finished ${fmtWhen(t.finished_at)}` : "");
@@ -1054,12 +1086,8 @@ function renderTransfersPage() {
     }
     const cancel = el("button", "btn ghost", t.state === "Done" ? "Remove" : "Cancel");
     cancel.addEventListener("click", async () => {
-      let del = false;
-      if (t.state !== "Done") {
-        if (!confirm("Cancel this transfer?")) return;
-        del = confirm("Also delete the partial files?");
-      }
-      await fetch(`/api/transfers/${t.id}/cancel${del ? "?delete=1" : ""}`, { method: "POST" });
+      if (t.state !== "Done" && !confirm("Cancel this transfer? Its partial download will be deleted.")) return;
+      await fetch(`/api/transfers/${t.id}/cancel`, { method: "POST" });
     });
     acts.appendChild(cancel);
     row.appendChild(acts);
@@ -1095,6 +1123,7 @@ function renderTransfersPage() {
       const n = t.files_total || (t.files || []).length;
       const meta = el("div", "meta");
       meta.textContent = `${fmtBytes(t.total)} \u00b7 ${n} file${n === 1 ? "" : "s"}` +
+        (t.avg_speed_mbps > 0 ? ` \u00b7 ${fmtSpeed(t.avg_speed_mbps)} avg` : "") +
         (t.peer_name ? ` \u00b7 ${t.direction === "push" ? "to " : "from "}${t.peer_name}` : "") +
         (t.finished_at ? ` \u00b7 ${fmtWhen(t.finished_at)}` : "");
       row.appendChild(meta);
@@ -1670,9 +1699,25 @@ async function addPeer(addr) {
   if (r.ok) toast("Added.", "ok"); else toast((await r.text()).trim(), "err");
 }
 async function unpair(fp, entry) {
-  const name = (entry && entry.name) || prettyId(fp);
+  // The unpair endpoint keys on the certificate fingerprint, but the device
+  // pane and peer menu only hold the device id; the paired entry carries the
+  // fingerprint, so prefer it. This keeps every caller on the same idempotent
+  // /api/trust/{fp}/unpair path (handleUnpair + pending-unpair retry).
+  const key = (entry && entry.cert_fingerprint) || fp;
+  const name = (entry && entry.name) || prettyId(key);
   if (!confirm(`Unpair ${name}? Active connections from this device will be rejected immediately.`)) return;
-  await fetch(`/api/trust/${encodeURIComponent(fp)}/unpair`, { method: "POST" });
+  const online = isOnline(key);
+  const r = await fetch(`/api/trust/${encodeURIComponent(key)}/unpair`, { method: "POST" });
+  if (r.ok) {
+    // A 200 means the local pairing is gone; when the peer is away the server
+    // remembers the unpair and retries the notification once it is next seen.
+    toast(online
+      ? `Unpaired ${name}. Active connections from this device will be rejected.`
+      : `Unpaired ${name}. It is offline now; it will be told when it is next seen.`, "ok");
+    return;
+  }
+  if (r.status === 404) { toast(`${name} was already unpaired.`, "info"); return; }
+  toast((await r.text()).trim() || `Could not unpair ${name}.`, "err");
 }
 async function pushTo(deviceId, name, folder) {
   const paths = await pickPaths(folder ? "folder" : "files", `Choose ${folder ? "a folder" : "files"} to send to ${name || "the device"}`, "");
@@ -1940,7 +1985,7 @@ $("share-browse-folder").addEventListener("click", async () => {
   if (p[0]) $("share-path").value = p[0];
 });
 $("stop-all").addEventListener("click", async () => { if (!confirm("Stop every share now?")) return; await fetch("/api/shares/stop-all", { method: "POST" }); });
-$("clear-finished").addEventListener("click", () => fetch("/api/transfers/clear-history", { method: "POST" }));
+$("clear-finished").addEventListener("click", () => fetch("/api/transfers/clear-finished", { method: "POST" }));
 $("pair-close").addEventListener("click", closePair);
 $("pair").addEventListener("click", (e) => { if (e.target === $("pair")) closePair(); });
 $("diag-close").addEventListener("click", closeDiag);

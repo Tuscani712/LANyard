@@ -174,6 +174,10 @@ func TestPairedProbeCache(t *testing.T) {
 	m.SetPairedProvider(func() []PairedPeer {
 		return []PairedPeer{{Fingerprint: fp, ShortID: short, Addrs: []string{"192.168.1.52"}, Port: 47800}}
 	})
+	// Drive the cache from an injected clock so expiry is deterministic even on
+	// hosts with a coarse timer (this flaked under Wine at the 1 ns interval).
+	var clock atomic.Int64
+	m.SetNowFunc(func() time.Time { return time.Unix(0, clock.Load()) })
 	m.SetPairedProbeInterval(time.Hour)
 
 	m.sweep()
@@ -184,7 +188,7 @@ func TestPairedProbeCache(t *testing.T) {
 		t.Fatalf("cached paired probe ran %d times, want 1", got)
 	}
 
-	m.SetPairedProbeInterval(time.Nanosecond)
+	clock.Add(int64(time.Hour + time.Second))
 	m.sweep()
 	m.wg.Wait()
 	if got := calls.Load(); got != 2 {

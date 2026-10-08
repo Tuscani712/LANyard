@@ -14,10 +14,8 @@ import (
 // by the reaper and that removal must be recorded with the pushing tag and the
 // stall outcome.
 func TestStalledPushIsLogged(t *testing.T) {
-	m := New(t.TempDir(), nil)
+	m := New(t.TempDir(), nil, WithTimeouts(20*time.Millisecond, 20*time.Millisecond))
 	defer m.Close()
-	m.SetIdleTimeout(20 * time.Millisecond)
-	m.SetStallTimeout(20 * time.Millisecond)
 	rec := xferlog.New(50)
 	m.SetXferLog(rec)
 
@@ -25,20 +23,23 @@ func TestStalledPushIsLogged(t *testing.T) {
 		t.Fatalf("Offer: %v", err)
 	}
 
-	deadline := time.Now().Add(3 * time.Second)
-	for m.Count() > 0 && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
+	// Wait for the reaper to log the removal, not merely for the push to leave
+	// the map: reapStalled drops the push under the lock and only then records
+	// the stall, so polling Count() can race the log line.
+	logged := func() bool {
+		for _, e := range rec.Entries() {
+			if e.Area == xferlog.AreaPushing && e.Outcome == "stall" {
+				return true
+			}
+		}
+		return false
+	}
+	if !waitFor(logged, 3*time.Second) {
+		t.Fatalf("stalled push removal not logged as pushing/stall: %+v", rec.Entries())
 	}
 	if m.Count() != 0 {
 		t.Fatal("stalled push was not removed by the reaper")
 	}
-
-	for _, e := range rec.Entries() {
-		if e.Area == xferlog.AreaPushing && e.Outcome == "stall" {
-			return
-		}
-	}
-	t.Errorf("stalled push removal not logged as pushing/stall: %+v", rec.Entries())
 }
 
 // A receive that finishes records one line in the transfer log carrying the
@@ -56,7 +57,7 @@ func TestFinishedPushLogsAverageSpeed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Offer: %v", err)
 	}
-	if _, err := m.Receive(p.ID, "peer-fp-1234", "a.txt", hex.EncodeToString(sum[:]), bytes.NewReader(data)); err != nil {
+	if _, _, err := m.Receive(p.ID, "peer-fp-1234", "a.txt", hex.EncodeToString(sum[:]), bytes.NewReader(data)); err != nil {
 		t.Fatalf("Receive: %v", err)
 	}
 	// Ensure the push has a measurable, non-zero lifetime.

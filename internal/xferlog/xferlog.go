@@ -20,6 +20,10 @@ import (
 type Level string
 
 const (
+	// LevelDebug is for routine, healthy chatter (a successful probe, a
+	// re-announced peer) that nobody needs in the default desktop log. It is
+	// still kept in the in-memory diagnostics history.
+	LevelDebug Level = "debug"
 	LevelInfo  Level = "info"
 	LevelWarn  Level = "warn"
 	LevelError Level = "error"
@@ -230,9 +234,10 @@ func (r *Recorder) Add(e Entry) {
 	r.mu.Unlock()
 }
 
-// Record writes the entry to the desktop log (info for normal steps, warn and
-// error for failures) and keeps it for the diagnostics report. l may be nil, in
-// which case the recorder's fallback logger is used. A nil recorder is a no-op.
+// Record writes the entry to the desktop log (debug for routine healthy
+// chatter, info for normal steps, warn and error for failures) and keeps it for
+// the diagnostics report. l may be nil, in which case the recorder's fallback
+// logger is used. A nil recorder is a no-op.
 func (r *Recorder) Record(l *slog.Logger, e Entry) {
 	if r == nil {
 		return
@@ -249,6 +254,8 @@ func (r *Recorder) Record(l *slog.Logger, e Entry) {
 		l.Error(e.summary(), e.attrs()...)
 	case LevelWarn:
 		l.Warn(e.summary(), e.attrs()...)
+	case LevelDebug:
+		l.Debug(e.summary(), e.attrs()...)
 	default:
 		l.Info(e.summary(), e.attrs()...)
 	}

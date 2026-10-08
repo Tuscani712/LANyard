@@ -120,8 +120,10 @@ func (r *registry) list() []Peer {
 	return out
 }
 
-// upsert records an announcement and returns a copy of the peer.
-func (r *registry) upsert(a Announcement, ips []string, source string) Peer {
+// upsert records an announcement and returns a copy of the peer plus whether
+// this announcement was new or changed something (a fresh sighting) rather than
+// a routine repeat of what we already knew.
+func (r *registry) upsert(a Announcement, ips []string, source string) (Peer, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	p, ok := r.peers[a.ShortID]
@@ -149,7 +151,7 @@ func (r *registry) upsert(a Announcement, ips []string, source string) Peer {
 	}
 	c := *p
 	c.Addrs = append([]string(nil), p.Addrs...)
-	return c
+	return c, changed
 }
 
 func (r *registry) remove(shortID string) {

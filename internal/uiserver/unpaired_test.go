@@ -96,6 +96,51 @@ func TestPeerRefusedPairingIgnoresPermissionDenials(t *testing.T) {
 	}
 }
 
+// The phone sends its refusal as a JSON error body ({"error":"not paired"}); the
+// auto-unpair path must recognize that real wire form, and must not be fooled by
+// a JSON permission reason or a lookalike. The pinned-certificate gate still
+// applies to the JSON form too.
+func TestPeerRefusedPairingMatchesThePhoneJSONBody(t *testing.T) {
+	cfg, err := config.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("config.Open: %v", err)
+	}
+	tr := trust.New(cfg, "self-fp", nil)
+	tr.Pair(trust.Entry{DeviceID: "phone", Name: "Phone", Fingerprint: "peer-fp"})
+	s := New(Deps{Trust: tr})
+	if !s.peerRefusedPairing("peer-fp", &peerapi.StatusError{Code: http.StatusForbidden, Status: "403 Forbidden", Msg: `{"error":"not paired"}`, Pinned: true}) {
+		t.Fatal("the phone's JSON not-paired body must be treated as the peer unpaired us")
+	}
+	if _, ok := tr.Entry("peer-fp"); ok {
+		t.Fatal("the stale local pairing should have been removed")
+	}
+
+	for _, tc := range []struct {
+		name string
+		msg  string
+		pin  bool
+	}{
+		{"json permission", `{"error":"pull not permitted"}`, true},
+		{"json not paired yet", `{"error":"not paired yet"}`, true},
+		{"json forbidden", `{"error":"forbidden"}`, true},
+		{"unpinned json not paired", `{"error":"not paired"}`, false},
+	} {
+		cfg2, err := config.Open(t.TempDir())
+		if err != nil {
+			t.Fatalf("%s: config.Open: %v", tc.name, err)
+		}
+		tr2 := trust.New(cfg2, "self-fp", nil)
+		tr2.Pair(trust.Entry{DeviceID: "phone", Name: "Phone", Fingerprint: "peer-fp"})
+		s2 := New(Deps{Trust: tr2})
+		if s2.peerRefusedPairing("peer-fp", &peerapi.StatusError{Code: http.StatusForbidden, Status: "403 Forbidden", Msg: tc.msg, Pinned: tc.pin}) {
+			t.Errorf("%s: pairing was removed, want it kept", tc.name)
+		}
+		if _, ok := tr2.Entry("peer-fp"); !ok {
+			t.Errorf("%s: the pairing should survive", tc.name)
+		}
+	}
+}
+
 // The removal path is gated on certificate pinning: an unpinned 403 "not paired"
 // (TLS present but the peer cert was never checked against the expected
 // fingerprint) must not drop a pairing.

@@ -248,7 +248,7 @@ func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
 	// the receiver verifies and finalizes at once (no separate "complete" call).
 	if sha := r.Header.Get("X-Lanyard-SHA256"); sha != "" && offset == 0 {
 		fileAt := time.Now()
-		st, err := s.inbox.Receive(r.PathValue("id"), PeerID(r.Context()), rel, sha, r.Body)
+		st, already, err := s.inbox.Receive(r.PathValue("id"), PeerID(r.Context()), rel, sha, r.Body)
 		if err != nil {
 			code := http.StatusBadRequest
 			switch {
@@ -264,7 +264,11 @@ func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
 			s.xferRecvFile(PeerID(r.Context()), xferlog.StepFile, xferlog.LevelError, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, path.Base(rel), 0, 0, 0, time.Since(fileAt), err)
 			return
 		}
-		s.xferRecvFile(PeerID(r.Context()), xferlog.StepFile, xferlog.LevelInfo, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, path.Base(rel), 0, st.Size, st.Size, time.Since(fileAt), nil)
+		// A replayed whole-file request for an already-placed file is an
+		// idempotent success: report the same result without a second receipt.
+		if !already {
+			s.xferRecvFile(PeerID(r.Context()), xferlog.StepFile, xferlog.LevelInfo, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, path.Base(rel), 0, st.Size, st.Size, time.Since(fileAt), nil)
+		}
 		writeJSON(w, map[string]any{"written": st.Size, "offset": st.Size, "done": true})
 		return
 	}
@@ -306,12 +310,16 @@ func (s *Server) handlePushComplete(w http.ResponseWriter, r *http.Request) {
 	file := path.Base(req.RelPath)
 	completeAt := time.Now()
 	if req.All {
-		s.inbox.Finish(id, fp)
-		s.xferRecv(PeerID(r.Context()), xferlog.StepComplete, xferlog.LevelInfo, peer, r.RemoteAddr, file, 0, time.Since(completeAt), nil)
+		// A repeated final complete is an idempotent success: only the first
+		// Finish removes the push and records it, so the duplicate neither
+		// errors nor double-records.
+		if s.inbox.Finish(id, fp) {
+			s.xferRecv(PeerID(r.Context()), xferlog.StepComplete, xferlog.LevelInfo, peer, r.RemoteAddr, file, 0, time.Since(completeAt), nil)
+		}
 		writeJSON(w, map[string]bool{"done": true})
 		return
 	}
-	st, err := s.inbox.Complete(id, fp, req.RelPath, req.SHA256)
+	st, already, err := s.inbox.Complete(id, fp, req.RelPath, req.SHA256)
 	if err != nil {
 		if s.inbox.WasCancelled(id) {
 			err = inbox.ErrCancelled
@@ -337,7 +345,11 @@ func (s *Server) handlePushComplete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-	s.xferRecv(PeerID(r.Context()), xferlog.StepComplete, xferlog.LevelInfo, peer, r.RemoteAddr, path.Base(st.RelPath), st.Size, time.Since(completeAt), nil)
+	// A replayed per-file complete for an already-placed file returns the same
+	// result without a second receipt, so it cannot double-record.
+	if !already {
+		s.xferRecv(PeerID(r.Context()), xferlog.StepComplete, xferlog.LevelInfo, peer, r.RemoteAddr, path.Base(st.RelPath), st.Size, time.Since(completeAt), nil)
+	}
 	writeJSON(w, map[string]any{"rel_path": st.RelPath, "done": true})
 }
 

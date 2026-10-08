@@ -74,3 +74,32 @@ func TestScrubKeepsShortAndRedactsLong(t *testing.T) {
 		}
 	}
 }
+
+// Every path shape must be replaced by <path> without leaking the part after a
+// space or the drive/server prefix.
+func TestScrubRedactsPathForms(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		leak []string
+	}{
+		{"unc", `copy \\server\share\private\taxes.txt`, []string{"server", "share", "taxes.txt"}},
+		{"unc_spaces", `open \\server\share\My Folder\secret.txt`, []string{"server", "My Folder", "secret.txt"}},
+		{"windows_backslash_spaces", `open C:\Program Files\Secret App\notes.txt`, []string{"C:", "Program Files", "notes.txt"}},
+		{"windows_forward", `open C:/Users/alice/Documents/private/report.docx`, []string{"C:", "/Users", "report.docx"}},
+		{"unix_spaces", `open /home/alice/My Documents/secret.txt`, []string{"alice", "My Documents", "secret.txt"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := Scrub(tc.in)
+			if !strings.Contains(got, "<path>") {
+				t.Fatalf("Scrub(%q) = %q, want a <path> marker", tc.in, got)
+			}
+			for _, leak := range tc.leak {
+				if strings.Contains(got, leak) {
+					t.Errorf("Scrub(%q) leaked %q: %q", tc.in, leak, got)
+				}
+			}
+		})
+	}
+}

@@ -43,7 +43,15 @@ const (
 	StateWaiting      = "Waiting for peer"
 	StateDone         = "Done"
 	StateFailed       = "Failed"
+	StateCancelled    = "Cancelled"
 )
+
+// isTerminal reports whether a state is a finished history entry: it stays on
+// the Transfers history (until removed or the history is cleared) instead of
+// being an in-flight job.
+func isTerminal(state string) bool {
+	return state == StateDone || state == StateFailed || state == StateCancelled
+}
 
 // Per-file states (spec §8.2 folder resume).
 const (
@@ -160,11 +168,16 @@ type Job struct {
 	OneTime           bool `json:"one_time,omitempty"`
 	CompletionPending bool `json:"completion_pending,omitempty"`
 	reporting         bool `json:"-"`
+	// cancelled marks a job the person stopped (as opposed to Paused): the
+	// worker keeps it as a Cancelled history entry instead of a resumable job.
+	cancelled bool `json:"-"`
 
 	mu           sync.Mutex         `json:"-"`
 	ctx          context.Context    `json:"-"`
 	cancel       context.CancelFunc `json:"-"`
-	speed        float64            `json:"-"` // bytes/sec, EMA
+	speed        float64            `json:"-"` // bytes/sec, EMA (~5 s, see inbox.RateWindow)
+	displaySpeed float64            `json:"-"` // speed last shown to the UI, gated to inbox.RateDisplayEvery
+	displayAt    time.Time          `json:"-"` // when displaySpeed was last refreshed
 	lastBytes    int64              `json:"-"`
 	lastAt       time.Time          `json:"-"`
 	lastProgress time.Time          `json:"-"`
@@ -176,31 +189,40 @@ type Job struct {
 
 // View is the JSON shape handed to the local UI.
 type View struct {
-	ID         string     `json:"id"`
-	Direction  string     `json:"direction"`
-	PeerID     string     `json:"peer_id"`
-	PeerName   string     `json:"peer_name"`
-	ShareID    string     `json:"share_id"`
-	ShareLabel string     `json:"share_label"`
-	Root       string     `json:"root"`
-	Dest       string     `json:"dest"`
-	State      string     `json:"state"`
-	Error      string     `json:"error"`
-	Note       string     `json:"note"`
-	RetryIn    int        `json:"retry_in"`
-	Attempt    int        `json:"attempt"`
-	Total      int64      `json:"total"`
-	Done       int64      `json:"done"`
-	SpeedMBps  float64    `json:"speed_mbps"`
-	ETASeconds int        `json:"eta_seconds"`
-	Files      []FileView `json:"files"`
-	CurrentIdx int        `json:"current_index"` // index into Files (the window)
-	FilesTotal int        `json:"files_total"`
-	FilesStart int        `json:"files_offset"` // position of Files[0] in the full list
-	FilesDone  int        `json:"files_done"`
-	StartedAt  time.Time  `json:"started_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
-	FinishedAt time.Time  `json:"finished_at"`
+	ID         string `json:"id"`
+	Direction  string `json:"direction"`
+	PeerID     string `json:"peer_id"`
+	PeerName   string `json:"peer_name"`
+	ShareID    string `json:"share_id"`
+	ShareLabel string `json:"share_label"`
+	Root       string `json:"root"`
+	Dest       string `json:"dest"`
+	State      string `json:"state"`
+	Error      string `json:"error"`
+	Note       string `json:"note"`
+	// Finishing is true when every byte of a push has left this device but the
+	// receiver has not yet confirmed the finalize, so the row is still
+	// Transferring at 100%. The UI shows "Finishing…" instead of a stale speed
+	// and an unexplained full bar.
+	Finishing  bool    `json:"finishing"`
+	RetryIn    int     `json:"retry_in"`
+	Attempt    int     `json:"attempt"`
+	Total      int64   `json:"total"`
+	Done       int64   `json:"done"`
+	SpeedMBps  float64 `json:"speed_mbps"`
+	ETASeconds int     `json:"eta_seconds"`
+	// AvgSpeedMBps is the average throughput over a finished job's life, shown
+	// on the history row. It is derived from the persisted start/finish times
+	// and bytes, so it survives a restart.
+	AvgSpeedMBps float64    `json:"avg_speed_mbps"`
+	Files        []FileView `json:"files"`
+	CurrentIdx   int        `json:"current_index"` // index into Files (the window)
+	FilesTotal   int        `json:"files_total"`
+	FilesStart   int        `json:"files_offset"` // position of Files[0] in the full list
+	FilesDone    int        `json:"files_done"`
+	StartedAt    time.Time  `json:"started_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	FinishedAt   time.Time  `json:"finished_at"`
 }
 
 type FileView struct {
@@ -295,7 +317,7 @@ func (m *Manager) Load() error {
 	defer m.mu.Unlock()
 	for _, j := range jobs {
 		switch j.State {
-		case StateDone, StatePaused, StateFailed:
+		case StateDone, StatePaused, StateFailed, StateCancelled:
 		default:
 			j.State = StateWaiting
 		}
@@ -359,7 +381,7 @@ func (m *Manager) persist() {
 	jobs := make([]*Job, 0, len(m.jobs))
 	var finished []*Job
 	for _, j := range m.jobs {
-		if j.State == StateDone || j.State == StateFailed {
+		if isTerminal(j.State) {
 			finished = append(finished, j)
 		} else {
 			jobs = append(jobs, j)
@@ -389,7 +411,7 @@ func (m *Manager) persist() {
 	for i, j := range jobs {
 		j.mu.Lock()
 		var payload any = j
-		if j.State == StateDone || j.State == StateFailed {
+		if isTerminal(j.State) {
 			payload = archiveJob(j)
 		}
 		b, err := json.Marshal(payload)
@@ -404,7 +426,12 @@ func (m *Manager) persist() {
 	}
 	buf.WriteByte(']')
 	raw := buf.Bytes()
-	_ = m.cfg.Update(func(s *config.Settings) { s.Transfers = raw })
+	if err := m.cfg.Update(func(s *config.Settings) { s.Transfers = raw }); err != nil {
+		// Never discard the failure: the history cannot be saved, so say so.
+		if m.log != nil {
+			m.log.Warn("transfers: could not persist history", "err", err)
+		}
+	}
 }
 
 // CreateParams describes a download request from the UI.
@@ -574,6 +601,54 @@ func (m *Manager) RecordReceiveFailed(peerFP, peerName, reason string) {
 	m.onChange()
 }
 
+// RecordReceiveCancelled records a push the receiving person stopped as a
+// Cancelled "receive" history entry, so it stays visible and correctly labelled
+// like a finished or failed receive. Files that had already landed are kept and
+// listed; partial files are not.
+func (m *Manager) RecordReceiveCancelled(peerFP, peerName string, files []ReceivedFile, started time.Time) {
+	now := time.Now()
+	if started.IsZero() {
+		started = now
+	}
+	job := &Job{
+		ID:         "r_" + randHex(6),
+		Direction:  "receive",
+		PeerID:     peerFP,
+		PeerName:   peerName,
+		StartedAt:  started,
+		UpdatedAt:  now,
+		FinishedAt: now,
+		State:      StateCancelled,
+		wake:       make(chan struct{}, 1),
+	}
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		job.Files = append(job.Files, &FileJob{
+			Rel: f.Name, Local: f.Name, Target: f.Name,
+			Size: f.Size, Done: f.Size, State: FileDone,
+		})
+		job.Total += f.Size
+		names = append(names, f.Name)
+	}
+	switch len(files) {
+	case 0:
+		job.ShareLabel = "Inbox"
+	case 1:
+		job.ShareLabel = files[0].Name
+	default:
+		job.ShareLabel = fmt.Sprintf("%d files", len(files))
+	}
+	if len(names) > 0 {
+		sort.Strings(names)
+		job.RemotePaths = names
+	}
+	m.mu.Lock()
+	m.jobs[job.ID] = job
+	m.mu.Unlock()
+	m.persist()
+	m.onChange()
+}
+
 // Resume restarts a paused/failed/waiting job.
 func (m *Manager) Resume(id string) error {
 	m.mu.Lock()
@@ -591,6 +666,8 @@ func (m *Manager) Resume(id string) error {
 	job.State = StateQueued
 	job.Error = ""
 	job.Note = ""
+	job.cancelled = false
+	job.FinishedAt = time.Time{}
 	job.mu.Unlock()
 	m.onChange()
 	m.start(job)
@@ -628,31 +705,49 @@ func (m *Manager) Pause(id string) error {
 	return nil
 }
 
-// Cancel stops a job, optionally deleting its partial files, and forgets it.
+// Cancel stops an in-flight job, marking it Cancelled in the history, or
+// removes a job that already finished (the row's Remove/Dismiss action).
+// A cancelled download is terminal, so its partial `.lanpart`/`.lanstate` files
+// are always deleted: nothing normal-looking and no orphaned partial is left
+// behind. A Failed pull keeps its partial so Resume can continue it.
 func (m *Manager) Cancel(id string, deletePartials bool) error {
 	m.mu.Lock()
 	job, ok := m.jobs[id]
-	if ok {
-		delete(m.jobs, id)
-	}
-	m.mu.Unlock()
 	if !ok {
+		m.mu.Unlock()
 		return errors.New("no such job")
 	}
 	job.mu.Lock()
+	if isTerminal(job.State) {
+		// A finished row: Remove forgets it entirely.
+		job.mu.Unlock()
+		delete(m.jobs, id)
+		m.mu.Unlock()
+		m.persist()
+		m.onChange()
+		return nil
+	}
+	// An in-flight job: stop it and keep it as a Cancelled history entry.
+	job.cancelled = true
+	job.State = StateCancelled
+	job.Note = ""
+	job.Error = ""
+	job.FinishedAt = time.Now()
+	job.UpdatedAt = job.FinishedAt
 	if job.cancel != nil {
 		job.cancel()
 	}
 	dest := job.Dest
+	direction := job.Direction
 	files := append([]*FileJob(nil), job.Files...)
 	job.mu.Unlock()
-	if deletePartials {
-		if job.Direction != "push" {
-			for _, f := range files {
-				final := filepath.Join(dest, filepath.FromSlash(f.localRel()))
-				_ = os.Remove(final + ".lanpart")
-				_ = os.Remove(final + ".lanstate")
-			}
+	m.mu.Unlock()
+	_ = deletePartials // kept for callers; a cancelled download always drops its partial
+	if direction != "push" {
+		for _, f := range files {
+			final := filepath.Join(dest, filepath.FromSlash(f.localRel()))
+			_ = os.Remove(final + ".lanpart")
+			_ = os.Remove(final + ".lanstate")
 		}
 	}
 	m.persist()
@@ -660,33 +755,33 @@ func (m *Manager) Cancel(id string, deletePartials bool) error {
 	return nil
 }
 
-// CancelAll cancels every unfinished job (both directions) and forgets it.
-// Partial files are kept. Used by Cancel all shares (§11.3).
+// CancelAll cancels every unfinished job (both directions), keeping each as a
+// Cancelled history entry. Partial files are kept. Used by Cancel all shares
+// (§11.3).
 func (m *Manager) CancelAll() int {
 	m.mu.Lock()
-	var victims []*Job
-	for id, j := range m.jobs {
+	n := 0
+	for _, j := range m.jobs {
 		j.mu.Lock()
-		done := j.State == StateDone
-		j.mu.Unlock()
-		if !done {
-			victims = append(victims, j)
-			delete(m.jobs, id)
+		if !isTerminal(j.State) {
+			j.cancelled = true
+			j.State = StateCancelled
+			j.Note = ""
+			j.FinishedAt = time.Now()
+			j.UpdatedAt = j.FinishedAt
+			if j.cancel != nil {
+				j.cancel()
+			}
+			n++
 		}
+		j.mu.Unlock()
 	}
 	m.mu.Unlock()
-	for _, j := range victims {
-		j.mu.Lock()
-		if j.cancel != nil {
-			j.cancel()
-		}
-		j.mu.Unlock()
-	}
-	if len(victims) > 0 {
+	if n > 0 {
 		m.persist()
 		m.onChange()
 	}
-	return len(victims)
+	return n
 }
 
 // SetBandwidthLimit sets the throughput cap in MB/s (0 = unlimited).
@@ -710,34 +805,23 @@ func (m *Manager) notifyProgress() {
 	m.onChange()
 }
 
-// ClearFinished forgets completed jobs (the history list).
+// ClearFinished forgets every finished row (Done, Failed and Cancelled) — the
+// whole history list — and leaves in-flight jobs alone.
 func (m *Manager) ClearFinished() int {
-	m.mu.Lock()
-	n := 0
-	for id, j := range m.jobs {
-		j.mu.Lock()
-		done := j.State == StateDone
-		j.mu.Unlock()
-		if done {
-			delete(m.jobs, id)
-			n++
-		}
-	}
-	m.mu.Unlock()
-	if n > 0 {
-		m.persist()
-		m.onChange()
-	}
-	return n
+	return m.clearTerminal()
 }
 
-// ClearHistory forgets every finished and failed job (the whole history list).
+// ClearHistory is the same history wipe, kept for the older endpoint name.
 func (m *Manager) ClearHistory() int {
+	return m.clearTerminal()
+}
+
+func (m *Manager) clearTerminal() int {
 	m.mu.Lock()
 	n := 0
 	for id, j := range m.jobs {
 		j.mu.Lock()
-		terminal := j.State == StateDone || j.State == StateFailed
+		terminal := isTerminal(j.State)
 		j.mu.Unlock()
 		if terminal {
 			delete(m.jobs, id)
@@ -904,19 +988,29 @@ func (m *Manager) view(j *Job) *View {
 		ShareID: j.ShareID, ShareLabel: j.ShareLabel, Root: j.Root, Dest: j.Dest,
 		State: j.State, Error: j.Error, Note: j.Note, Attempt: j.attempt,
 		Total: j.Total, Done: j.Done,
-		SpeedMBps: j.speed / 1e6, StartedAt: j.StartedAt, UpdatedAt: j.UpdatedAt, FinishedAt: j.FinishedAt,
+		SpeedMBps: j.displaySpeed / 1e6, StartedAt: j.StartedAt, UpdatedAt: j.UpdatedAt, FinishedAt: j.FinishedAt,
 	}
 	if !j.retryAt.IsZero() && time.Now().Before(j.retryAt) {
 		v.RetryIn = int(time.Until(j.retryAt).Seconds()) + 1
 	}
 	if j.State == StateTransferring {
-		v.SpeedMBps = j.speed / 1e6
+		v.SpeedMBps = j.displaySpeed / 1e6
 	} else {
 		v.SpeedMBps = 0
 	}
+	// A finished row reports the average throughput over its whole life, from
+	// the persisted times and byte count, so the history still shows how fast
+	// the transfer actually went after a restart.
+	if isTerminal(j.State) && j.Done > 0 && j.FinishedAt.After(j.StartedAt) {
+		if secs := j.FinishedAt.Sub(j.StartedAt).Seconds(); secs > 0 {
+			v.AvgSpeedMBps = float64(j.Done) / secs / 1e6
+		}
+	}
+	// ETA comes from the same displayed smoothed speed, never from an
+	// instantaneous sample, so a burst after a pause cannot make it jump.
 	remaining := j.Total - j.Done
-	if j.speed > 1 && remaining > 0 && j.State == StateTransferring {
-		v.ETASeconds = int(float64(remaining) / j.speed)
+	if j.displaySpeed > 1 && remaining > 0 && j.State == StateTransferring {
+		v.ETASeconds = int(float64(remaining) / j.displaySpeed)
 	}
 	firstOpen, firstPartial := -1, -1
 	downloading, verifying := 0, 0
@@ -973,6 +1067,13 @@ func (m *Manager) view(j *Job) *View {
 	if j.State == StateTransferring && verifying > 0 && downloading == 0 {
 		v.State = StateVerifying
 	}
+	// Every byte has left this device but the job is still Transferring: the
+	// receiver is hashing and renaming (or the whole-push PushComplete is in
+	// flight). Surface that as Finishing so the row does not sit at 100% with
+	// a stale speed. Push only: a download's finalize is already StateVerifying.
+	if j.Direction == "push" && j.State == StateTransferring && j.Total > 0 && j.Done >= j.Total {
+		v.Finishing = true
+	}
 	return v
 }
 
@@ -997,6 +1098,8 @@ func (m *Manager) run(job *Job) {
 	job.lastBytes = job.Done
 	job.lastProgress = time.Now()
 	job.speed = 0
+	job.displaySpeed = 0
+	job.displayAt = time.Time{}
 	ctx := job.ctx
 	job.mu.Unlock()
 	m.onChange()
@@ -1128,7 +1231,13 @@ func (m *Manager) run(job *Job) {
 	job.retryAt = time.Time{}
 	switch {
 	case canceled:
-		if job.State != StatePaused {
+		if job.cancelled {
+			// Stopped on purpose: a terminal history entry, not a resumable job.
+			job.State = StateCancelled
+			if job.FinishedAt.IsZero() {
+				job.FinishedAt = time.Now()
+			}
+		} else if job.State != StatePaused {
 			job.State = StatePaused
 		}
 		job.Note = ""
@@ -1743,7 +1852,9 @@ func contentRangeStart(h string) (int64, bool) {
 	return v, err == nil
 }
 
-// bumpSpeed updates the exponentially smoothed speed. Caller holds job.mu.
+// bumpSpeed updates the exponentially smoothed speed. Caller holds job.mu. The
+// EMA samples every 250 ms; the value shown to the UI is republished at most
+// once per inbox.RateDisplayEvery so the speed/ETA text cannot flicker.
 func (m *Manager) bumpSpeed(job *Job) {
 	now := time.Now()
 	dt := now.Sub(job.lastAt).Seconds()
@@ -1763,6 +1874,10 @@ func (m *Manager) bumpSpeed(job *Job) {
 	job.lastBytes = job.Done
 	job.lastAt = now
 	job.UpdatedAt = now
+	if job.displayAt.IsZero() || now.Sub(job.displayAt) >= inbox.RateDisplayEvery {
+		job.displayAt = now
+		job.displaySpeed = job.speed
+	}
 }
 
 func (m *Manager) writeSidecar(path string, job *Job, f *FileJob, committed int64) {
@@ -1770,7 +1885,12 @@ func (m *Manager) writeSidecar(path string, job *Job, f *FileJob, committed int6
 		ShareID: job.ShareID, PeerID: job.PeerID, RemotePath: f.Rel,
 		Size: f.Size, ETag: f.ETag, BytesCommitted: committed,
 	}
-	_ = writeSidecar(path, sc)
+	if err := writeSidecar(path, sc); err != nil {
+		// The resume state could not be saved; surface it instead of dropping it.
+		if m.log != nil {
+			m.log.Warn("transfers: could not persist resume state", "file", f.Rel, "err", err)
+		}
+	}
 }
 
 func writeSidecar(path string, sc sidecar) error {

@@ -2,15 +2,24 @@ package inbox
 
 import "time"
 
-// rateWindow is the trailing span over which the receive rate is smoothed.
-// Three seconds is long enough that a brief pause cannot turn into a spike when
-// progress resumes, yet short enough that the shown rate still feels live.
-const rateWindow = 3 * time.Second
+// RateWindow is the trailing span over which the receive rate is smoothed. Five
+// seconds is long enough that a brief pause cannot turn into a spike when
+// progress resumes, yet short enough that the shown rate still feels live. It is
+// the one shared definition of the window in Go: the sending path (transfer)
+// reports its speed over the same span, and web/app.js mirrors the value.
+const RateWindow = 5 * time.Second
 
-// rateSampleEvery bounds how often a cumulative-bytes observation is taken, so
-// the sampler stays cheap under a fast LAN stream while still giving the
-// three-second window enough points.
-const rateSampleEvery = 200 * time.Millisecond
+// RateSampleEvery bounds how often a cumulative-bytes observation is taken, so
+// the sampler stays cheap under a fast LAN stream while still giving the window
+// enough points.
+const RateSampleEvery = 200 * time.Millisecond
+
+// RateDisplayEvery is the minimum gap between two updates of the displayed
+// speed/ETA text. The underlying sampling keeps running at RateSampleEvery (and
+// byte progress keeps advancing with every read); only the text the UI renders
+// is gated to this slower cadence so it cannot flicker four times a second.
+// web/app.js mirrors the value.
+const RateDisplayEvery = time.Second
 
 // rateSample is one observation of the cumulative bytes received for a push at
 // a point in time.
@@ -52,4 +61,37 @@ func rollingRate(samples []rateSample, now time.Time, window time.Duration) floa
 		return 0
 	}
 	return float64(gained) / window.Seconds()
+}
+
+// rateAndETA is the smoothed transfer rate and the ETA derived from it.
+type rateAndETA struct {
+	bytesPerSecond float64
+	etaSeconds     int
+}
+
+// computeRateETA is a pure function: from cumulative byte samples in time order,
+// the evaluation time, the trailing window and the bytes still to transfer, it
+// returns the smoothed rate and the ETA computed from that same rate alone. The
+// ETA is remaining / smoothed-bytes-per-second, never remaining / instantaneous
+// bytes, so a burst after a pause cannot make it jump. It is 0 when there is no
+// rate or nothing left to transfer.
+func computeRateETA(samples []rateSample, now time.Time, window time.Duration, remaining int64) rateAndETA {
+	bps := rollingRate(samples, now, window)
+	eta := 0
+	if bps > 0 && remaining > 0 {
+		eta = int(float64(remaining) / bps)
+	}
+	return rateAndETA{bytesPerSecond: bps, etaSeconds: eta}
+}
+
+// displayDue reports whether the displayed speed/ETA text may refresh at now,
+// given the last time it was refreshed and the minimum gap between updates. A
+// zero last time (the first update) is always due. It is a pure function so the
+// "at most one change per RateDisplayEvery" property is testable without a
+// clock.
+func displayDue(last, now time.Time, every time.Duration) bool {
+	if every <= 0 {
+		return true
+	}
+	return last.IsZero() || now.Sub(last) >= every
 }

@@ -119,5 +119,10 @@ func (s *Server) saveMountPrefs() {
 	for _, m := range s.d.Mounts.List() {
 		prefs = append(prefs, config.MountPref{DeviceID: m.DeviceID, Name: m.Name, Drive: m.Drive})
 	}
-	_ = s.d.Cfg.Update(func(st *config.Settings) { st.Mounts = prefs })
+	if err := s.d.Cfg.Update(func(st *config.Settings) { st.Mounts = prefs }); err != nil {
+		// A failed mount-preference save must not be silent.
+		if s.d.Log != nil {
+			s.d.Log.Warn("settings: could not persist mount preferences", "err", err)
+		}
+	}
 }

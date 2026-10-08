@@ -127,11 +127,30 @@ func (s *Server) revokeRemote(fp string, lastKnown trust.Entry) {
 // record. remember is false for a revoke the peer itself initiated, which needs
 // no retry.
 func (s *Server) notifyUnpair(fp string, lastKnown trust.Entry, remember bool) {
+	// Capture the delivery generation and whether a revoke was already queued
+	// before any work. A successful sibling bumps the generation and clears the
+	// record, so a failure here must not re-arm it.
+	var seen uint64
+	hadPending := false
+	if s.d.Trust != nil {
+		seen = s.d.Trust.UnpairGeneration(fp)
+		hadPending = s.d.Trust.HasPendingUnpair(fp)
+	}
+	// A pending revoke is refused when the device has been paired again with a
+	// pairing newer than the revoke: delivering it would unpair the fresh
+	// pairing. Drop the stale record instead of retrying it forever.
+	if remember && s.d.Trust != nil && s.d.Trust.PendingUnpairSuperseded(fp) {
+		s.d.Trust.ClearPendingUnpair(fp)
+		if s.d.Log != nil {
+			s.d.Log.Info("unpair: stale revoke dropped; the device was paired again", "fp", fp)
+		}
+		return
+	}
 	if s.d.Client == nil {
 		if s.d.Log != nil {
 			s.d.Log.Info("unpair: peer client unavailable; cannot notify the peer", "fp", fp)
 		}
-		s.rememberPendingUnpair(fp, lastKnown, remember)
+		s.rememberPendingUnpair(fp, lastKnown, remember, seen, hadPending)
 		return
 	}
 	var host string
@@ -157,20 +176,34 @@ func (s *Server) notifyUnpair(fp string, lastKnown trust.Entry, remember bool) {
 		if s.d.Log != nil {
 			s.d.Log.Info("unpair: peer has no known address; skipping notification", "fp", fp)
 		}
-		s.rememberPendingUnpair(fp, lastKnown, remember)
+		s.rememberPendingUnpair(fp, lastKnown, remember, seen, hadPending)
 		return
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := s.d.Client.RevokePairing(ctx, host, port, fp); err != nil {
+		// A pinned 403 "not paired" means the peer has already dropped us: the
+		// unpair has achieved its goal, so this is a success, not a failure.
+		// Clear the record, stop retrying and do not warn.
+		if peerapi.IsNotPaired(err) {
+			if s.d.Trust != nil {
+				s.d.Trust.MarkUnpairDelivered(fp)
+				s.d.Trust.ClearPendingUnpair(fp)
+			}
+			if s.d.Log != nil {
+				s.d.Log.Info("unpair: peer already dropped us; nothing more to do", "fp", fp, "addr", addr)
+			}
+			return
+		}
 		if s.d.Log != nil {
 			s.d.Log.Warn("unpair: could not notify the peer", "fp", fp, "addr", addr, "via", source, "err", err)
 		}
-		s.rememberPendingUnpair(fp, lastKnown, remember)
+		s.rememberPendingUnpair(fp, lastKnown, remember, seen, hadPending)
 		return
 	}
 	if s.d.Trust != nil {
+		s.d.Trust.MarkUnpairDelivered(fp)
 		s.d.Trust.ClearPendingUnpair(fp)
 	}
 	if s.d.Log != nil {
@@ -179,16 +212,28 @@ func (s *Server) notifyUnpair(fp string, lastKnown trust.Entry, remember bool) {
 }
 
 // rememberPendingUnpair keeps an unpair notification for a later retry, unless
-// remember is false or there is nothing to key it on.
-func (s *Server) rememberPendingUnpair(fp string, lastKnown trust.Entry, remember bool) {
+// remember is false, there is nothing to key it on, or a sibling delivery has
+// already resolved it (it cleared the record and/or bumped the generation),
+// in which case re-arming would resurrect a revoke that already succeeded.
+func (s *Server) rememberPendingUnpair(fp string, lastKnown trust.Entry, remember bool, seen uint64, hadPending bool) {
 	if !remember || s.d.Trust == nil || fp == "" {
 		return
 	}
-	alreadyPending := s.d.Trust.HasPendingUnpair(fp)
+	if hadPending && !s.d.Trust.HasPendingUnpair(fp) {
+		if s.d.Log != nil {
+			s.d.Log.Info("unpair: duplicate retry ignored; a sibling already notified the peer", "fp", fp)
+		}
+		return
+	}
 	e := lastKnown
 	e.Fingerprint = fp
-	s.d.Trust.AddPendingUnpair(e)
-	if !alreadyPending && s.d.Log != nil {
+	if !s.d.Trust.AddPendingUnpairIfGeneration(fp, seen, e) {
+		if s.d.Log != nil {
+			s.d.Log.Info("unpair: duplicate retry ignored; the peer was already notified", "fp", fp)
+		}
+		return
+	}
+	if !hadPending && s.d.Log != nil {
 		s.d.Log.Info("unpair: will retry notifying the peer when it is next seen", "fp", fp)
 	}
 }

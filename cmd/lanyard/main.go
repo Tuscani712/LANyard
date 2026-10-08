@@ -132,7 +132,9 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	}
 
 	if name != "" {
-		_ = cfg.Update(func(s *config.Settings) { s.DeviceName = name })
+		if err := cfg.Update(func(s *config.Settings) { s.DeviceName = name }); err != nil {
+			log.Warn("could not save the device name", "err", err)
+		}
 	}
 	st := cfg.Get()
 	// Desktop notifications are on unless the person turned them off. The
@@ -396,6 +398,16 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		}
 		trMgr.RecordReceiveFailed(peerFP, peer, reason)
 	})
+	// A push the receiving person stops is kept as a Cancelled history entry,
+	// like a finished or failed receive (files already landed are listed).
+	inboxMgr.SetOnCancel(func(peerFP string, files []inbox.ReceivedFile, started time.Time) {
+		peer := resolvePeer(peerFP)
+		received := make([]transfer.ReceivedFile, 0, len(files))
+		for _, f := range files {
+			received = append(received, transfer.ReceivedFile{Name: f.Name, Size: f.Size})
+		}
+		trMgr.RecordReceiveCancelled(peerFP, peer, received, started)
+	})
 
 	// A device asking to Connect or Pair is shown even when the window is not
 	// focused; the request itself is still answered in the UI.
@@ -558,6 +570,14 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	// A peer that unpairs us over the peer API gets the same cleanup as an
 	// unpair from our own UI: drop its mount and, best effort, notify it back.
 	peerSrv.SetOnRevoke(ui.HandleRemoteRevoke)
+	// A device unpaired while offline may reach us first via /hello or an
+	// inbound handshake rather than being seen by discovery; retry the pending
+	// unpair the moment it proves reachable.
+	peerSrv.SetOnPeerSeen(func(fp string) {
+		if trustStore.HasPendingUnpair(fp) {
+			ui.RetryPendingUnpair(fp)
+		}
+	})
 	// A device unpaired while it was offline may already be visible; retry now,
 	// when discovery next reports it, and on a slow tick so a quick return that
 	// does not raise a discovery event is still caught.

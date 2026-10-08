@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
@@ -76,6 +77,93 @@ func TestReceivePushLogsStages(t *testing.T) {
 	}
 	if rep := rec.Report(); !strings.Contains(rep, "receive/offer") || !strings.Contains(rep, "receive/file") {
 		t.Errorf("report missing receive stages:\n%s", rep)
+	}
+}
+
+// A replayed complete, per-file or final, is an idempotent success: the handler
+// returns 200 both times, the file is placed once, and the complete stage is
+// recorded only for the real first-time call.
+func TestDuplicateCompleteIsIdempotent(t *testing.T) {
+	ib := inbox.New(t.TempDir(), nil)
+	t.Cleanup(func() { ib.Close() })
+	rec := xferlog.New(50)
+	s := &Server{
+		inbox: ib,
+		auth:  AllowAll(),
+		log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		xlog:  rec,
+	}
+
+	body := []byte("hello")
+	offerBody, _ := json.Marshal(map[string]any{
+		"files": []map[string]any{{"rel_path": "a.txt", "size": len(body)}},
+	})
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/push/offer", strings.NewReader(string(offerBody)))
+	s.handlePushOffer(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("offer status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	var offer pushOfferResp
+	if err := json.Unmarshal(rr.Body.Bytes(), &offer); err != nil {
+		t.Fatalf("offer decode: %v", err)
+	}
+
+	// Stream the bytes, then complete the file twice with the same digest.
+	rr = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPut, "/api/v1/push/"+offer.PushID+"/file?path=a.txt", strings.NewReader(string(body)))
+	req.SetPathValue("id", offer.PushID)
+	req.Header.Set("Content-Range", "bytes 0-4/5")
+	s.handlePushFile(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("file status = %d body = %s", rr.Code, rr.Body.String())
+	}
+	sum := sha256.Sum256(body)
+	completeBody := `{"rel_path":"a.txt","sha256":"` + hex.EncodeToString(sum[:]) + `"}`
+	for i := 0; i < 2; i++ {
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, "/api/v1/push/"+offer.PushID+"/complete", strings.NewReader(completeBody))
+		req.SetPathValue("id", offer.PushID)
+		s.handlePushComplete(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("per-file complete #%d status = %d body = %s", i+1, rr.Code, rr.Body.String())
+		}
+	}
+
+	// The final complete, twice: the second must also be a success.
+	for i := 0; i < 2; i++ {
+		rr = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodPost, "/api/v1/push/"+offer.PushID+"/complete", strings.NewReader(`{"all":true}`))
+		req.SetPathValue("id", offer.PushID)
+		s.handlePushComplete(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("final complete #%d status = %d body = %s", i+1, rr.Code, rr.Body.String())
+		}
+	}
+
+	entries, err := os.ReadDir(ib.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "a.txt" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("a duplicate complete placed the file more than once: %v", names)
+	}
+
+	completes := 0
+	for _, e := range rec.Entries() {
+		if e.Step == xferlog.StepComplete && e.Direction == xferlog.DirectionReceive {
+			completes++
+		}
+		if e.Level == xferlog.LevelError {
+			t.Errorf("duplicate complete logged an error: %+v", e)
+		}
+	}
+	if completes != 2 {
+		t.Errorf("complete recorded %d times, want 2 (one per-file, one final)", completes)
 	}
 }
 

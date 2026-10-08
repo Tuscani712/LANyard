@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"lanyard/internal/config"
+	"lanyard/internal/xferlog"
 )
 
 func newStore(t *testing.T) *Store {
@@ -65,6 +66,57 @@ func TestPairFlow(t *testing.T) {
 	}
 	if a := st.Access("peer-fp"); a.Paired {
 		t.Errorf("access after unpair = %+v", a)
+	}
+}
+
+// A replayed confirmation, from either side, is a no-op success: the session
+// is already active, the pairing entry was recorded once, and the confirm is
+// logged once, so a duplicate request cannot double-pair or double-record.
+func TestReplayedConfirmIsNoOp(t *testing.T) {
+	st := newStore(t)
+	rec := xferlog.New(200)
+	st.SetXferLog(rec)
+
+	// Responder side.
+	in, err := st.CreateIncoming(ModePair, "peer-fp", "Bob", "bob-dev", "nonceA", Permissions{Browse: true, Push: true})
+	if err != nil {
+		t.Fatalf("CreateIncoming: %v", err)
+	}
+	if _, err := st.Accept(in.ID, Permissions{Browse: true, Push: true}); err != nil {
+		t.Fatalf("Accept: %v", err)
+	}
+	if _, err := st.ActivateRemote(in.ID); err != nil {
+		t.Fatalf("ActivateRemote: %v", err)
+	}
+	if _, err := st.ActivateRemote(in.ID); err != nil {
+		t.Fatalf("replayed ActivateRemote must be a no-op success: %v", err)
+	}
+	if e, ok := st.Entry("peer-fp"); !ok || !e.Permissions.Push {
+		t.Fatalf("entry = %+v ok=%v, want push still granted", e, ok)
+	}
+
+	// Initiator side.
+	out := st.CreateOutgoing(ModePair, "peer-fp2", "Carol", "carol-dev", Permissions{Browse: true})
+	st.SetRemote(out.ID, "remote-1", "nonceB")
+	st.SetStatus(out.ID, StatusAccepted, "")
+	if _, err := st.Confirm(out.ID); err != nil {
+		t.Fatalf("Confirm: %v", err)
+	}
+	if _, err := st.Confirm(out.ID); err != nil {
+		t.Fatalf("replayed Confirm must be a no-op success: %v", err)
+	}
+	if e, ok := st.Entry("peer-fp2"); !ok || !e.Permissions.Browse {
+		t.Fatalf("entry = %+v ok=%v, want browse still granted", e, ok)
+	}
+
+	confirms := 0
+	for _, e := range rec.Entries() {
+		if e.Area == xferlog.AreaPairing && e.Outcome == "confirm" {
+			confirms++
+		}
+	}
+	if confirms != 2 {
+		t.Errorf("confirm logged %d times, want 2 (one per real pairing, none for the replays)", confirms)
 	}
 }
 

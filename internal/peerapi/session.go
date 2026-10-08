@@ -73,6 +73,9 @@ func (s *Server) handleSessionRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fp := PeerID(r.Context())
+	// An inbound handshake proves the peer is online; retry any pending unpair
+	// for it even before the handshake is validated or accepted.
+	s.notePeerSeen(fp)
 	if !s.rl.allow("session:"+fp, 10, time.Minute) {
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return

@@ -1,6 +1,7 @@
 package peerapi
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
@@ -31,22 +32,41 @@ var genericForbidden = map[string]bool{
 	"forbidden":          true,
 }
 
+// reason extracts the human reason from a peer error body. The phone (and any
+// other JSON peer) answers with {"error":"..."}; an older or plain-text peer
+// sends the bare phrase. A JSON body whose error field is missing or the wrong
+// type yields "" and is therefore never mistaken for a reason. Anything that is
+// not a JSON object is returned trimmed, unchanged.
+func reason(msg string) string {
+	trimmed := strings.TrimSpace(msg)
+	if strings.HasPrefix(trimmed, "{") {
+		var env struct {
+			Error string `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(trimmed), &env); err == nil {
+			return strings.TrimSpace(env.Error)
+		}
+	}
+	return trimmed
+}
+
 // IsNotPaired reports whether err is a 403 that the peer sent over a
-// certificate-pinned connection and whose body is exactly "not paired". Only
-// that exact phrase means the peer has dropped us: permission denials
-// ("pull not permitted", "push not permitted", "not permitted", "forbidden"),
-// an empty body, and any other message must never remove a good local pairing.
-// The comparison is case- and surrounding-whitespace-insensitive; a phrase that
-// merely contains "paired" (for example "not paired yet" or "unpaired") does
-// not match. The StatusError must also carry Pinned (the peer's certificate was
-// verified against the expected fingerprint), so a bare TLS answer cannot
-// trigger data loss.
+// certificate-pinned connection and whose body means "not paired". Both wire
+// forms are accepted: the plain phrase ("not paired") and the JSON error body a
+// phone sends ({"error":"not paired"}). Only that exact reason means the peer
+// has dropped us: permission denials ("pull not permitted", "push not
+// permitted", "not permitted", "forbidden"), an empty body, and any other
+// message must never remove a good local pairing. The comparison is case- and
+// surrounding-whitespace-insensitive; a phrase that merely contains "paired"
+// (for example "not paired yet" or "unpaired") does not match. The StatusError
+// must also carry Pinned (the peer's certificate was verified against the
+// expected fingerprint), so a bare TLS answer cannot trigger data loss.
 func IsNotPaired(err error) bool {
 	var se *StatusError
 	if !errors.As(err, &se) || se.Code != http.StatusForbidden || !se.Pinned {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(se.Msg), notPairedMsg)
+	return strings.EqualFold(reason(se.Msg), notPairedMsg)
 }
 
 // UserMessage maps a peer client error to the line a person should see. It
@@ -60,8 +80,9 @@ func UserMessage(err error) string {
 	var se *StatusError
 	if errors.As(err, &se) {
 		if se.Code == http.StatusForbidden {
-			if se.Msg != "" && !genericForbidden[se.Msg] {
-				return se.Msg
+			msg := reason(se.Msg)
+			if msg != "" && !genericForbidden[msg] {
+				return msg
 			}
 			return NotPairedMessage
 		}

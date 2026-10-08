@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -139,6 +140,15 @@ type View struct {
 	UpdatedAt     time.Time   `json:"updated_at"`
 }
 
+// pendingUnpair is one queued revoke notification: the paired snapshot captured
+// when the device was unpaired, plus the moment it was queued. The timestamp
+// lets a delivery that predates a newer pairing be refused, so a stale revoke
+// cannot unpair a device the person has since re-paired.
+type pendingUnpair struct {
+	Entry
+	QueuedAt time.Time
+}
+
 // Store holds paired entries and live sessions.
 type Store struct {
 	cfg      *config.Store
@@ -155,7 +165,12 @@ type Store struct {
 	// pendingUnpair holds devices we unpaired locally but could not yet tell to
 	// drop us (the peer was offline). The entry keeps the last-known address so
 	// the notification can be retried once discovery sees the peer again.
-	pendingUnpair map[string]Entry
+	pendingUnpair map[string]pendingUnpair
+	// unpairDelivered counts successful unpair notifications per fingerprint.
+	// A racing retry captures the count before it attempts delivery and refuses
+	// to re-arm a pending record once a sibling has bumped it; that stops a
+	// duplicate attempt from resurrecting a revoke that already succeeded.
+	unpairDelivered map[string]uint64
 	// invites maps one-time QR pairing nonces to their expiry.
 	invites   map[string]time.Time
 	inviteTTL time.Duration
@@ -190,8 +205,9 @@ func New(cfg *config.Store, selfFP string, onChange func()) *Store {
 	}
 	return &Store{cfg: cfg, selfFP: selfFP, onChange: onChange,
 		paired: map[string]*Entry{}, sessions: map[string]*Session{},
-		pendingUnpair: map[string]Entry{},
-		invites:       map[string]time.Time{}, inviteTTL: PairInviteTTL}
+		pendingUnpair:   map[string]pendingUnpair{},
+		unpairDelivered: map[string]uint64{},
+		invites:         map[string]time.Time{}, inviteTTL: PairInviteTTL}
 }
 
 // SetPairInviteTTL changes how long a pairing invite lives (tests).
@@ -319,7 +335,10 @@ func (s *Store) persist() {
 	if err != nil {
 		return
 	}
-	_ = s.cfg.Update(func(st *config.Settings) { st.Trust = raw })
+	if err := s.cfg.Update(func(st *config.Settings) { st.Trust = raw }); err != nil {
+		// The trust store could not be saved; never discard the failure.
+		slog.Warn("trust: could not persist paired devices", "err", err)
+	}
 }
 
 // Paired lists paired devices, oldest first.
@@ -381,7 +400,10 @@ func sameAddrs(a, b []string) bool {
 	return true
 }
 
-// Pair upserts a paired entry.
+// Pair upserts a paired entry. A successful pairing with a fingerprint also
+// clears any pending-unpair revoke for it: the device has just been paired
+// again, so a queued "drop us" from the previous unpair is stale and must never
+// be delivered (it would unpair the fresh pairing).
 func (s *Store) Pair(e Entry) {
 	if e.Mode == "" {
 		e.Mode = ModePair
@@ -392,7 +414,15 @@ func (s *Store) Pair(e Entry) {
 	s.mu.Lock()
 	c := e
 	s.paired[e.Fingerprint] = &c
+	cleared := false
+	if e.Fingerprint != "" {
+		_, cleared = s.pendingUnpair[e.Fingerprint]
+		delete(s.pendingUnpair, e.Fingerprint)
+	}
 	s.mu.Unlock()
+	if cleared {
+		s.pairLog(xferlog.LevelInfo, "pair", e.Fingerprint, "", "pairing supersedes a pending unpair", 0, nil)
+	}
 	s.persist()
 	s.onChange()
 }
@@ -428,13 +458,19 @@ func (s *Store) Unpair(fp string) bool {
 // AddPendingUnpair records a device we unpaired locally but could not yet tell
 // to drop us, so the notification is retried when the device is next seen. The
 // entry's address is the last-known one and may be empty; discovery can still
-// supply a live address on the retry.
+// supply a live address on the retry. Each record is stamped with the moment it
+// was queued (preserved if one is already queued), so a later pairing can be
+// recognised as newer than the revoke.
 func (s *Store) AddPendingUnpair(e Entry) {
 	if e.Fingerprint == "" {
 		return
 	}
 	s.mu.Lock()
-	s.pendingUnpair[e.Fingerprint] = e
+	queuedAt := time.Now()
+	if prev, ok := s.pendingUnpair[e.Fingerprint]; ok {
+		queuedAt = prev.QueuedAt
+	}
+	s.pendingUnpair[e.Fingerprint] = pendingUnpair{Entry: e, QueuedAt: queuedAt}
 	s.mu.Unlock()
 }
 
@@ -448,12 +484,77 @@ func (s *Store) ClearPendingUnpair(fp string) bool {
 	return ok
 }
 
+// MarkUnpairDelivered records that an unpair notification for fp has been
+// delivered (or found already-unpaired) and returns the new generation. It must
+// be called on every successful notification, with or without a pending record:
+// it is what lets a racing duplicate retry detect that its sibling already
+// finished and refuse to re-arm the pending record.
+func (s *Store) MarkUnpairDelivered(fp string) uint64 {
+	if fp == "" {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unpairDelivered[fp]++
+	return s.unpairDelivered[fp]
+}
+
+// UnpairGeneration reports how many unpair notifications for fp have been
+// delivered (or found already-unpaired) so far. A retry captures this before it
+// attempts delivery and passes it back to AddPendingUnpairIfGeneration, so a
+// sibling's success forbids it re-arming the pending record.
+func (s *Store) UnpairGeneration(fp string) uint64 {
+	if fp == "" {
+		return 0
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.unpairDelivered[fp]
+}
+
+// AddPendingUnpairIfGeneration records a pending unpair only when no sibling has
+// completed a delivery since the caller captured seen. It reports whether the
+// record was stored. This is what stops a duplicate/racing retry from
+// resurrecting a revoke that already succeeded.
+func (s *Store) AddPendingUnpairIfGeneration(fp string, seen uint64, e Entry) bool {
+	if fp == "" {
+		return false
+	}
+	e.Fingerprint = fp
+	s.mu.Lock()
+	if s.unpairDelivered[fp] != seen {
+		s.mu.Unlock()
+		return false
+	}
+	queuedAt := time.Now()
+	if prev, ok := s.pendingUnpair[fp]; ok {
+		queuedAt = prev.QueuedAt
+	}
+	s.pendingUnpair[fp] = pendingUnpair{Entry: e, QueuedAt: queuedAt}
+	s.mu.Unlock()
+	return true
+}
+
 // PendingUnpair returns the pending-unpair record for a fingerprint.
 func (s *Store) PendingUnpair(fp string) (Entry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	e, ok := s.pendingUnpair[fp]
-	return e, ok
+	return e.Entry, ok
+}
+
+// PendingUnpairSuperseded reports whether fp is paired again with a pairing
+// newer than its queued revoke. Delivering that revoke would unpair the device
+// the person just re-paired, so it must be refused and discarded.
+func (s *Store) PendingUnpairSuperseded(fp string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p, ok := s.pendingUnpair[fp]
+	if !ok {
+		return false
+	}
+	e, paired := s.paired[fp]
+	return paired && e.CreatedAt.After(p.QueuedAt)
 }
 
 // HasPendingUnpair reports whether fp still needs its unpair delivered.
@@ -470,7 +571,7 @@ func (s *Store) PendingUnpairs() []Entry {
 	defer s.mu.RUnlock()
 	out := make([]Entry, 0, len(s.pendingUnpair))
 	for _, e := range s.pendingUnpair {
-		out = append(out, e)
+		out = append(out, e.Entry)
 	}
 	return out
 }
@@ -714,6 +815,14 @@ func (s *Store) ActivateRemote(id string) (*Session, error) {
 		s.pairLog(xferlog.LevelWarn, "confirm", sess.PeerFP, id, "not accepted yet", 0, err)
 		return nil, err
 	}
+	// A replayed confirm (the initiator retried, or a duplicate request) is a
+	// no-op success: the session is already active and the pairing entry was
+	// recorded once, so do not pair or log a second time.
+	if sess.Status == StatusActive {
+		snap := *sess
+		s.mu.Unlock()
+		return &snap, nil
+	}
 	sess.Status = StatusActive
 	sess.UpdatedAt = time.Now()
 	fp, mode := sess.PeerFP, sess.Mode
@@ -746,6 +855,13 @@ func (s *Store) Confirm(id string) (*Session, error) {
 		err := fmt.Errorf("session is %s", sess.Status)
 		s.pairLog(xferlog.LevelWarn, "confirm", sess.PeerFP, id, "session not accepted", 0, err)
 		return nil, err
+	}
+	// A replayed confirm is a no-op success: the session is already active and
+	// the pairing entry was recorded once, so do not pair or log a second time.
+	if sess.Status == StatusActive {
+		snap := *sess
+		s.mu.Unlock()
+		return &snap, nil
 	}
 	sess.Status = StatusActive
 	sess.UpdatedAt = time.Now()

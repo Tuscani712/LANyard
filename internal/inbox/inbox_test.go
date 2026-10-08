@@ -27,7 +27,7 @@ func TestOfferWriteComplete(t *testing.T) {
 	if err != nil || n != int64(len(data)) {
 		t.Fatalf("WriteChunk n=%d err=%v", n, err)
 	}
-	st, err := m.Complete(p.ID, "peer", "sub/a.txt", sha(data))
+	st, _, err := m.Complete(p.ID, "peer", "sub/a.txt", sha(data))
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
@@ -40,18 +40,130 @@ func TestOfferWriteComplete(t *testing.T) {
 	}
 }
 
+// A repeated complete for a file already verified and placed must be an
+// idempotent success: it returns the same final path and never places the file
+// a second time (no "a (1).txt").
+func TestCompleteIsIdempotent(t *testing.T) {
+	m := New(t.TempDir(), nil)
+	data := []byte("hello push")
+	p, err := m.Offer("peer", "paired", []FileReq{{RelPath: "a.txt", Size: int64(len(data))}}, 0)
+	if err != nil {
+		t.Fatalf("Offer: %v", err)
+	}
+	if _, err := m.WriteChunk(p.ID, "peer", "a.txt", 0, strings.NewReader(string(data))); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+	st1, again1, err := m.Complete(p.ID, "peer", "a.txt", sha(data))
+	if err != nil || again1 {
+		t.Fatalf("first Complete: st=%+v again=%v err=%v", st1, again1, err)
+	}
+	st2, again2, err := m.Complete(p.ID, "peer", "a.txt", sha(data))
+	if err != nil {
+		t.Fatalf("repeated Complete must succeed: %v", err)
+	}
+	if !again2 {
+		t.Error("repeated Complete should report the file as already placed")
+	}
+	if st2.Final != st1.Final {
+		t.Errorf("repeated Complete final = %q, want the original %q", st2.Final, st1.Final)
+	}
+	entries, err := os.ReadDir(m.Dir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "a.txt" {
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("a duplicate complete placed the file twice: %v", names)
+	}
+}
+
+// The whole-file fast path must likewise be replay-safe: a retried request for
+// an already-placed file drains its body and returns the same result.
+func TestReceiveIsIdempotent(t *testing.T) {
+	m := New(t.TempDir(), nil)
+	data := []byte("small file body")
+	p, err := m.Offer("p", "paired", []FileReq{{RelPath: "x.txt", Size: int64(len(data))}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st1, again1, err := m.Receive(p.ID, "p", "x.txt", sha(data), strings.NewReader(string(data)))
+	if err != nil || again1 {
+		t.Fatalf("first Receive: st=%+v again=%v err=%v", st1, again1, err)
+	}
+	st2, again2, err := m.Receive(p.ID, "p", "x.txt", sha(data), strings.NewReader(string(data)))
+	if err != nil {
+		t.Fatalf("repeated Receive must succeed: %v", err)
+	}
+	if !again2 {
+		t.Error("repeated Receive should report the file as already placed")
+	}
+	if st2.Final != st1.Final {
+		t.Errorf("repeated Receive final = %q, want the original %q", st2.Final, st1.Final)
+	}
+	entries, _ := os.ReadDir(m.Dir())
+	if len(entries) != 1 || entries[0].Name() != "x.txt" {
+		t.Fatalf("a duplicate whole-file receive placed the file twice: %v", entries)
+	}
+}
+
+// Two simultaneous completes for the same file must place it exactly once: the
+// per-file lock serializes the finalize and the replay then reports "already".
+func TestConcurrentCompletePlacesOnce(t *testing.T) {
+	m := New(t.TempDir(), nil)
+	data := []byte("concurrent body")
+	p, err := m.Offer("peer", "paired", []FileReq{{RelPath: "a.txt", Size: int64(len(data))}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.WriteChunk(p.ID, "peer", "a.txt", 0, strings.NewReader(string(data))); err != nil {
+		t.Fatal(err)
+	}
+	const n = 8
+	var wg sync.WaitGroup
+	alreadies := make([]bool, n)
+	errs := make([]error, n)
+	for i := 0; i < n; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, alreadies[i], errs[i] = m.Complete(p.ID, "peer", "a.txt", sha(data))
+		}()
+	}
+	wg.Wait()
+	firsts := 0
+	for i := 0; i < n; i++ {
+		if errs[i] != nil {
+			t.Fatalf("concurrent Complete #%d: %v", i, errs[i])
+		}
+		if !alreadies[i] {
+			firsts++
+		}
+	}
+	if firsts != 1 {
+		t.Errorf("exactly one complete should do the work, got %d", firsts)
+	}
+	entries, _ := os.ReadDir(m.Dir())
+	if len(entries) != 1 {
+		t.Fatalf("concurrent completes placed the file %d times", len(entries))
+	}
+}
+
 func TestNeverOverwrite(t *testing.T) {
 	m := New(t.TempDir(), nil)
 	data := []byte("x")
 	first, _ := m.Offer("p", "paired", []FileReq{{RelPath: "a.txt", Size: 1}}, 1<<20)
 	m.WriteChunk(first.ID, "p", "a.txt", 0, strings.NewReader("x"))
-	st1, err := m.Complete(first.ID, "p", "a.txt", sha(data))
+	st1, _, err := m.Complete(first.ID, "p", "a.txt", sha(data))
 	if err != nil {
 		t.Fatal(err)
 	}
 	second, _ := m.Offer("p", "paired", []FileReq{{RelPath: "a.txt", Size: 1}}, 1<<20)
 	m.WriteChunk(second.ID, "p", "a.txt", 0, strings.NewReader("x"))
-	st2, err := m.Complete(second.ID, "p", "a.txt", sha(data))
+	st2, _, err := m.Complete(second.ID, "p", "a.txt", sha(data))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +179,7 @@ func TestChecksumMismatch(t *testing.T) {
 	m := New(t.TempDir(), nil)
 	p, _ := m.Offer("p", "paired", []FileReq{{RelPath: "a.txt", Size: 3}}, 1<<20)
 	m.WriteChunk(p.ID, "p", "a.txt", 0, strings.NewReader("abc"))
-	if _, err := m.Complete(p.ID, "p", "a.txt", strings.Repeat("0", 64)); err == nil {
+	if _, _, err := m.Complete(p.ID, "p", "a.txt", strings.Repeat("0", 64)); err == nil {
 		t.Fatal("bad checksum should be refused")
 	}
 	if _, err := os.Stat(filepath.Join(m.Dir(), "a.txt")); err == nil {
@@ -95,7 +207,7 @@ func TestReceiveWholeFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	st, err := m.Receive(p.ID, "p", "d/x.txt", sha(data), strings.NewReader(string(data)))
+	st, _, err := m.Receive(p.ID, "p", "d/x.txt", sha(data), strings.NewReader(string(data)))
 	if err != nil {
 		t.Fatalf("Receive: %v", err)
 	}
@@ -124,7 +236,7 @@ func TestReceiveRefusesBadInput(t *testing.T) {
 	for name, c := range cases {
 		m := New(t.TempDir(), nil)
 		p, _ := m.Offer("p", "paired", []FileReq{{RelPath: "a.bin", Size: int64(len(data))}}, 0)
-		if _, err := m.Receive(p.ID, "p", "a.bin", c.sha, strings.NewReader(c.body)); err == nil {
+		if _, _, err := m.Receive(p.ID, "p", "a.bin", c.sha, strings.NewReader(c.body)); err == nil {
 			t.Errorf("%s: should be refused", name)
 		}
 		if _, err := os.Stat(filepath.Join(m.Dir(), "a.bin")); err == nil {
@@ -136,10 +248,10 @@ func TestReceiveRefusesBadInput(t *testing.T) {
 	}
 	m := New(t.TempDir(), nil)
 	p, _ := m.Offer("p", "paired", []FileReq{{RelPath: "a.bin", Size: 1}}, 0)
-	if _, err := m.Receive(p.ID, "someone-else", "a.bin", sha([]byte("x")), strings.NewReader("x")); err == nil {
+	if _, _, err := m.Receive(p.ID, "someone-else", "a.bin", sha([]byte("x")), strings.NewReader("x")); err == nil {
 		t.Error("another peer must not write into this push")
 	}
-	if _, err := m.Receive(p.ID, "p", "unlisted.bin", sha([]byte("x")), strings.NewReader("x")); err == nil {
+	if _, _, err := m.Receive(p.ID, "p", "unlisted.bin", sha([]byte("x")), strings.NewReader("x")); err == nil {
 		t.Error("a file that was not offered must be refused")
 	}
 }
@@ -249,7 +361,7 @@ func TestFinishReportsReceivedFiles(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Offer: %v", err)
 	}
-	if _, err := m.Receive(p.ID, "peer", "sub/a.txt", sha(data), strings.NewReader(string(data))); err != nil {
+	if _, _, err := m.Receive(p.ID, "peer", "sub/a.txt", sha(data), strings.NewReader(string(data))); err != nil {
 		t.Fatalf("Receive: %v", err)
 	}
 	if !m.Finish(p.ID, "peer") {
@@ -264,6 +376,121 @@ func TestFinishReportsReceivedFiles(t *testing.T) {
 	f := gotFiles[0]
 	if f.Rel != "sub/a.txt" || f.Name != "a.txt" || f.Size != int64(len(data)) {
 		t.Fatalf("file = %+v", f)
+	}
+}
+
+// A push whose bytes have all arrived but whose files are not finalized yet
+// must report Finishing, and keep doing so until Finish removes it. A body
+// still arriving must not be marked Finishing.
+func TestIncomingMarksFinishingWhenAllBytesArrived(t *testing.T) {
+	m := New(t.TempDir(), nil)
+	a, b := []byte("aaaa"), []byte("bbb")
+	p, err := m.Offer("peer", "paired", []FileReq{
+		{RelPath: "a.txt", Size: int64(len(a))},
+		{RelPath: "b.txt", Size: int64(len(b))},
+	}, 0)
+	if err != nil {
+		t.Fatalf("Offer: %v", err)
+	}
+	view := func() IncomingView {
+		got := m.Incoming()
+		if len(got) != 1 {
+			t.Fatalf("Incoming = %+v, want one push", got)
+		}
+		return got[0]
+	}
+	if view().Finishing {
+		t.Fatal("a push with no bytes yet must not be Finishing")
+	}
+	if _, err := m.WriteChunk(p.ID, "peer", "a.txt", 0, strings.NewReader(string(a))); err != nil {
+		t.Fatalf("WriteChunk a: %v", err)
+	}
+	// b has not arrived, so the push is not finishing yet even though one file
+	// is fully received.
+	if view().Finishing {
+		t.Fatal("Finishing must wait for every file's bytes")
+	}
+	if _, err := m.WriteChunk(p.ID, "peer", "b.txt", 0, strings.NewReader(string(b))); err != nil {
+		t.Fatalf("WriteChunk b: %v", err)
+	}
+	if !view().Finishing {
+		t.Fatal("all bytes arrived; the push must report Finishing")
+	}
+	// Finalizing one file leaves the push finishing until Finish.
+	if _, _, err := m.Complete(p.ID, "peer", "a.txt", sha(a)); err != nil {
+		t.Fatalf("Complete a: %v", err)
+	}
+	if !view().Finishing {
+		t.Fatal("a partially finalized push must stay Finishing")
+	}
+	if _, _, err := m.Complete(p.ID, "peer", "b.txt", sha(b)); err != nil {
+		t.Fatalf("Complete b: %v", err)
+	}
+	if !view().Finishing {
+		t.Fatal("a fully finalized push awaiting Finish must still be Finishing")
+	}
+	if !m.Finish(p.ID, "peer") {
+		t.Fatal("Finish returned false")
+	}
+	if got := m.Incoming(); len(got) != 0 {
+		t.Fatalf("Finishing must clear when the push finishes: %+v", got)
+	}
+}
+
+// The whole-file fast path finalizes inside Receive; the row must still report
+// Finishing until the sender's Finish removes it.
+func TestIncomingFinishingAfterWholeFileReceive(t *testing.T) {
+	m := New(t.TempDir(), nil)
+	data := []byte("one shot")
+	p, err := m.Offer("p", "paired", []FileReq{{RelPath: "x.txt", Size: int64(len(data))}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.Receive(p.ID, "p", "x.txt", sha(data), strings.NewReader(string(data))); err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+	got := m.Incoming()
+	if len(got) != 1 || !got[0].Finishing {
+		t.Fatalf("after whole-file Receive = %+v, want one Finishing push", got)
+	}
+	if !m.Finish(p.ID, "p") {
+		t.Fatal("Finish returned false")
+	}
+	if got := m.Incoming(); len(got) != 0 {
+		t.Fatalf("Finishing must clear on Finish: %+v", got)
+	}
+}
+
+// Cancelling a push fires onCancel with the files that already landed, so the
+// caller can record a Cancelled history entry.
+func TestCancelReportsReceivedFiles(t *testing.T) {
+	m := New(t.TempDir(), nil)
+	var gotPeer string
+	var gotFiles []ReceivedFile
+	var gotStarted time.Time
+	m.SetOnCancel(func(peerFP string, files []ReceivedFile, started time.Time) {
+		gotPeer, gotFiles, gotStarted = peerFP, files, started
+	})
+
+	data := []byte("kept bytes")
+	p, err := m.Offer("peer", "paired", []FileReq{{RelPath: "sub/a.txt", Size: int64(len(data)), MTime: time.Now()}}, 0)
+	if err != nil {
+		t.Fatalf("Offer: %v", err)
+	}
+	if _, _, err := m.Receive(p.ID, "peer", "sub/a.txt", sha(data), strings.NewReader(string(data))); err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+	if !m.Cancel(p.ID) {
+		t.Fatal("Cancel returned false")
+	}
+	if gotPeer != "peer" {
+		t.Fatalf("peer = %q", gotPeer)
+	}
+	if len(gotFiles) != 1 || gotFiles[0].Name != "a.txt" || gotFiles[0].Size != int64(len(data)) {
+		t.Fatalf("files = %+v", gotFiles)
+	}
+	if gotStarted.IsZero() {
+		t.Fatal("start time was not reported")
 	}
 }
 
@@ -508,7 +735,7 @@ func TestDroppedPushKeepsPartialAndResumes(t *testing.T) {
 	if n != int64(len(full)-sent) {
 		t.Fatalf("resumed %d bytes, want %d", n, len(full)-sent)
 	}
-	if _, err := m.Complete(p2.ID, "peer", "big.bin", sha(full)); err != nil {
+	if _, _, err := m.Complete(p2.ID, "peer", "big.bin", sha(full)); err != nil {
 		t.Fatalf("Complete after resume: %v", err)
 	}
 	got, err := os.ReadFile(filepath.Join(dir, "big.bin"))

@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -772,7 +773,10 @@ func (m *Manager) persist() {
 	if err != nil {
 		return
 	}
-	_ = m.cfg.Update(func(st *config.Settings) { st.Shares = raw })
+	if err := m.cfg.Update(func(st *config.Settings) { st.Shares = raw }); err != nil {
+		// The share list could not be saved; never discard the failure.
+		slog.Warn("shares: could not persist shares", "err", err)
+	}
 }
 
 // --- read access ---

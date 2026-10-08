@@ -13,6 +13,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -106,6 +107,16 @@ type FileState struct {
 	live    atomic.Int64 // bytes of this file received so far, updated while streaming
 	Final   string       `json:"-"`
 	Part    string       `json:"-"`
+
+	// completeMu serializes the finalize (hash + rename) of this file, so two
+	// concurrent "complete" requests for the same file cannot both place it.
+	completeMu sync.Mutex
+	// completeDone is set once the file has been verified and renamed into
+	// place. A repeated complete/whole-file request for the same file is then
+	// an idempotent success that returns the same result instead of hashing or
+	// renaming again. It is atomic because Incoming() reads it under m.mu while
+	// the finalize paths set it while only holding the file's completeMu.
+	completeDone atomic.Bool
 }
 
 // Push is one accepted batch of files.
@@ -145,38 +156,51 @@ type Push struct {
 	samplesMu sync.Mutex
 	samples   []rateSample
 	sampleAt  time.Time
-	// speedBits holds the current smoothed receive rate as math.Float64bits of
+	// displayAt is when the displayed speed/ETA text was last refreshed. It
+	// gates the published text to RateDisplayEvery while samples keep arriving.
+	displayAt time.Time
+	// speedBits holds the displayed smoothed receive rate as math.Float64bits of
 	// bytes/second, published atomically for Incoming() to read.
 	speedBits atomic.Uint64
+	// etaBits holds the displayed ETA in whole seconds, published atomically.
+	etaBits atomic.Int64
 }
 
 // observeRate records the cumulative byte total and republishes the smoothed
-// receive rate. It is called as bytes arrive; samples are throttled so a fast
-// stream does not build an unbounded sample slice.
+// receive rate and ETA. It is called as bytes arrive; samples are throttled so a
+// fast stream does not build an unbounded sample slice, and the displayed text
+// is throttled independently to RateDisplayEvery.
 func (p *Push) observeRate(now time.Time) {
 	p.samplesMu.Lock()
-	if !p.sampleAt.IsZero() && now.Sub(p.sampleAt) < rateSampleEvery {
+	if p.sampleAt.IsZero() || now.Sub(p.sampleAt) >= RateSampleEvery {
+		p.sampleAt = now
+		p.samples = append(p.samples, rateSample{at: now, bytes: p.live.Load()})
+		cutoff := now.Add(-RateWindow)
+		drop := 0
+		for drop < len(p.samples) && p.samples[drop].at.Before(cutoff) {
+			drop++
+		}
+		if drop > 0 {
+			p.samples = append(p.samples[:0], p.samples[drop:]...)
+		}
+	}
+	if !displayDue(p.displayAt, now, RateDisplayEvery) {
 		p.samplesMu.Unlock()
 		return
 	}
-	p.sampleAt = now
-	p.samples = append(p.samples, rateSample{at: now, bytes: p.live.Load()})
-	cutoff := now.Add(-rateWindow)
-	drop := 0
-	for drop < len(p.samples) && p.samples[drop].at.Before(cutoff) {
-		drop++
-	}
-	if drop > 0 {
-		p.samples = append(p.samples[:0], p.samples[drop:]...)
-	}
-	rate := rollingRate(p.samples, now, rateWindow)
+	p.displayAt = now
+	r := computeRateETA(p.samples, now, RateWindow, p.Total-p.live.Load())
 	p.samplesMu.Unlock()
-	p.speedBits.Store(math.Float64bits(rate))
+	p.speedBits.Store(math.Float64bits(r.bytesPerSecond))
+	p.etaBits.Store(int64(r.etaSeconds))
 }
 
-// speed returns the current smoothed receive rate in bytes/second, or 0 when
-// there is nothing to report.
+// speed returns the current displayed smoothed receive rate in bytes/second, or
+// 0 when there is nothing to report.
 func (p *Push) speed() float64 { return math.Float64frombits(p.speedBits.Load()) }
+
+// eta returns the current displayed ETA in whole seconds, or 0 when unknown.
+func (p *Push) eta() int { return int(p.etaBits.Load()) }
 
 // ErrCancelled is returned to the sender once the receiving person has
 // cancelled an accepted push.
@@ -236,10 +260,46 @@ type IncomingView struct {
 	Total      int64     `json:"total"`
 	Done       int64     `json:"done"`
 	SpeedMBps  float64   `json:"speed_mbps"`
+	ETASeconds int       `json:"eta_seconds"`
 	FilesTotal int       `json:"files_total"`
 	FilesDone  int       `json:"files_done"`
 	Current    string    `json:"current,omitempty"`
 	StartedAt  time.Time `json:"started_at"`
+	// Finishing is true once every byte of the push has arrived but the push
+	// has not yet been finalized: the .lanpart is still being hashed and
+	// renamed, or the whole push is waiting for its final Finish. The UI shows
+	// "Finishing…" for this 100%-received-but-still-listed window instead of an
+	// unexplained full bar.
+	Finishing bool `json:"finishing"`
+}
+
+// finishing reports whether every byte of the push has arrived but the push
+// has not yet finished. Once the last byte of the last file is in, the row
+// still exists while each .lanpart is hashed and renamed (the per-file
+// Complete) and until the sender's final Finish removes the push. During that
+// window the byte total reads 100%, so the UI needs an explicit "Finishing…"
+// state rather than an unexplained full bar. A push with a body still arriving
+// is not finishing. Caller holds m.mu, which guards the per-file Done counters;
+// the live counters and completeDone are atomic.
+func (p *Push) finishing() bool {
+	if p.Total <= 0 {
+		return false
+	}
+	var received int64
+	for _, f := range p.Files {
+		d := f.Done
+		if l := f.live.Load(); l > d {
+			d = l
+		}
+		if d > f.Size {
+			d = f.Size
+		}
+		if d < f.Size {
+			return false // a body is still arriving
+		}
+		received += d
+	}
+	return received >= p.Total
 }
 
 // Incoming lists the pushes being received, oldest first.
@@ -248,7 +308,7 @@ func (m *Manager) Incoming() []IncomingView {
 	defer m.mu.Unlock()
 	out := make([]IncomingView, 0, len(m.pushes))
 	for _, p := range m.pushes {
-		v := IncomingView{ID: p.ID, PeerFP: p.PeerFP, Mode: p.Mode, Total: p.Total, SpeedMBps: p.speed() / 1e6, FilesTotal: len(p.Files), StartedAt: p.CreatedAt}
+		v := IncomingView{ID: p.ID, PeerFP: p.PeerFP, Mode: p.Mode, Total: p.Total, SpeedMBps: p.speed() / 1e6, ETASeconds: p.eta(), FilesTotal: len(p.Files), StartedAt: p.CreatedAt, Finishing: p.finishing()}
 		for _, f := range p.Files {
 			d := f.Done
 			if l := f.live.Load(); l > d {
@@ -290,9 +350,23 @@ func (m *Manager) HasActivePush(peerFP string) bool {
 // Cancel stops an accepted push. Files already received stay; partial files
 // are removed. The sender's next request fails with ErrCancelled.
 func (m *Manager) Cancel(id string) bool {
+	var received []ReceivedFile
+	var started time.Time
+	var peerFP string
 	m.mu.Lock()
 	p, ok := m.pushes[id]
 	if ok {
+		peerFP, started = p.PeerFP, p.CreatedAt
+		for _, f := range p.Files {
+			if f.Size > 0 && f.Done >= f.Size {
+				name := filepath.Base(f.Final)
+				if f.Final == "" {
+					name = filepath.Base(f.RelPath)
+				}
+				received = append(received, ReceivedFile{Rel: f.RelPath, Name: name, Size: f.Size})
+			}
+		}
+		sort.Slice(received, func(i, j int) bool { return received[i].Rel < received[j].Rel })
 		delete(m.pushes, id)
 		p.cancelled.Store(true)
 		m.gone[id] = struct{}{}
@@ -305,6 +379,9 @@ func (m *Manager) Cancel(id string) bool {
 		if f.Done < f.Size || f.Size == 0 {
 			_ = os.Remove(f.Part)
 		}
+	}
+	if m.onCancel != nil {
+		m.onCancel(peerFP, received, started)
 	}
 	m.onChange()
 	return true
@@ -326,6 +403,7 @@ type Manager struct {
 	onDone    func(peerFP string, files []ReceivedFile)
 	onSnippet func(peerFP, text string)
 	onFail    func(peerFP, reason string)
+	onCancel  func(peerFP string, files []ReceivedFile, started time.Time)
 
 	// Tunables; overridable before or during use. now is injectable for tests.
 	now           func() time.Time
@@ -402,7 +480,28 @@ func nearestExistingDir(path string) string {
 	}
 }
 
-func New(dir string, onChange func()) *Manager {
+// Option customizes a Manager at construction time. Options run before the
+// background reaper starts, so a timeout set here is in effect from the very
+// first sweep rather than only after the reaper has already armed its timer.
+type Option func(*Manager)
+
+// WithTimeouts sets the in-flight stall timeout and the no-body idle timeout
+// before the reaper starts, deriving the sweep interval from the shorter of the
+// two. A non-positive value leaves that timeout at its default. Intended for
+// tests that need a deterministic reap; production uses the package defaults.
+func WithTimeouts(stall, idle time.Duration) Option {
+	return func(m *Manager) {
+		if stall > 0 {
+			m.stallTimeout = stall
+		}
+		if idle > 0 {
+			m.idleTimeout = idle
+		}
+		m.refreshSweepLocked()
+	}
+}
+
+func New(dir string, onChange func(), opts ...Option) *Manager {
 	if onChange == nil {
 		onChange = func() {}
 	}
@@ -412,6 +511,11 @@ func New(dir string, onChange func()) *Manager {
 		stallTimeout: defaultStallTimeout, idleTimeout: defaultIdleTimeout,
 		sweepInterval: defaultSweepInterval,
 		done:          make(chan struct{}),
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(m)
+		}
 	}
 	m.startReaper()
 	return m
@@ -439,6 +543,12 @@ func (m *Manager) notifyProgress() {
 // SetOnFail registers a callback for a push that fails before it finishes: the
 // connection died or stalled. The reason is for logs and the transfer history.
 func (m *Manager) SetOnFail(fn func(peerFP, reason string)) { m.onFail = fn }
+
+// SetOnCancel registers a callback for a push the receiving person stops, with
+// the files that had already landed, so a Cancelled history entry is recorded.
+func (m *Manager) SetOnCancel(fn func(peerFP string, files []ReceivedFile, started time.Time)) {
+	m.onCancel = fn
+}
 
 // SetStallTimeout sets how long an in-flight body may make no progress before
 // the reaper removes the push, and scales the sweep interval to match. Intended
@@ -646,6 +756,28 @@ func (m *Manager) SetDir(dir string) {
 	m.mu.Unlock()
 }
 
+// windowsNames reports whether DOS reserved device names must be remapped. It is
+// a var so tests can exercise the Windows rule on any host.
+var windowsNames = runtime.GOOS == "windows"
+
+// isReservedName reports whether base is a DOS device name (CON, PRN, AUX, NUL,
+// COM1–COM9, LPT1–LPT9), ignoring case and any extension.
+func isReservedName(name string) bool {
+	base := name
+	if i := strings.IndexByte(base, '.'); i >= 0 {
+		base = base[:i]
+	}
+	base = strings.ToUpper(base)
+	switch base {
+	case "CON", "PRN", "AUX", "NUL":
+		return true
+	}
+	if len(base) == 4 && (base[:3] == "COM" || base[:3] == "LPT") {
+		return base[3] >= '1' && base[3] <= '9'
+	}
+	return false
+}
+
 func sanitize(rel string) (string, error) {
 	clean, err := shares.CleanRel(rel)
 	if err != nil {
@@ -666,6 +798,12 @@ func sanitize(rel string) (string, error) {
 		s = strings.TrimRight(s, ". ")
 		if s == "" {
 			s = "_"
+		}
+		// On Windows a device name is reserved with or without an extension and
+		// with trailing dots/spaces stripped; prefix an underscore to make it a
+		// normal file name.
+		if windowsNames && isReservedName(s) {
+			s = "_" + s
 		}
 		out = append(out, s)
 	}
@@ -803,24 +941,36 @@ func (m *Manager) WriteChunk(id, peerFP, rel string, offset int64, r io.Reader) 
 // bytes are written (no second read from disk), the size and digest are checked,
 // and the file is renamed into place. It is the fast path for small files; large
 // or partly received files use WriteChunk and Complete.
-func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileState, error) {
+//
+// The returned already flag reports a replayed request for a file that was
+// already placed: the body is drained and the original result is returned, so a
+// duplicate whole-file send is an idempotent success rather than a second place.
+func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileState, bool, error) {
 	p, ok := m.Get(id, peerFP)
 	if !ok {
-		return nil, errors.New("no such push")
+		return nil, false, errors.New("no such push")
 	}
 	st, ok := p.Files[rel]
 	if !ok {
-		return nil, errors.New("no such file in push")
+		return nil, false, errors.New("no such file in push")
+	}
+	st.completeMu.Lock()
+	defer st.completeMu.Unlock()
+	if st.completeDone.Load() {
+		// Drain the retried body so the connection stays healthy, then report
+		// the same result without touching the placed file.
+		_, _ = io.Copy(io.Discard, r)
+		return st, true, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(st.Part), 0o700); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if old := st.live.Swap(0); old != 0 {
 		p.live.Add(-old)
 	}
 	f, err := os.OpenFile(st.Part, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	h := sha256.New()
 	// Read one byte more than announced so an oversized body is noticed.
@@ -833,9 +983,9 @@ func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileSt
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
-	fail := func(e error) (*FileState, error) {
+	fail := func(e error) (*FileState, bool, error) {
 		_ = os.Remove(st.Part)
-		return nil, e
+		return nil, false, e
 	}
 	if err != nil {
 		if p.cancelled.Load() {
@@ -845,7 +995,7 @@ func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileSt
 		// A read/write error means the connection died; drop the push now but
 		// keep the .lanpart so a re-offer can resume from what already arrived.
 		m.failPush(id, err.Error())
-		return nil, err
+		return nil, false, err
 	}
 	if n != st.Size {
 		return fail(fmt.Errorf("size mismatch: have %d, expected %d", n, st.Size))
@@ -865,45 +1015,57 @@ func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileSt
 	}
 	m.mu.Lock()
 	st.Final, st.Done = final, st.Size
+	st.completeDone.Store(true)
 	m.mu.Unlock()
 	m.onChange()
-	return st, nil
+	return st, false, nil
 }
 
 // Complete verifies the whole-file SHA-256 and atomically renames the part in
 // place, choosing a non-colliding name. It sets the remote modification time.
-func (m *Manager) Complete(id, peerFP, rel, wantSHA string) (*FileState, error) {
+//
+// The returned already flag reports a replayed complete for a file that was
+// already verified and placed: the same result is returned and nothing is
+// hashed or renamed again, so a duplicate final-complete cannot re-place the
+// file, re-count it or fail.
+func (m *Manager) Complete(id, peerFP, rel, wantSHA string) (*FileState, bool, error) {
 	p, ok := m.Get(id, peerFP)
 	if !ok {
-		return nil, errors.New("no such push")
+		return nil, false, errors.New("no such push")
 	}
 	st, ok := p.Files[rel]
 	if !ok {
-		return nil, errors.New("no such file in push")
+		return nil, false, errors.New("no such file in push")
+	}
+	st.completeMu.Lock()
+	defer st.completeMu.Unlock()
+	if st.completeDone.Load() {
+		return st, true, nil
 	}
 	gotSHA, gotSize, err := hashFile(st.Part)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if gotSize != st.Size {
-		return nil, fmt.Errorf("size mismatch: have %d, expected %d", gotSize, st.Size)
+		return nil, false, fmt.Errorf("size mismatch: have %d, expected %d", gotSize, st.Size)
 	}
 	if wantSHA != "" && !strings.EqualFold(gotSHA, wantSHA) {
-		return nil, errors.New("checksum mismatch")
+		return nil, false, errors.New("checksum mismatch")
 	}
 	final := uniqueName(st.Final)
 	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if err := os.Rename(st.Part, final); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !st.MTime.IsZero() {
 		_ = os.Chtimes(final, st.MTime, st.MTime)
 	}
 	st.Final = final
+	st.completeDone.Store(true)
 	m.onChange()
-	return st, nil
+	return st, false, nil
 }
 
 // Finish removes a completed push and reports the files that landed.

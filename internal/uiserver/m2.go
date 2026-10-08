@@ -255,7 +255,8 @@ func (s *Server) handleTransfersClear(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]int{"cleared": s.d.Transfers.ClearFinished()})
 }
 
-// handleTransfersClearHistory forgets every finished and failed job.
+// handleTransfersClearHistory forgets every terminal job (done, failed or
+// cancelled), the same as handleTransfersClear.
 func (s *Server) handleTransfersClearHistory(w http.ResponseWriter, r *http.Request) {
 	if s.d.Transfers == nil {
 		http.Error(w, "transfers unavailable", http.StatusServiceUnavailable)

@@ -185,15 +185,22 @@ func (m *Manager) runPush(job *Job) {
 		}()
 	}
 	wg.Wait()
-	if firstErr != nil {
+	if firstErr != nil || ctx.Err() != nil {
 		job.mu.Lock()
 		job.running = false
-		paused := errors.Is(ctx.Err(), context.Canceled)
-		if paused {
+		cancelled := errors.Is(ctx.Err(), context.Canceled)
+		switch {
+		case cancelled && job.cancelled:
+			job.State = StateCancelled
+			if job.FinishedAt.IsZero() {
+				job.FinishedAt = time.Now()
+			}
+			job.Note = ""
+		case cancelled:
 			job.State = StatePaused
 		}
 		job.mu.Unlock()
-		if !paused {
+		if !cancelled {
 			m.pushFail(job, firstErr)
 		}
 		m.persist()
