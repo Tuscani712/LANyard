@@ -994,7 +994,8 @@ function renderTransfersPage() {
     row.appendChild(top);
     const pct = inc.total ? Math.min(100, (inc.done / inc.total) * 100) : 0;
     const bar = el("div", "bar"); const fill = el("div", "fill"); fill.style.width = pct.toFixed(1) + "%"; bar.appendChild(fill); row.appendChild(bar);
-    row.appendChild(el("div", "meta", `${pct.toFixed(0)}% \u00b7 ${fmtBytes(inc.done)} / ${fmtBytes(inc.total)} \u00b7 ${inc.files_done} of ${inc.files_total} file${inc.files_total === 1 ? "" : "s"} \u00b7 saved to your Inbox`));
+    const spd = inc.speed_mbps > 0 ? ` \u00b7 ${fmtSpeed(inc.speed_mbps)}` : "";
+    row.appendChild(el("div", "meta", `${pct.toFixed(0)}%${spd} \u00b7 ${fmtBytes(inc.done)} / ${fmtBytes(inc.total)} \u00b7 ${inc.files_done} of ${inc.files_total} file${inc.files_total === 1 ? "" : "s"} \u00b7 saved to your Inbox`));
     if (inc.current) row.appendChild(el("div", "meta", inc.current));
     const acts = el("div", "actions");
     acts.appendChild(btn("Cancel", async () => {

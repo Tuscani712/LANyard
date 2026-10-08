@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -131,7 +132,51 @@ type Push struct {
 	// of the last body start/end. The reaper uses it to decide a connection has
 	// stalled or a push has gone idle.
 	lastProgress atomic.Int64
+
+	// live is the cumulative bytes received for this push, maintained so the
+	// rate sampler can read one value without taking a lock. It is seeded from
+	// the bytes already on disk when a push is resumed.
+	live atomic.Int64
+
+	// samples and sampleAt back the smoothed receive rate. They are guarded by
+	// samplesMu rather than m.mu so bytes can be sampled while a stream is
+	// copied and Incoming() can read the published speed without lock order
+	// problems.
+	samplesMu sync.Mutex
+	samples   []rateSample
+	sampleAt  time.Time
+	// speedBits holds the current smoothed receive rate as math.Float64bits of
+	// bytes/second, published atomically for Incoming() to read.
+	speedBits atomic.Uint64
 }
+
+// observeRate records the cumulative byte total and republishes the smoothed
+// receive rate. It is called as bytes arrive; samples are throttled so a fast
+// stream does not build an unbounded sample slice.
+func (p *Push) observeRate(now time.Time) {
+	p.samplesMu.Lock()
+	if !p.sampleAt.IsZero() && now.Sub(p.sampleAt) < rateSampleEvery {
+		p.samplesMu.Unlock()
+		return
+	}
+	p.sampleAt = now
+	p.samples = append(p.samples, rateSample{at: now, bytes: p.live.Load()})
+	cutoff := now.Add(-rateWindow)
+	drop := 0
+	for drop < len(p.samples) && p.samples[drop].at.Before(cutoff) {
+		drop++
+	}
+	if drop > 0 {
+		p.samples = append(p.samples[:0], p.samples[drop:]...)
+	}
+	rate := rollingRate(p.samples, now, rateWindow)
+	p.samplesMu.Unlock()
+	p.speedBits.Store(math.Float64bits(rate))
+}
+
+// speed returns the current smoothed receive rate in bytes/second, or 0 when
+// there is nothing to report.
+func (p *Push) speed() float64 { return math.Float64frombits(p.speedBits.Load()) }
 
 // ErrCancelled is returned to the sender once the receiving person has
 // cancelled an accepted push.
@@ -153,11 +198,15 @@ func (c cancelReader) Read(b []byte) (int, error) {
 		return 0, ErrCancelled
 	}
 	n, err := c.r.Read(b)
-	if c.st != nil {
-		c.st.live.Add(int64(n))
+	if n > 0 {
+		if c.st != nil {
+			c.st.live.Add(int64(n))
+		}
+		c.p.live.Add(int64(n))
 	}
 	if n > 0 && c.m != nil {
 		c.p.touch(c.m.now())
+		c.p.observeRate(c.m.now())
 		c.m.notifyProgress()
 	}
 	return n, err
@@ -186,6 +235,7 @@ type IncomingView struct {
 	Mode       string    `json:"mode"`
 	Total      int64     `json:"total"`
 	Done       int64     `json:"done"`
+	SpeedMBps  float64   `json:"speed_mbps"`
 	FilesTotal int       `json:"files_total"`
 	FilesDone  int       `json:"files_done"`
 	Current    string    `json:"current,omitempty"`
@@ -198,7 +248,7 @@ func (m *Manager) Incoming() []IncomingView {
 	defer m.mu.Unlock()
 	out := make([]IncomingView, 0, len(m.pushes))
 	for _, p := range m.pushes {
-		v := IncomingView{ID: p.ID, PeerFP: p.PeerFP, Mode: p.Mode, Total: p.Total, FilesTotal: len(p.Files), StartedAt: p.CreatedAt}
+		v := IncomingView{ID: p.ID, PeerFP: p.PeerFP, Mode: p.Mode, Total: p.Total, SpeedMBps: p.speed() / 1e6, FilesTotal: len(p.Files), StartedAt: p.CreatedAt}
 		for _, f := range p.Files {
 			d := f.Done
 			if l := f.live.Load(); l > d {
@@ -661,6 +711,7 @@ func (m *Manager) Offer(peerFP, mode string, files []FileReq, maxBytes int64) (*
 			st.live.Store(done)
 		}
 		p.Files[rel] = st
+		p.live.Add(st.Done)
 		p.Total += f.Size
 	}
 	if p.Total > maxBytes {
@@ -709,7 +760,9 @@ func (m *Manager) WriteChunk(id, peerFP, rel string, offset int64, r io.Reader) 
 	if err := os.MkdirAll(filepath.Dir(st.Part), 0o700); err != nil {
 		return 0, err
 	}
-	st.live.Store(offset)
+	if old := st.live.Swap(offset); old != offset {
+		p.live.Add(offset - old)
+	}
 	f, err := os.OpenFile(st.Part, os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
 		return 0, err
@@ -762,7 +815,9 @@ func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileSt
 	if err := os.MkdirAll(filepath.Dir(st.Part), 0o700); err != nil {
 		return nil, err
 	}
-	st.live.Store(0)
+	if old := st.live.Swap(0); old != 0 {
+		p.live.Add(-old)
+	}
 	f, err := os.OpenFile(st.Part, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
 	if err != nil {
 		return nil, err
@@ -854,6 +909,7 @@ func (m *Manager) Complete(id, peerFP, rel, wantSHA string) (*FileState, error) 
 // Finish removes a completed push and reports the files that landed.
 func (m *Manager) Finish(id, peerFP string) bool {
 	var received []ReceivedFile
+	var done *Push
 	m.mu.Lock()
 	p, ok := m.pushes[id]
 	if ok && p.PeerFP == peerFP {
@@ -866,15 +922,42 @@ func (m *Manager) Finish(id, peerFP string) bool {
 		}
 		sort.Slice(received, func(i, j int) bool { return received[i].Rel < received[j].Rel })
 		delete(m.pushes, id)
+		done = p
 	}
 	m.mu.Unlock()
 	if ok {
+		if done != nil {
+			m.finishLog(done, received, m.now())
+		}
 		m.onChange()
 		if m.onDone != nil {
 			m.onDone(peerFP, received)
 		}
 	}
 	return ok
+}
+
+// finishLog records a completed incoming push in the shared transfer log with
+// the average throughput over its whole life, so a finished receive leaves a
+// line reporting how fast it actually went.
+func (m *Manager) finishLog(p *Push, files []ReceivedFile, now time.Time) {
+	if m.xlog == nil {
+		return
+	}
+	var total int64
+	for _, f := range files {
+		total += f.Size
+	}
+	elapsed := now.Sub(p.CreatedAt)
+	var bps int64
+	if elapsed > 0 && total > 0 {
+		bps = int64(float64(total) / elapsed.Seconds())
+	}
+	m.xlog.Record(nil, xferlog.Entry{
+		Area: xferlog.AreaPushing, Direction: xferlog.DirectionReceive, Step: xferlog.StepComplete,
+		Level: xferlog.LevelInfo, Outcome: "complete", FP: identity.ShortID(p.PeerFP),
+		Session: p.ID, Bytes: total, Elapsed: elapsed, SpeedBps: bps,
+	})
 }
 
 // Count returns how many pushes are in flight.

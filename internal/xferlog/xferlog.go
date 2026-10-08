@@ -71,6 +71,7 @@ type Entry struct {
 	Reason    string        `json:"reason,omitempty"`
 	Age       time.Duration `json:"age_ns,omitempty"`
 	Elapsed   time.Duration `json:"elapsed_ns,omitempty"`
+	SpeedBps  int64         `json:"speed_bps,omitempty"`
 	Error     string        `json:"error,omitempty"`
 }
 
@@ -159,6 +160,9 @@ func (e Entry) attrs() []any {
 	}
 	if e.Elapsed > 0 {
 		attrs = append(attrs, "elapsed_ms", e.Elapsed.Milliseconds())
+	}
+	if e.SpeedBps > 0 {
+		attrs = append(attrs, "speed_bps", e.SpeedBps)
 	}
 	if e.Error != "" {
 		attrs = append(attrs, "err", Scrub(e.Error))
@@ -311,6 +315,9 @@ func (r *Recorder) Report() string {
 		}
 		if e.Elapsed > 0 {
 			fmt.Fprintf(&b, " elapsed=%s", e.Elapsed.Round(time.Millisecond))
+		}
+		if e.SpeedBps > 0 {
+			fmt.Fprintf(&b, " speed=%d B/s", e.SpeedBps)
 		}
 		if e.Error != "" {
 			fmt.Fprintf(&b, " err=%q", Scrub(e.Error))
