@@ -227,7 +227,17 @@ func (m *Manager) pushOne(ctx context.Context, job *Job, pushID string, f *FileJ
 	if mbps := m.bandwidth(); mbps > 0 {
 		body = &throttleReader{r: body, mbps: mbps, start: time.Now()}
 	}
-	written, err := m.client.PushFile(ctx, job.Host, job.Port, job.PeerID, pushID, f.Rel, offset, f.Size, body)
+	// Publish the resumed prefix before streaming so job.Done is offset (not
+	// zero) and setFileDone, which is absolute, never adds the prefix twice.
+	job.mu.Lock()
+	setFileDone(job, f, offset)
+	f.State = FilePartial
+	job.UpdatedAt = time.Now()
+	job.lastProgress = time.Now()
+	job.mu.Unlock()
+	m.onChange()
+	written, err := m.client.PushFile(ctx, job.Host, job.Port, job.PeerID, pushID, f.Rel, offset, f.Size,
+		&pushCountingReader{m: m, job: job, f: f, r: body, base: offset})
 	if err != nil {
 		return err
 	}
@@ -241,14 +251,42 @@ func (m *Manager) pushOne(ctx context.Context, job *Job, pushID string, f *FileJ
 		return err
 	}
 	job.mu.Lock()
+	setFileDone(job, f, f.Size)
 	f.State = FileDone
-	f.Done = f.Size
-	job.Done += f.Size - offset
 	job.UpdatedAt = time.Now()
 	m.bumpSpeed(job)
 	job.mu.Unlock()
 	m.onChange()
 	return nil
+}
+
+// pushCountingReader wraps an upload body and records the job's live progress
+// as bytes leave the sender, so the UI advances during a slow push instead of
+// jumping to 100% only once the whole file has been verified. base is the
+// number of bytes already on the receiver for this attempt; because
+// setFileDone sets an absolute value, a retry/resume can never double-count
+// the prefix that was already transferred.
+type pushCountingReader struct {
+	m    *Manager
+	job  *Job
+	f    *FileJob
+	r    io.Reader
+	base int64
+	sent int64
+}
+
+func (c *pushCountingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		c.sent += int64(n)
+		c.job.mu.Lock()
+		setFileDone(c.job, c.f, c.base+c.sent)
+		c.job.lastProgress = time.Now()
+		c.m.bumpSpeed(c.job)
+		c.job.mu.Unlock()
+		c.m.notifyProgress()
+	}
+	return n, err
 }
 
 func (m *Manager) pushFail(job *Job, err error) {
@@ -283,9 +321,8 @@ func (m *Manager) pushSmall(ctx context.Context, job *Job, pushID string, f *Fil
 		return err
 	}
 	job.mu.Lock()
+	setFileDone(job, f, f.Size)
 	f.State = FileDone
-	f.Done = f.Size
-	job.Done += f.Size
 	job.UpdatedAt = time.Now()
 	job.lastProgress = time.Now()
 	m.bumpSpeed(job)
