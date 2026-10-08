@@ -31,7 +31,14 @@ class SpeedMeter(
     /**
      * Records [cumulativeBytes] moved at [nowMillis] and returns the smoothed
      * bytes/second over the window, or null when a rate must not be shown.
+     *
+     * Synchronized: one meter is kept per transfer, and every file body of a
+     * concurrent receive samples the same instance from its own server thread.
+     * The backing `ArrayDeque`s are not thread-safe; unsynchronized use let a
+     * racing resize/clear leave a null slot, which unboxed to a
+     * `Number.longValue()` NPE and took down the receive handler.
      */
+    @Synchronized
     fun sample(nowMillis: Long, cumulativeBytes: Long): Double? {
         val lastAt = times.lastOrNull()
         if (lastAt != null) {
@@ -40,7 +47,7 @@ class SpeedMeter(
                 // so the resumed bytes are judged on their own, and show nothing
                 // for this callback rather than a rate spanning the gap.
                 clear()
-            } else if (nowMillis <= lastAt || cumulativeBytes < bytes.last()) {
+            } else if (nowMillis <= lastAt || cumulativeBytes < (bytes.lastOrNull() ?: cumulativeBytes)) {
                 // Out-of-order callback, or a counter that reset (a new file):
                 // re-anchor so the rate never runs negative.
                 clear()
@@ -56,13 +63,16 @@ class SpeedMeter(
         }
         if (times.size < 2) return null
 
-        val elapsedSeconds = (nowMillis - times.first()) / 1000.0
+        val firstTime = times.firstOrNull() ?: return null
+        val firstBytes = bytes.firstOrNull() ?: return null
+        val elapsedSeconds = (nowMillis - firstTime) / 1000.0
         if (elapsedSeconds <= 0.0) return null
-        val moved = (cumulativeBytes - bytes.first()).coerceAtLeast(0L)
+        val moved = (cumulativeBytes - firstBytes).coerceAtLeast(0L)
         return moved / elapsedSeconds
     }
 
     /** Forgets every sample; the next [sample] behaves like a fresh start. */
+    @Synchronized
     fun reset() = clear()
 
     private fun clear() {
