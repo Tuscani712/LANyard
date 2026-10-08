@@ -201,10 +201,16 @@ func (s *Server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 // person-readable line. A 404 means the peer speaks the discovery protocol but
 // does not run the pairing service yet (for example the current Android app),
 // which is a different situation from a device that cannot be reached at all.
+// A 403 is a pairing/permission refusal, not an unreachable device.
 func pairingStartMessage(err error) (string, bool) {
 	var se *peerapi.StatusError
-	if errors.As(err, &se) && se.Code == http.StatusNotFound {
-		return "This device can't accept pairing yet. Pair from it instead: scan this computer's QR code.", true
+	if errors.As(err, &se) {
+		switch se.Code {
+		case http.StatusNotFound:
+			return "This device can't accept pairing yet. Pair from it instead: scan this computer's QR code.", true
+		case http.StatusForbidden:
+			return peerapi.UserMessage(err), true
+		}
 	}
 	return "could not reach device: " + err.Error(), false
 }

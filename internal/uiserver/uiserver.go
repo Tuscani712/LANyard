@@ -30,6 +30,7 @@ import (
 	"lanyard/internal/shares"
 	"lanyard/internal/transfer"
 	"lanyard/internal/trust"
+	"lanyard/internal/xferlog"
 )
 
 //go:embed web
@@ -89,6 +90,10 @@ type Deps struct {
 	OpenFolder func(path string) error
 	// Mounts serves paired devices as drives (spec §11.2).
 	Mounts *mount.Manager
+
+	// XferLog is the shared four-area diagnostics recorder shown in the
+	// diagnostics panel and copied by "Copy log".
+	XferLog *xferlog.Recorder
 
 	// M6: settings.
 	Cfg           *config.Store
@@ -339,6 +344,38 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// peerErrorMessage maps a failure to reach or be accepted by a peer to the
+// line the UI shows. A 403 is a pairing/permission refusal, not an unreachable
+// device, so it must never be reported as "could not reach device".
+//
+// This is the desktop-side mapping for the "not paired" wording (task c):
+// internal/uiserver/uiserver.go:peerErrorMessage, with the shared decision in
+// internal/peerapi/errors.go:peerapi.UserMessage.
+func peerErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	var se *peerapi.StatusError
+	if errors.As(err, &se) && se.Code == http.StatusForbidden {
+		return peerapi.UserMessage(err)
+	}
+	return "could not reach device: " + err.Error()
+}
+
+// peerUIMessage is peerErrorMessage without the "could not reach device"
+// prefix, for handlers that already returned a bare error string. It still
+// maps a 403 to the "not paired" wording instead of passing the raw status.
+func peerUIMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	var se *peerapi.StatusError
+	if errors.As(err, &se) && se.Code == http.StatusForbidden {
+		return peerapi.UserMessage(err)
+	}
+	return err.Error()
+}
+
 func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Address     string `json:"address"`
@@ -362,7 +399,7 @@ func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	p, err := s.d.AddPeer(ctx, host, port, strings.TrimSpace(req.Fingerprint))
 	if err != nil {
-		http.Error(w, "could not reach device: "+err.Error(), http.StatusBadGateway)
+		http.Error(w, peerErrorMessage(err), http.StatusBadGateway)
 		return
 	}
 	writeJSON(w, p)

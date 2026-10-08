@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/libp2p/zeroconf/v2"
+
+	"lanyard/internal/xferlog"
 )
 
 const (
@@ -63,8 +65,10 @@ func (m *Manager) startMDNS(ctx context.Context) {
 	srv, err := zeroconf.Register(m.self.ShortID, mdnsService, mdnsDomain, m.self.Port, txt, nil)
 	if err != nil {
 		m.log.Warn("mDNS announce unavailable; relying on beacon/manual", "err", err)
+		m.xfer(xferlog.Entry{Outcome: "browse", Level: xferlog.LevelWarn, Reason: "mDNS announce unavailable", Error: err.Error()})
 	} else {
 		node.server = srv
+		m.xfer(xferlog.Entry{Outcome: "announce", Level: xferlog.LevelInfo, Reason: "mDNS announce started"})
 	}
 
 	bctx, cancel := context.WithCancel(ctx)
@@ -75,8 +79,9 @@ func (m *Manager) startMDNS(ctx context.Context) {
 	m.wg.Add(2)
 	go func() {
 		defer m.wg.Done()
-		if err := zeroconf.Browse(bctx, mdnsService, mdnsDomain, entries); err != nil {
+		if err := zeroconf.Browse(bctx, mdnsService, mdnsDomain, entries); err != nil && bctx.Err() == nil {
 			m.log.Warn("mDNS browse unavailable; relying on beacon/manual", "err", err)
+			m.xfer(xferlog.Entry{Outcome: "browse", Level: xferlog.LevelWarn, Reason: "mDNS browse unavailable", Error: err.Error()})
 		}
 	}()
 	go func() {
@@ -94,6 +99,10 @@ func (m *Manager) startMDNS(ctx context.Context) {
 				ips = append(ips, ip.String())
 			}
 			if time.Until(e.Expiry) < 5*time.Second { // TTL 0 goodbye
+				m.xfer(xferlog.Entry{
+					Outcome: "expire", Level: xferlog.LevelInfo, FP: a.ShortID, Peer: a.Name,
+					Reason: "mDNS record expired",
+				})
 				m.removeIfIdle(a.ShortID)
 				continue
 			}

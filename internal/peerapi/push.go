@@ -7,13 +7,17 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"lanyard/internal/approval"
+	"lanyard/internal/identity"
 	"lanyard/internal/inbox"
 	"lanyard/internal/trust"
+	"lanyard/internal/xferlog"
 )
 
 // SetInbox attaches the Inbox receiver. Kept as a setter so the constructor
@@ -95,15 +99,18 @@ func (s *Server) askToAccept(w http.ResponseWriter, r *http.Request, a trust.Acc
 }
 
 // pushAccess authorizes a push endpoint: a paired peer with push permission, or
-// any live Connect session.
-func (s *Server) pushAccess(w http.ResponseWriter, r *http.Request) (trust.Access, bool) {
+// any live Connect session. step names the stage being authorized, for the
+// transfer log when the request is refused.
+func (s *Server) pushAccess(w http.ResponseWriter, r *http.Request, step string) (trust.Access, bool) {
+	fp := PeerID(r.Context())
 	if s.inbox == nil {
 		http.Error(w, "inbox unavailable", http.StatusServiceUnavailable)
+		s.xferRecv(PeerID(r.Context()), step, xferlog.LevelError, s.peerName(fp, trust.Access{}), r.RemoteAddr, "", 0, 0, errors.New("inbox unavailable"))
 		return trust.Access{}, false
 	}
 	var a trust.Access
 	if s.auth != nil {
-		a = s.auth.Access(PeerID(r.Context()))
+		a = s.auth.Access(fp)
 	}
 	if a.Paired && a.Push {
 		return a, true
@@ -111,12 +118,41 @@ func (s *Server) pushAccess(w http.ResponseWriter, r *http.Request) (trust.Acces
 	if a.SessionID != "" {
 		return a, true
 	}
+	reason := "not permitted"
 	if a.Paired {
-		http.Error(w, "push not permitted", http.StatusForbidden)
-		return a, false
+		reason = "push not permitted"
 	}
-	http.Error(w, "not permitted", http.StatusForbidden)
+	http.Error(w, reason, http.StatusForbidden)
+	s.xferRecv(PeerID(r.Context()), step, xferlog.LevelWarn, s.peerName(fp, a), r.RemoteAddr, "", 0, 0, errors.New("not paired with this device"))
 	return a, false
+}
+
+// xferRecv records one receiving-side transfer entry. It never stores a full
+// file path: callers pass a base name. The peer identity is reduced to its
+// short fingerprint.
+func (s *Server) xferRecv(fp, step string, level xferlog.Level, peer, target, file string, bytes int64, elapsed time.Duration, err error) {
+	e := xferlog.Entry{
+		Area: xferlog.AreaPushing, Direction: xferlog.DirectionReceive, Step: step, Level: level,
+		FP: identity.ShortID(fp), Peer: peer, Target: target, File: file, Bytes: bytes, Elapsed: elapsed,
+	}
+	if err != nil {
+		e.Error = err.Error()
+	}
+	s.xfer(e)
+}
+
+// xferRecvFile records a per-file receipt with its offset and size, which is
+// what tells resume apart from a fresh write.
+func (s *Server) xferRecvFile(fp, step string, level xferlog.Level, peer, target, class string, offset, size, bytes int64, elapsed time.Duration, err error) {
+	e := xferlog.Entry{
+		Area: xferlog.AreaPushing, Direction: xferlog.DirectionReceive, Step: step, Level: level,
+		FP: identity.ShortID(fp), Peer: peer, Target: target, File: class,
+		Offset: offset, Size: size, Bytes: bytes, Elapsed: elapsed,
+	}
+	if err != nil {
+		e.Error = err.Error()
+	}
+	s.xfer(e)
 }
 
 const (
@@ -137,7 +173,7 @@ type pushOfferResp struct {
 }
 
 func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
-	a, ok := s.pushAccess(w, r)
+	a, ok := s.pushAccess(w, r, xferlog.StepOffer)
 	if !ok {
 		return
 	}
@@ -165,11 +201,13 @@ func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
 			total += f.Size
 		}
 	}
+	offerAt := time.Now()
 	// A Connect session, or a paired peer above its ask-over limit, needs a
 	// person to accept (spec §4.2/§4.4). Without an approval queue (tests, the
 	// dev flag) pushes keep the old automatic behaviour.
 	if reason := needsApproval(a, total); reason != "" && s.approvals != nil {
 		if !s.askToAccept(w, r, a, reason, req.Files, total) {
+			s.xferRecv(PeerID(r.Context()), xferlog.StepOffer, xferlog.LevelWarn, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, "", 0, time.Since(offerAt), errors.New("the offer was declined or not answered"))
 			return
 		}
 	}
@@ -180,8 +218,10 @@ func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
 			code = http.StatusInsufficientStorage
 		}
 		http.Error(w, err.Error(), code)
+		s.xferRecv(PeerID(r.Context()), xferlog.StepOffer, xferlog.LevelError, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, "", 0, time.Since(offerAt), err)
 		return
 	}
+	s.xferRecv(PeerID(r.Context()), xferlog.StepOffer, xferlog.LevelInfo, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, "", 0, time.Since(offerAt), nil)
 	resp := pushOfferResp{PushID: p.ID, Accepted: true, MaxBytes: p.MaxBytes}
 	for _, f := range p.SortedOffsets() {
 		resp.Files = append(resp.Files, pushFileResp{RelPath: f.RelPath, Offset: f.Offset})
@@ -190,7 +230,7 @@ func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
-	a, ok := s.pushAccess(w, r)
+	a, ok := s.pushAccess(w, r, xferlog.StepFile)
 	if !ok {
 		return
 	}
@@ -207,6 +247,7 @@ func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
 	// Small-file fast path: the whole file and its digest in one request, which
 	// the receiver verifies and finalizes at once (no separate "complete" call).
 	if sha := r.Header.Get("X-Lanyard-SHA256"); sha != "" && offset == 0 {
+		fileAt := time.Now()
 		st, err := s.inbox.Receive(r.PathValue("id"), PeerID(r.Context()), rel, sha, r.Body)
 		if err != nil {
 			code := http.StatusBadRequest
@@ -220,11 +261,14 @@ func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
 				code = http.StatusConflict
 			}
 			http.Error(w, err.Error(), code)
+			s.xferRecvFile(PeerID(r.Context()), xferlog.StepFile, xferlog.LevelError, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, path.Base(rel), 0, 0, 0, time.Since(fileAt), err)
 			return
 		}
+		s.xferRecvFile(PeerID(r.Context()), xferlog.StepFile, xferlog.LevelInfo, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, path.Base(rel), 0, st.Size, st.Size, time.Since(fileAt), nil)
 		writeJSON(w, map[string]any{"written": st.Size, "offset": st.Size, "done": true})
 		return
 	}
+	fileAt := time.Now()
 	n, err := s.inbox.WriteChunk(r.PathValue("id"), PeerID(r.Context()), rel, offset, r.Body)
 	if err != nil {
 		code := http.StatusBadRequest
@@ -234,14 +278,17 @@ func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
 			code = http.StatusNotFound
 		}
 		http.Error(w, err.Error(), code)
+		s.xferRecvFile(PeerID(r.Context()), xferlog.StepFile, xferlog.LevelError, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, path.Base(rel), offset, 0, 0, time.Since(fileAt), err)
 		return
 	}
+	s.xferRecvFile(PeerID(r.Context()), xferlog.StepFile, xferlog.LevelInfo, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, path.Base(rel), offset, 0, n, time.Since(fileAt), nil)
 	writeJSON(w, map[string]int64{"written": n, "offset": offset + n})
 	_ = a
 }
 
 func (s *Server) handlePushComplete(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.pushAccess(w, r); !ok {
+	a, ok := s.pushAccess(w, r, xferlog.StepComplete)
+	if !ok {
 		return
 	}
 	var req struct {
@@ -255,20 +302,42 @@ func (s *Server) handlePushComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	fp := PeerID(r.Context())
+	peer := s.peerName(fp, a)
+	file := path.Base(req.RelPath)
+	completeAt := time.Now()
 	if req.All {
 		s.inbox.Finish(id, fp)
+		s.xferRecv(PeerID(r.Context()), xferlog.StepComplete, xferlog.LevelInfo, peer, r.RemoteAddr, file, 0, time.Since(completeAt), nil)
 		writeJSON(w, map[string]bool{"done": true})
 		return
 	}
 	st, err := s.inbox.Complete(id, fp, req.RelPath, req.SHA256)
 	if err != nil {
 		if s.inbox.WasCancelled(id) {
+			err = inbox.ErrCancelled
+		}
+		// A 409 conflict carries the Connect session id and its age so a
+		// resume/verify mismatch can be told apart from a stale session.
+		var age time.Duration
+		sessionID := a.SessionID
+		if sessionID != "" && s.trust != nil {
+			if sess, ok := s.trust.Snapshot(sessionID); ok {
+				age = time.Since(sess.CreatedAt)
+			}
+		}
+		s.xfer(xferlog.Entry{
+			Area: xferlog.AreaPushing, Direction: xferlog.DirectionReceive, Step: xferlog.StepComplete,
+			Level: xferlog.LevelError, FP: identity.ShortID(fp), Peer: peer, Target: r.RemoteAddr,
+			File: file, Session: sessionID, Age: age, Elapsed: time.Since(completeAt), Error: err.Error(),
+		})
+		if errors.Is(err, inbox.ErrCancelled) {
 			http.Error(w, inbox.ErrCancelled.Error(), http.StatusGone)
 			return
 		}
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
+	s.xferRecv(PeerID(r.Context()), xferlog.StepComplete, xferlog.LevelInfo, peer, r.RemoteAddr, path.Base(st.RelPath), st.Size, time.Since(completeAt), nil)
 	writeJSON(w, map[string]any{"rel_path": st.RelPath, "done": true})
 }
 

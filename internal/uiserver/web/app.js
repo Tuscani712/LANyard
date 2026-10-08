@@ -276,6 +276,23 @@ function showNotice(n) {
   }
 }
 
+// httpError rejects a non-ok fetch with the status preserved, so callers can
+// tell a peer's 403 refusal from a transport failure.
+function httpError(r) {
+  return r.text().then((t) => Promise.reject({ status: r.status, message: t.trim() }));
+}
+// peerErrorText renders a rejected fetch for the person. The desktop's Go side
+// already maps a 403 to "Not paired with this device." (see
+// internal/uiserver/uiserver.go:peerErrorMessage); a 403 is a pairing refusal,
+// not an unreachable device, so it is shown without the "Could not reach" prefix.
+function peerErrorText(err, fallbackPrefix) {
+  if (err && typeof err === "object" && err.status) {
+    if (err.status === 403) return err.message || "Not paired with this device.";
+    return (fallbackPrefix || "") + (err.message || ("HTTP " + err.status));
+  }
+  return (fallbackPrefix || "") + String(err);
+}
+
 // ---------- native file / folder dialog ----------
 // Opens the operating system's own Explorer-style dialog (via the app) and
 // returns the chosen paths, or [] if cancelled. In a plain browser (no native
@@ -608,7 +625,7 @@ function renderDevice(body, p) {
   body.appendChild(listBox);
 
   fetch(`/api/remote/shares?device=${encodeURIComponent(p.device)}`)
-    .then((r) => r.ok ? r.json() : r.text().then((t) => Promise.reject(t.trim())))
+    .then((r) => r.ok ? r.json() : httpError(r))
     .then((list) => {
       if (place().kind !== "device" || place().device !== p.device) return;
       clear(listBox);
@@ -631,7 +648,7 @@ function renderDevice(body, p) {
         listBox.appendChild(row);
       }
     })
-    .catch((err) => { clear(listBox); listBox.appendChild(el("div", "empty", "Could not reach this device: " + String(err))); });
+    .catch((err) => { clear(listBox); listBox.appendChild(el("div", "empty", peerErrorText(err, "Could not reach this device: "))); });
 }
 
 // -- everything other devices share with this one --
@@ -650,7 +667,7 @@ function renderShared(body) {
     const rows = el("div", "stack"); rows.appendChild(el("div", "empty", "Loading\u2026"));
     sec.appendChild(rows); box.appendChild(sec);
     fetch(`/api/remote/shares?device=${encodeURIComponent(peer.device_id)}`)
-      .then((r) => r.ok ? r.json() : r.text().then((t) => Promise.reject(t.trim())))
+      .then((r) => r.ok ? r.json() : httpError(r))
       .then((shs) => {
         if (place().kind !== "shared") return;
         clear(rows);
@@ -666,7 +683,7 @@ function renderShared(body) {
           row.appendChild(acts); rows.appendChild(row);
         }
       })
-      .catch((err) => { clear(rows); rows.appendChild(el("div", "msg err", "Could not list this device's shares: " + err)); });
+      .catch((err) => { clear(rows); rows.appendChild(el("div", "msg err", peerErrorText(err, "Could not list this device's shares: "))); });
   }
 }
 
@@ -691,7 +708,7 @@ function renderRemote(body, p) {
 
   const q = `device=${encodeURIComponent(p.device)}&share=${encodeURIComponent(p.share)}&path=${encodeURIComponent(p.path || "")}`;
   fetch(`/api/remote/tree?${q}`)
-    .then((r) => r.ok ? r.json() : r.text().then((t) => Promise.reject(t.trim())))
+    .then((r) => r.ok ? r.json() : httpError(r))
     .then((entries) => {
       const cur = place();
       if (cur.kind !== "remote" || cur.device !== p.device || cur.share !== p.share || (cur.path || "") !== (p.path || "")) return;
@@ -714,7 +731,7 @@ function renderRemote(body, p) {
         list.appendChild(item);
       }
     })
-    .catch((err) => { list.replaceChildren(el("div", "empty", String(err))); });
+    .catch((err) => { list.replaceChildren(el("div", "empty", peerErrorText(err, ""))); });
 }
 
 // Starts a download. It goes to the saved (or default) folder; the first time,
@@ -1458,13 +1475,13 @@ async function pairWithLink(uri) {
   const p = parsePairLink(uri);
   if (!p || !p.fp || !p.n || !p.addrs.length) { toast("That is not a valid pairing link.", "err"); return; }
   pairPerms = { browse: true, push: false }; pairKeep = false;
-  let ok = false, lastErr = "";
+  let ok = false, lastErr = "", lastStatus = 0;
   for (const a of p.addrs) {
     const r = await fetch("/api/peers/add", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: a, fingerprint: p.fp }) });
     if (r.ok) { ok = true; break; }
-    lastErr = (await r.text()).trim();
+    lastStatus = r.status; lastErr = (await r.text()).trim();
   }
-  if (!ok) { toast("Could not reach the device: " + lastErr, "err"); return; }
+  if (!ok) { toast(peerErrorText({ status: lastStatus, message: lastErr }, "Could not reach the device: "), "err"); return; }
   const name = p.name || p.fp.slice(0, 8);
   const r = await fetch("/api/sessions/request", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: p.fp, mode: "pair", permissions: pairPerms, keep_connected: false, invite: p.n }) });
   if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
@@ -1725,6 +1742,7 @@ function connectEvents() {
 
 // ---------- diagnostics ----------
 let diagReport = "";
+let diagLog = "";
 async function openDiagnostics(device) {
   $("diag").hidden = false;
   const body = $("diag-body");
@@ -1737,9 +1755,10 @@ async function openDiagnostics(device) {
     j = await r.json();
   } catch (e) { clear(body); body.appendChild(el("div", "msg err", String(e))); return; }
   diagReport = j.report || "";
-  renderDiag(j.checks || [], device || "");
+  diagLog = j.log || "";
+  renderDiag(j.checks || [], device || "", j.transfer_log || []);
 }
-function renderDiag(checks, device) {
+function renderDiag(checks, device, transferLog) {
   const body = $("diag-body"); clear(body);
   const targets = shareTargets();
   if (targets.length) {
@@ -1769,6 +1788,34 @@ function renderDiag(checks, device) {
     stack.appendChild(row);
   }
   body.appendChild(stack);
+  if (transferLog && transferLog.length) {
+    body.appendChild(el("div", "section-title", "Diagnostics log"));
+    const logStack = el("div", "stack");
+    for (const e of transferLog.slice(-30).reverse()) {
+      const row = el("div", "row col");
+      const top = el("div", "row"); top.style.border = "0"; top.style.padding = "0"; top.style.background = "transparent";
+      top.appendChild(el("span", "badge " + diagClass(e.level === "error" ? "fail" : e.level === "warn" ? "warn" : "ok"), e.level === "error" ? "\u2715" : e.level === "warn" ? "!" : "\u2713"));
+      const area = e.area || (e.direction === "receive" ? "pushing" : e.direction === "send" ? "pushing" : "log");
+      const outcome = e.outcome || e.step || "";
+      let label = area + (outcome ? " " + outcome : "");
+      if (e.direction && e.step) label = area + " " + (e.direction === "receive" ? "incoming " : "outgoing ") + e.step;
+      if (e.file) label += ": " + e.file;
+      top.appendChild(el("div", "grow name", label));
+      row.appendChild(top);
+      const bits = [];
+      if (e.fp) bits.push(e.fp); else if (e.peer) bits.push(e.peer);
+      if (e.target) bits.push(e.target);
+      if (e.reason) bits.push(e.reason);
+      if (e.bytes) bits.push(fmtBytes(e.bytes));
+      if (e.misses) bits.push("misses " + e.misses);
+      if (e.session) bits.push(e.session);
+      if (e.elapsed_ns) bits.push(Math.round(e.elapsed_ns / 1e6) + " ms");
+      if (bits.length) row.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
+      if (e.error) row.appendChild(el("div", "msg err", e.error));
+      logStack.appendChild(row);
+    }
+    body.appendChild(logStack);
+  }
 }
 function diagClass(status) { return status === "ok" ? "ok" : status === "warn" ? "warn" : status === "fail" ? "err" : ""; }
 function closeDiag() { $("diag").hidden = true; }
@@ -1837,6 +1884,7 @@ $("pair").addEventListener("click", (e) => { if (e.target === $("pair")) closePa
 $("diag-close").addEventListener("click", closeDiag);
 $("diag").addEventListener("click", (e) => { if (e.target === $("diag")) closeDiag(); });
 $("diag-copy").addEventListener("click", () => copyText(diagReport || ""));
+$("diag-copy-log").addEventListener("click", () => copyText(diagLog || ""));
 
 async function submitShare(confirmFlag) {
   const lifetime = $("share-lifetime").value;

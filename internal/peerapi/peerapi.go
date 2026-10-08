@@ -22,6 +22,7 @@ import (
 	"lanyard/internal/inbox"
 	"lanyard/internal/shares"
 	"lanyard/internal/trust"
+	"lanyard/internal/xferlog"
 )
 
 // Authorizer decides what an authenticated peer certificate may do.
@@ -60,6 +61,7 @@ type Server struct {
 	hashes    hashCache
 	rl        rateLimiter
 	log       *slog.Logger
+	xlog      *xferlog.Recorder
 	// mu guards srv and port, which Listen and Serve write while Shutdown and
 	// Port may read from other goroutines.
 	mu        sync.Mutex
@@ -71,6 +73,20 @@ type Server struct {
 
 func NewServer(id *identity.Identity, hello func() discovery.Hello, sh *shares.Manager, tr *trust.Store, auth Authorizer, log *slog.Logger) *Server {
 	return &Server{id: id, hello: hello, shares: sh, trust: tr, auth: auth, log: log}
+}
+
+// SetXferLog attaches the shared transfer recorder so incoming push offers,
+// per-file receipts and completions (and their failures) are written to the
+// desktop log and shown in the diagnostics report.
+func (s *Server) SetXferLog(r *xferlog.Recorder) { s.xlog = r }
+
+// xfer records one transfer entry and mirrors it into the desktop log. Push
+// and pull entries default to their area at the call site.
+func (s *Server) xfer(e xferlog.Entry) {
+	if e.Area == "" {
+		e.Area = xferlog.AreaPushing
+	}
+	s.xlog.Record(s.log, e)
 }
 
 func (s *Server) tlsConfig() *tls.Config {

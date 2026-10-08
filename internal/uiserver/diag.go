@@ -13,6 +13,7 @@ import (
 	"lanyard/internal/discovery"
 	"lanyard/internal/inbox"
 	"lanyard/internal/lanaddr"
+	"lanyard/internal/xferlog"
 )
 
 // diagEnv adapts the running server to the diagnostics checks.
@@ -126,5 +127,24 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
 	checks := diag.Run(ctx, diagEnv{s: s, device: device})
-	writeJSON(w, map[string]any{"checks": checks, "report": diag.Report(checks)})
+	report := diag.Report(checks)
+	// The four diagnostic areas — discovery, pairing, pushing and pulling — are
+	// recorded by the discovery manager, the trust store, the transfer manager,
+	// the peer service and the inbox reaper into one shared recorder. It is
+	// shown in the panel, folded into the report, and offered on its own to
+	// "Copy log".
+	rec := s.d.XferLog
+	if rec == nil && s.d.Transfers != nil {
+		rec = s.d.Transfers.XferLog()
+	}
+	var entries []xferlog.Entry
+	log := ""
+	if rec != nil {
+		entries = rec.Entries()
+		log = rec.Report()
+		if log != "" {
+			report += "\n" + log
+		}
+	}
+	writeJSON(w, map[string]any{"checks": checks, "report": report, "log": log, "transfer_log": entries})
 }

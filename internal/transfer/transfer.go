@@ -30,6 +30,7 @@ import (
 	"lanyard/internal/inbox"
 	"lanyard/internal/peerapi"
 	"lanyard/internal/shares"
+	"lanyard/internal/xferlog"
 )
 
 // Job states (spec §8.3).
@@ -217,6 +218,7 @@ type Manager struct {
 	cfg        *config.Store
 	client     *peerapi.Client
 	log        *slog.Logger
+	xlog       *xferlog.Recorder
 	onChange   func()
 	workers    int
 	slots      chan struct{}
@@ -258,6 +260,23 @@ func New(cfg *config.Store, client *peerapi.Client, log *slog.Logger, workers in
 		backoffMax:   30 * time.Second,
 		jobs:         map[string]*Job{},
 	}
+}
+
+// SetXferLog attaches the shared transfer recorder so offer/file/complete
+// attempts are written to the desktop log and shown in the diagnostics report.
+// A nil recorder leaves logging to the desktop log only.
+func (m *Manager) SetXferLog(r *xferlog.Recorder) { m.xlog = r }
+
+// XferLog returns the attached recorder (may be nil).
+func (m *Manager) XferLog() *xferlog.Recorder { return m.xlog }
+
+// xfer records one transfer entry and mirrors it into the desktop log. Push
+// entries default to the pushing area; downloads set AreaPulling explicitly.
+func (m *Manager) xfer(e xferlog.Entry) {
+	if e.Area == "" {
+		e.Area = xferlog.AreaPushing
+	}
+	m.xlog.Record(m.log, e)
 }
 
 // Load restores jobs from config. Jobs the user paused stay paused and failed
@@ -1118,7 +1137,7 @@ func (m *Manager) run(job *Job) {
 		job.Note = "Peer unreachable. Will resume automatically when it comes back, or press Resume."
 	case firstErr != nil:
 		job.State = StateFailed
-		job.Error = firstErr.Error()
+		job.Error = peerapi.UserMessage(firstErr)
 		job.Note = ""
 	default:
 		job.State = StateDone

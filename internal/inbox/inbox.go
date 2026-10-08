@@ -20,7 +20,9 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"lanyard/internal/identity"
 	"lanyard/internal/shares"
+	"lanyard/internal/xferlog"
 )
 
 // DefaultMaxBytes is the limit applied when the peer has none configured: none.
@@ -290,6 +292,24 @@ type Manager struct {
 
 	done      chan struct{}
 	closeOnce sync.Once
+
+	// xlog records stalled-push removals (the reaper) in the shared four-area
+	// diagnostics log. Nil is a valid no-op.
+	xlog *xferlog.Recorder
+}
+
+// SetXferLog attaches the shared diagnostics recorder.
+func (m *Manager) SetXferLog(r *xferlog.Recorder) { m.xlog = r }
+
+// stallLog records a reaper/failure removal of an incoming push.
+func (m *Manager) stallLog(peerFP, id, reason string) {
+	if m.xlog == nil {
+		return
+	}
+	m.xlog.Record(nil, xferlog.Entry{
+		Area: xferlog.AreaPushing, Level: xferlog.LevelWarn, Outcome: "stall",
+		FP: identity.ShortID(peerFP), Session: id, Reason: reason,
+	})
 }
 
 // ReceivedFile describes one file that finished landing in the Inbox, for the
@@ -461,6 +481,7 @@ func (m *Manager) reapStalled() {
 		return
 	}
 	for _, p := range stalled {
+		m.stallLog(p.PeerFP, p.ID, "the connection stalled")
 		if m.onFail != nil {
 			m.onFail(p.PeerFP, "the connection stalled")
 		}
@@ -483,6 +504,7 @@ func (m *Manager) failPush(id, reason string) bool {
 	if !ok {
 		return false
 	}
+	m.stallLog(p.PeerFP, p.ID, reason)
 	if m.onFail != nil {
 		m.onFail(p.PeerFP, reason)
 	}

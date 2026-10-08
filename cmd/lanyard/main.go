@@ -31,6 +31,7 @@ import (
 	"lanyard/internal/trust"
 	"lanyard/internal/uiserver"
 	"lanyard/internal/update"
+	"lanyard/internal/xferlog"
 )
 
 const version = "1.1.0-beta.5"
@@ -208,14 +209,19 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	shMgr.Start(shStop)
 	defer close(shStop)
 
-	// Transfer jobs.
+	// One shared recorder captures all four diagnostic areas — discovery,
+	// pairing, pushing and pulling — for the desktop log, the rotating log file
+	// and the diagnostics report.
+	xferLog := xferlog.NewWithLogger(500, log)
 	trMgr := transfer.New(cfg, client, log, 3, onChange)
+	trMgr.SetXferLog(xferLog)
 	if err := trMgr.Load(); err != nil {
 		return err
 	}
 
 	// Trust store and Connect/Pair sessions.
 	trustStore := trust.New(cfg, id.DeviceID, onChange)
+	trustStore.SetXferLog(xferLog)
 	if err := trustStore.Load(); err != nil {
 		return err
 	}
@@ -227,6 +233,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	// store; there is no bypass in a shipped build.
 	var auth peerapi.Authorizer = trustStore
 	inboxMgr := inbox.New(inboxDir(dataDir, st.InboxFolder), onChange)
+	inboxMgr.SetXferLog(xferLog)
 	defer inboxMgr.Close()   // stop the stall reaper on shutdown
 	_ = inboxMgr.EnsureDir() // the default ~/LANyard folder is created up front
 	trMgr.SetBandwidthLimit(st.BandwidthLimitMBps)
@@ -244,6 +251,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	}
 	peerSrv = peerapi.NewServer(id, hello, shMgr, trustStore, auth, log)
 	peerSrv.SetInbox(inboxMgr)
+	peerSrv.SetXferLog(xferLog)
 	approvals := approval.New(onChange)
 	peerSrv.SetApprovals(approvals)
 
@@ -302,6 +310,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	disc := discovery.New(discovery.Announcement{
 		Name: st.DeviceName, OS: runtime.GOOS, Port: peerSrv.Port(), DeviceLabel: st.DeviceIDLabel,
 	}, id.DeviceID, client.Probe, log)
+	disc.SetXferLog(xferLog)
 	// A peer with a transfer in flight (either direction) must not be evicted
 	// when liveness probes briefly fail; a busy link can starve the probe.
 	disc.SetActiveTransfer(func(shortID, fingerprint string) bool {
@@ -539,6 +548,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		SetStartOnLogin:     func(enable bool) error { return setStartOnLogin(dataDir, enable) },
 		StartOnLoginEnabled: autostart.Enabled,
 		Log:                 log,
+		XferLog:             xferLog,
 	})
 	uiWant := st.UIPort
 	if uiPortFlag != 0 {

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"lanyard/internal/config"
+	"lanyard/internal/xferlog"
 )
 
 // The beacon is the fallback for networks that block mDNS: a small JSON
@@ -23,6 +24,7 @@ func (m *Manager) startBeacon(ctx context.Context) {
 	pc, err := lc.ListenPacket(ctx, "udp4", hostPort("0.0.0.0", config.BeaconPort))
 	if err != nil {
 		m.log.Warn("beacon listener unavailable (port busy); mDNS and manual connect still work", "err", err)
+		m.xfer(xferlog.Entry{Outcome: "browse", Level: xferlog.LevelWarn, Reason: "beacon listener unavailable", Error: err.Error()})
 		return
 	}
 	conn := pc.(*net.UDPConn)

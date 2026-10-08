@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"lanyard/internal/identity"
+	"lanyard/internal/xferlog"
 )
 
 // Liveness tuning. A peer is evicted only after this many consecutive failed
@@ -47,6 +48,19 @@ type Manager struct {
 	pairedMu     sync.Mutex
 	pairedProbed map[string]time.Time
 	pairedEvery  time.Duration
+
+	// xlog records discovery events (seen/lost, probes, evictions) in the
+	// shared four-area diagnostics log. Nil is a valid no-op.
+	xlog *xferlog.Recorder
+}
+
+// SetXferLog attaches the shared diagnostics recorder.
+func (m *Manager) SetXferLog(r *xferlog.Recorder) { m.xlog = r }
+
+// xfer records one discovery event.
+func (m *Manager) xfer(e xferlog.Entry) {
+	e.Area = xferlog.AreaDiscovery
+	m.xlog.Record(m.log, e)
 }
 
 func New(self Announcement, selfFullID string, probe Prober, log *slog.Logger) *Manager {
@@ -151,6 +165,10 @@ func (m *Manager) handle(a Announcement, ips []string, source string) {
 		return
 	}
 	p := m.reg.upsert(a, usable, source)
+	m.xfer(xferlog.Entry{
+		Outcome: "seen", Level: xferlog.LevelInfo,
+		FP: a.ShortID, Peer: a.Name, Target: hostPort(usable[0], a.Port), Reason: source,
+	})
 	if !p.Verified {
 		m.verifyAsync(p.ShortID)
 	}
@@ -174,7 +192,9 @@ func (m *Manager) verifyAsync(shortID string) {
 	m.wg.Add(1)
 	go func() {
 		defer m.wg.Done()
+		start := time.Now()
 		certID, h, err := m.tryAddrs(addrs, port)
+		elapsed := time.Since(start)
 		m.reg.mu.Lock()
 		defer m.reg.mu.Unlock()
 		p, ok := m.reg.peers[shortID]
@@ -184,14 +204,27 @@ func (m *Manager) verifyAsync(shortID string) {
 		p.probing = false
 		if err != nil {
 			p.fails++
+			m.xfer(xferlog.Entry{
+				Outcome: "probe", Level: xferlog.LevelWarn, FP: shortID,
+				Target: hostPort(addrs[0], port), Elapsed: elapsed, Error: err.Error(),
+			})
 			return
 		}
 		if !strings.HasPrefix(certID, shortID) {
 			m.log.Warn("discarding peer whose certificate does not match its announced ID", "announced", shortID)
+			m.xfer(xferlog.Entry{
+				Outcome: "probe", Level: xferlog.LevelWarn, FP: shortID,
+				Target: hostPort(addrs[0], port), Elapsed: elapsed,
+				Reason: "certificate does not match announced id",
+			})
 			delete(m.reg.peers, shortID)
 			m.reg.notify()
 			return
 		}
+		m.xfer(xferlog.Entry{
+			Outcome: "probe", Level: xferlog.LevelInfo, FP: shortID,
+			Target: hostPort(addrs[0], port), Elapsed: elapsed,
+		})
 		p.fails = 0
 		p.LastSeen = time.Now()
 		if !p.Verified || p.DeviceID != certID {
@@ -225,8 +258,13 @@ func (m *Manager) tryAddrs(addrs []string, port int) (string, *Hello, error) {
 // When expectedFP is set the presented certificate must match it exactly before
 // the peer is recorded, so a pairing link can pin a fingerprint (fail closed).
 func (m *Manager) AddManual(ctx context.Context, host string, port int, expectedFP string) (*Peer, error) {
+	start := time.Now()
 	certID, h, err := m.probe(ctx, host, port)
 	if err != nil {
+		m.xfer(xferlog.Entry{
+			Outcome: "probe", Level: xferlog.LevelWarn,
+			Target: hostPort(host, port), Elapsed: time.Since(start), Error: err.Error(),
+		})
 		return nil, err
 	}
 	if certID == m.selfID {
@@ -240,6 +278,10 @@ func (m *Manager) AddManual(ctx context.Context, host string, port int, expected
 		name, osName, label = h.Name, h.OS, h.DeviceID
 	}
 	short := identity.ShortID(certID)
+	m.xfer(xferlog.Entry{
+		Outcome: "seen", Level: xferlog.LevelInfo, FP: short, Peer: name,
+		Target: hostPort(host, port), Reason: "manual", Elapsed: time.Since(start),
+	})
 	p := m.reg.upsert(Announcement{ShortID: short, DeviceLabel: label, Name: name, OS: osName, Port: port}, []string{host}, "manual")
 	m.reg.mu.Lock()
 	if rp, ok := m.reg.peers[short]; ok {
@@ -281,28 +323,67 @@ func (m *Manager) sweep() {
 // treated as alive regardless of the probe result: its miss counter is cleared
 // and LastSeen refreshed, so a busy link cannot evict it.
 func (m *Manager) probeRegistryPeer(p Peer) {
+	start := time.Now()
 	certID, _, err := m.tryAddrs(p.Addrs, p.Port)
+	elapsed := time.Since(start)
 	active := m.isActive(p.ShortID, p.DeviceID)
+	target := ""
+	if len(p.Addrs) > 0 {
+		target = hostPort(p.Addrs[0], p.Port)
+	}
 	m.reg.mu.Lock()
-	defer m.reg.mu.Unlock()
 	rp, ok := m.reg.peers[p.ShortID]
 	if !ok {
+		m.reg.mu.Unlock()
 		return
 	}
 	if err == nil && strings.HasPrefix(certID, p.ShortID) {
 		rp.fails = 0
 		rp.LastSeen = time.Now()
+		misses := 0
+		m.reg.mu.Unlock()
+		m.xfer(xferlog.Entry{
+			Outcome: "probe", Level: xferlog.LevelInfo, FP: p.ShortID,
+			Target: target, Elapsed: elapsed, Misses: misses,
+		})
 		return
 	}
 	if active {
 		rp.fails = 0
 		rp.LastSeen = time.Now()
+		m.reg.mu.Unlock()
+		m.xfer(xferlog.Entry{
+			Outcome: "guard", Level: xferlog.LevelInfo, FP: p.ShortID,
+			Target: target, Reason: "active transfer; peer kept", Elapsed: elapsed,
+		})
 		return
 	}
 	rp.fails++
-	if rp.fails >= m.evictAfter {
+	misses := rp.fails
+	evicted := misses >= m.evictAfter
+	if evicted {
 		delete(m.reg.peers, p.ShortID)
 		m.reg.notify()
+	}
+	m.reg.mu.Unlock()
+	reason := "liveness probe failed"
+	if err != nil {
+		reason = err.Error()
+	} else if certID != "" {
+		reason = "certificate does not match announced id"
+	}
+	level := xferlog.LevelWarn
+	if evicted {
+		level = xferlog.LevelError
+		m.xfer(xferlog.Entry{
+			Outcome: "evict", Level: level, FP: p.ShortID, Target: target,
+			Misses: misses, Reason: "liveness probes failed", Elapsed: elapsed,
+		})
+	} else {
+		m.xfer(xferlog.Entry{
+			Outcome: "probe", Level: level, FP: p.ShortID, Target: target,
+			Misses: misses, Reason: reason, Elapsed: elapsed,
+		})
 	}
 }
 
@@ -333,8 +414,24 @@ func (m *Manager) probePairedPeers() {
 		m.wg.Add(1)
 		go func(pp PairedPeer, short string) {
 			defer m.wg.Done()
+			start := time.Now()
+			target := ""
+			if len(pp.Addrs) > 0 {
+				target = hostPort(pp.Addrs[0], pp.Port)
+			}
 			certID, h, err := m.tryAddrs(pp.Addrs, pp.Port)
+			elapsed := time.Since(start)
 			if err != nil || (certID != pp.Fingerprint && !strings.HasPrefix(certID, short)) {
+				reason := "paired probe failed"
+				if err != nil {
+					reason = err.Error()
+				} else {
+					reason = "certificate does not match paired fingerprint"
+				}
+				m.xfer(xferlog.Entry{
+					Outcome: "probe", Level: xferlog.LevelWarn, FP: short,
+					Target: target, Reason: reason, Elapsed: elapsed,
+				})
 				return
 			}
 			m.reg.upsert(Announcement{ShortID: short, DeviceLabel: pp.Name, Name: pp.Name, Port: pp.Port}, pp.Addrs, "paired")
@@ -353,6 +450,10 @@ func (m *Manager) probePairedPeers() {
 			}
 			m.reg.mu.Unlock()
 			m.reg.notify()
+			m.xfer(xferlog.Entry{
+				Outcome: "seen", Level: xferlog.LevelInfo, FP: short, Peer: pp.Name,
+				Target: target, Reason: "paired-probe", Elapsed: elapsed,
+			})
 		}(pp, short)
 	}
 }
@@ -390,7 +491,15 @@ func (m *Manager) removeIfIdle(shortID string) {
 			rp.LastSeen = time.Now()
 		}
 		m.reg.mu.Unlock()
+		m.xfer(xferlog.Entry{
+			Outcome: "guard", Level: xferlog.LevelInfo, FP: shortID,
+			Reason: "active transfer; peer kept on goodbye",
+		})
 		return
 	}
 	m.reg.remove(shortID)
+	m.xfer(xferlog.Entry{
+		Outcome: "lost", Level: xferlog.LevelInfo, FP: shortID,
+		Reason: "mDNS goodbye or expiry",
+	})
 }

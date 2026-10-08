@@ -11,11 +11,13 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
 	"lanyard/internal/config"
 	"lanyard/internal/identity"
+	"lanyard/internal/xferlog"
 )
 
 // Modes and session states.
@@ -142,6 +144,29 @@ type Store struct {
 	// invites maps one-time QR pairing nonces to their expiry.
 	invites   map[string]time.Time
 	inviteTTL time.Duration
+
+	// xlog records pairing/session lifecycle events in the shared four-area
+	// diagnostics log. Nil is a valid no-op.
+	xlog *xferlog.Recorder
+}
+
+// SetXferLog attaches the shared diagnostics recorder.
+func (s *Store) SetXferLog(r *xferlog.Recorder) { s.xlog = r }
+
+// pairLog records one pairing-area event. The recorder carries the desktop
+// logger, so no logger is passed here. age is optional (0 unknown).
+func (s *Store) pairLog(level xferlog.Level, outcome, peerFP, sessionID, reason string, age time.Duration, err error) {
+	if s.xlog == nil {
+		return
+	}
+	e := xferlog.Entry{
+		Area: xferlog.AreaPairing, Level: level, Outcome: outcome,
+		FP: identity.ShortID(peerFP), Session: sessionID, Reason: reason, Age: age,
+	}
+	if err != nil {
+		e.Error = err.Error()
+	}
+	s.xlog.Record(nil, e)
 }
 
 func New(cfg *config.Store, selfFP string, onChange func()) *Store {
@@ -362,12 +387,21 @@ func (s *Store) Unpair(fp string) bool {
 	_, ok := s.paired[fp]
 	delete(s.paired, fp)
 	// Drop any live session with the same peer too.
+	dropped := 0
 	for id, sess := range s.sessions {
 		if sess.PeerFP == fp {
 			delete(s.sessions, id)
+			dropped++
 		}
 	}
 	s.mu.Unlock()
+	reason := "unpaired"
+	if !ok {
+		reason = "not paired"
+	} else if dropped > 0 {
+		reason = fmt.Sprintf("unpaired; %d live session(s) closed", dropped)
+	}
+	s.pairLog(xferlog.LevelInfo, "unpair", fp, "", reason, 0, nil)
 	if ok {
 		s.persist()
 		s.onChange()
@@ -462,16 +496,23 @@ func (s *Store) CreateIncoming(mode, peerFP, peerName, peerDevice, peerNonce str
 	defer s.mu.Unlock()
 	s.sweepLocked(now)
 	if len(s.sessions) >= MaxSessions {
-		return nil, errors.New("too many sessions")
+		err := errors.New("too many sessions")
+		s.pairLog(xferlog.LevelWarn, "refuse", peerFP, "", "session limit reached", 0, err)
+		return nil, err
 	}
 	pending := 0
-	for _, sess := range s.sessions {
+	var pendingID string
+	var pendingAge time.Duration
+	for id, sess := range s.sessions {
 		if sess.PeerFP == peerFP && sess.Status == StatusPending {
 			pending++
+			pendingID, pendingAge = id, now.Sub(sess.CreatedAt)
 		}
 	}
 	if pending >= MaxPendingPerPeer {
-		return nil, errors.New("a request from this device is already waiting")
+		err := errors.New("a request from this device is already waiting")
+		s.pairLog(xferlog.LevelWarn, "refuse", peerFP, pendingID, "request already waiting", pendingAge, err)
+		return nil, err
 	}
 	sess := &Session{
 		ID: sessionID(), Mode: mode, Incoming: true,
@@ -481,6 +522,7 @@ func (s *Store) CreateIncoming(mode, peerFP, peerName, peerDevice, peerNonce str
 		CreatedAt: now, UpdatedAt: now,
 	}
 	s.sessions[sess.ID] = sess
+	s.pairLog(xferlog.LevelInfo, "request", peerFP, sess.ID, mode+" requested", 0, nil)
 	if fn := s.onIncoming; fn != nil {
 		snap := *sess
 		go fn(&snap)
@@ -501,6 +543,7 @@ func (s *Store) CreateOutgoing(mode, peerFP, peerName, peerDevice string, reques
 	s.mu.Lock()
 	s.sessions[sess.ID] = sess
 	s.mu.Unlock()
+	s.pairLog(xferlog.LevelInfo, "request", peerFP, sess.ID, mode+" requested", 0, nil)
 	s.onChange()
 	return sess
 }
@@ -550,17 +593,23 @@ func (s *Store) Accept(id string, granted Permissions) (*Session, error) {
 	sess, ok := s.sessions[id]
 	if !ok || !sess.Incoming {
 		s.mu.Unlock()
-		return nil, errors.New("no such request")
+		err := errors.New("no such request")
+		s.pairLog(xferlog.LevelWarn, "refuse", "", id, "no such request", 0, err)
+		return nil, err
 	}
 	if sess.Status != StatusPending {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("request is %s", sess.Status)
+		err := fmt.Errorf("request is %s", sess.Status)
+		s.pairLog(xferlog.LevelWarn, "refuse", sess.PeerFP, id, "request not pending", 0, err)
+		return nil, err
 	}
 	sess.Granted = granted
 	sess.Status = StatusAccepted
 	sess.UpdatedAt = time.Now()
+	fp := sess.PeerFP
 	snap := *sess
 	s.mu.Unlock()
+	s.pairLog(xferlog.LevelInfo, "accept", fp, id, "granted "+permString(granted), 0, nil)
 	// The trust entry is created only when the initiator confirms the SAS
 	// (see ActivateRemote), so a cancelled or unconfirmed pairing leaves no
 	// entry on either side.
@@ -577,22 +626,28 @@ func (s *Store) ActivateRemote(id string) (*Session, error) {
 	sess, ok := s.sessions[id]
 	if !ok || !sess.Incoming {
 		s.mu.Unlock()
-		return nil, errors.New("no such session")
+		err := errors.New("no such session")
+		s.pairLog(xferlog.LevelWarn, "confirm", "", id, "no such session", 0, err)
+		return nil, err
 	}
 	if sess.Status == StatusPending {
 		s.mu.Unlock()
-		return nil, errors.New("the request was not accepted")
+		err := errors.New("the request was not accepted")
+		s.pairLog(xferlog.LevelWarn, "confirm", sess.PeerFP, id, "not accepted yet", 0, err)
+		return nil, err
 	}
 	sess.Status = StatusActive
 	sess.UpdatedAt = time.Now()
+	fp, mode := sess.PeerFP, sess.Mode
 	snap := *sess
 	s.mu.Unlock()
-	if sess.Mode == ModePair {
+	if mode == ModePair {
 		s.Pair(Entry{
-			DeviceID: sess.PeerDevice, Name: sess.PeerName, Fingerprint: sess.PeerFP,
+			DeviceID: sess.PeerDevice, Name: sess.PeerName, Fingerprint: fp,
 			Mode: ModePair, Permissions: sess.Granted,
 		})
 	}
+	s.pairLog(xferlog.LevelInfo, "confirm", fp, id, "confirmed "+mode, 0, nil)
 	s.onChange()
 	return &snap, nil
 }
@@ -604,22 +659,28 @@ func (s *Store) Confirm(id string) (*Session, error) {
 	sess, ok := s.sessions[id]
 	if !ok || sess.Incoming {
 		s.mu.Unlock()
-		return nil, errors.New("no such session")
+		err := errors.New("no such session")
+		s.pairLog(xferlog.LevelWarn, "confirm", "", id, "no such session", 0, err)
+		return nil, err
 	}
 	if sess.Status != StatusAccepted && sess.Status != StatusActive {
 		s.mu.Unlock()
-		return nil, fmt.Errorf("session is %s", sess.Status)
+		err := fmt.Errorf("session is %s", sess.Status)
+		s.pairLog(xferlog.LevelWarn, "confirm", sess.PeerFP, id, "session not accepted", 0, err)
+		return nil, err
 	}
 	sess.Status = StatusActive
 	sess.UpdatedAt = time.Now()
+	fp, mode := sess.PeerFP, sess.Mode
 	snap := *sess
 	s.mu.Unlock()
-	if sess.Mode == ModePair {
+	if mode == ModePair {
 		s.Pair(Entry{
-			DeviceID: sess.PeerDevice, Name: sess.PeerName, Fingerprint: sess.PeerFP,
+			DeviceID: sess.PeerDevice, Name: sess.PeerName, Fingerprint: fp,
 			Mode: ModePair, Permissions: sess.Requested,
 		})
 	}
+	s.pairLog(xferlog.LevelInfo, "confirm", fp, id, "confirmed "+mode, 0, nil)
 	s.onChange()
 	return &snap, nil
 }
@@ -628,16 +689,48 @@ func (s *Store) Confirm(id string) (*Session, error) {
 func (s *Store) SetStatus(id, status, errMsg string) bool {
 	s.mu.Lock()
 	sess := s.sessions[id]
+	var fp string
 	if sess != nil {
 		sess.Status = status
 		sess.Error = errMsg
 		sess.UpdatedAt = time.Now()
+		fp = sess.PeerFP
 	}
 	s.mu.Unlock()
 	if sess != nil {
+		outcome := "status"
+		level := xferlog.LevelInfo
+		switch status {
+		case StatusRejected:
+			outcome, level = "refuse", xferlog.LevelWarn
+		case StatusClosed:
+			outcome = "close"
+		case StatusExpired:
+			outcome = "expire"
+		}
+		var err error
+		if errMsg != "" {
+			err = errors.New(errMsg)
+		}
+		s.pairLog(level, outcome, fp, id, "session "+status, 0, err)
 		s.onChange()
 	}
 	return sess != nil
+}
+
+// permString renders granted permissions compactly for the log.
+func permString(p Permissions) string {
+	parts := make([]string, 0, 2)
+	if p.Browse {
+		parts = append(parts, "browse")
+	}
+	if p.Push {
+		parts = append(parts, "push")
+	}
+	if len(parts) == 0 {
+		return "none"
+	}
+	return strings.Join(parts, "+")
 }
 
 // Reject marks an incoming request rejected.
@@ -647,12 +740,14 @@ func (s *Store) Reject(id string) bool { return s.SetStatus(id, StatusRejected, 
 func (s *Store) Close(id string) bool {
 	s.mu.Lock()
 	sess, ok := s.sessions[id]
+	var fp, mode string
 	if ok {
+		fp, mode = sess.PeerFP, sess.Mode
 		delete(s.sessions, id)
 	}
 	s.mu.Unlock()
 	if ok {
-		_ = sess
+		s.pairLog(xferlog.LevelInfo, "close", fp, id, "closed "+mode, 0, nil)
 		s.onChange()
 	}
 	return ok
@@ -670,8 +765,10 @@ func (s *Store) EndAfterTransfer(fp string) (remoteID string, ended bool) {
 		return "", false
 	}
 	remoteID = sess.RemoteID
+	fp, id := sess.PeerFP, sess.ID
 	delete(s.sessions, sess.ID)
 	s.mu.Unlock()
+	s.pairLog(xferlog.LevelInfo, "close", fp, id, "closed after transfer", 0, nil)
 	s.onChange()
 	return remoteID, true
 }
@@ -685,8 +782,10 @@ func (s *Store) CloseAfterTransfer(id string) bool {
 		s.mu.Unlock()
 		return false
 	}
+	fp := sess.PeerFP
 	delete(s.sessions, id)
 	s.mu.Unlock()
+	s.pairLog(xferlog.LevelInfo, "close", fp, id, "closed after transfer", 0, nil)
 	s.onChange()
 	return true
 }
@@ -795,37 +894,38 @@ func (s *Store) Sweep() bool {
 
 func (s *Store) sweepLocked(now time.Time) bool {
 	changed := false
+	expire := func(id string, sess *Session, reason string) {
+		age := now.Sub(sess.UpdatedAt)
+		s.pairLog(xferlog.LevelInfo, "expire", sess.PeerFP, id, reason, age, nil)
+		delete(s.sessions, id)
+		changed = true
+	}
 	for id, sess := range s.sessions {
 		switch sess.Status {
 		case StatusPending:
 			if now.Sub(sess.CreatedAt) > PairingTTL {
-				delete(s.sessions, id)
-				changed = true
+				expire(id, sess, "pairing request expired")
 			}
 		case StatusAccepted:
 			// A handshake accepted but never confirmed must not linger.
 			if now.Sub(sess.UpdatedAt) > PairingTTL {
-				delete(s.sessions, id)
-				changed = true
+				expire(id, sess, "accepted request not confirmed")
 			}
 		case StatusActive:
 			switch sess.Mode {
 			case ModeConnect:
 				if now.Sub(sess.UpdatedAt) > SessionInactivity {
-					delete(s.sessions, id)
-					changed = true
+					expire(id, sess, "connect session idle")
 				}
 			case ModePair:
 				// The trust entry outlives the handshake; drop the session itself.
 				if now.Sub(sess.UpdatedAt) > PairingTTL {
-					delete(s.sessions, id)
-					changed = true
+					expire(id, sess, "pairing session expired")
 				}
 			}
 		case StatusRejected, StatusClosed, StatusExpired:
 			if now.Sub(sess.UpdatedAt) > 5*time.Minute {
-				delete(s.sessions, id)
-				changed = true
+				expire(id, sess, "closed session reaped")
 			}
 		}
 	}

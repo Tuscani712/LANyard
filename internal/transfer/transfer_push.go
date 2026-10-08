@@ -12,9 +12,13 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"lanyard/internal/identity"
 	"lanyard/internal/inbox"
+	"lanyard/internal/peerapi"
+	"lanyard/internal/xferlog"
 )
 
 // PushParams describes a push into a peer's Inbox.
@@ -105,11 +109,22 @@ func (m *Manager) runPush(job *Job) {
 	for _, f := range job.Files {
 		reqs = append(reqs, inbox.FileReq{RelPath: f.Rel, Size: f.Size, MTime: time.Unix(0, f.MTime)})
 	}
+	offerAt := time.Now()
 	offer, err := m.client.PushOffer(ctx, job.Host, job.Port, job.PeerID, reqs)
 	if err != nil {
+		m.xfer(xferlog.Entry{
+			Direction: xferlog.DirectionSend, Step: xferlog.StepOffer, Level: xferlog.LevelError,
+			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+			Elapsed: time.Since(offerAt), Error: err.Error(),
+		})
 		m.pushFail(job, err)
 		return
 	}
+	m.xfer(xferlog.Entry{
+		Direction: xferlog.DirectionSend, Step: xferlog.StepOffer, Level: xferlog.LevelInfo,
+		Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+		Elapsed: time.Since(offerAt),
+	})
 	offsets := map[string]int64{}
 	for _, f := range offer.Files {
 		offsets[f.RelPath] = f.Offset
@@ -185,13 +200,23 @@ func (m *Manager) runPush(job *Job) {
 		m.onChange()
 		return
 	}
+	completeAt := time.Now()
 	if err := m.client.PushComplete(ctx, job.Host, job.Port, job.PeerID, offer.PushID, "", "", true); err != nil {
 		// The whole push is not finalized on the receiver: the job must not be
 		// marked Done. Surface it like any other transfer failure.
-		m.log.Error("final push complete failed", "job", job.ID, "peer", job.PeerName, "err", err)
+		m.xfer(xferlog.Entry{
+			Direction: xferlog.DirectionSend, Step: xferlog.StepComplete, Level: xferlog.LevelError,
+			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+			Elapsed: time.Since(completeAt), Error: err.Error(),
+		})
 		m.pushFail(job, fmt.Errorf("could not finalize the transfer: %w", err))
 		return
 	}
+	m.xfer(xferlog.Entry{
+		Direction: xferlog.DirectionSend, Step: xferlog.StepComplete, Level: xferlog.LevelInfo,
+		Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+		Bytes: job.Total, Elapsed: time.Since(completeAt),
+	})
 	job.mu.Lock()
 	job.running = false
 	job.State = StateDone
@@ -236,20 +261,42 @@ func (m *Manager) pushOne(ctx context.Context, job *Job, pushID string, f *FileJ
 	job.lastProgress = time.Now()
 	job.mu.Unlock()
 	m.onChange()
-	written, err := m.client.PushFile(ctx, job.Host, job.Port, job.PeerID, pushID, f.Rel, offset, f.Size,
-		&pushCountingReader{m: m, job: job, f: f, r: body, base: offset})
+	putAt := time.Now()
+	cr := &pushCountingReader{m: m, job: job, f: f, r: body, base: offset}
+	written, err := m.client.PushFile(ctx, job.Host, job.Port, job.PeerID, pushID, f.Rel, offset, f.Size, cr)
 	if err != nil {
+		m.xfer(xferlog.Entry{
+			Direction: xferlog.DirectionSend, Step: xferlog.StepFile, Level: xferlog.LevelError,
+			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+			File: filepath.Base(f.Rel), Bytes: cr.sent.Load(), Elapsed: time.Since(putAt), Error: err.Error(),
+		})
 		return err
 	}
+	m.xfer(xferlog.Entry{
+		Direction: xferlog.DirectionSend, Step: xferlog.StepFile, Level: xferlog.LevelInfo,
+		Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+		File: filepath.Base(f.Rel), Bytes: written, Elapsed: time.Since(putAt),
+	})
 	if offset+written < f.Size {
 		if _, err := io.Copy(h, src); err != nil {
 			return err
 		}
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
+	completeAt := time.Now()
 	if err := m.client.PushComplete(ctx, job.Host, job.Port, job.PeerID, pushID, f.Rel, sum, false); err != nil {
+		m.xfer(xferlog.Entry{
+			Direction: xferlog.DirectionSend, Step: xferlog.StepComplete, Level: xferlog.LevelError,
+			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+			File: filepath.Base(f.Rel), Elapsed: time.Since(completeAt), Error: err.Error(),
+		})
 		return err
 	}
+	m.xfer(xferlog.Entry{
+		Direction: xferlog.DirectionSend, Step: xferlog.StepComplete, Level: xferlog.LevelInfo,
+		Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+		File: filepath.Base(f.Rel), Bytes: f.Size, Elapsed: time.Since(completeAt),
+	})
 	job.mu.Lock()
 	setFileDone(job, f, f.Size)
 	f.State = FileDone
@@ -272,15 +319,15 @@ type pushCountingReader struct {
 	f    *FileJob
 	r    io.Reader
 	base int64
-	sent int64
+	sent atomic.Int64
 }
 
 func (c *pushCountingReader) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
 	if n > 0 {
-		c.sent += int64(n)
+		c.sent.Add(int64(n))
 		c.job.mu.Lock()
-		setFileDone(c.job, c.f, c.base+c.sent)
+		setFileDone(c.job, c.f, c.base+c.sent.Load())
 		c.job.lastProgress = time.Now()
 		c.m.bumpSpeed(c.job)
 		c.job.mu.Unlock()
@@ -293,7 +340,7 @@ func (m *Manager) pushFail(job *Job, err error) {
 	job.mu.Lock()
 	job.running = false
 	job.State = StateFailed
-	job.Error = err.Error()
+	job.Error = peerapi.UserMessage(err)
 	job.UpdatedAt = time.Now()
 	job.FinishedAt = job.UpdatedAt
 	job.mu.Unlock()
@@ -301,6 +348,14 @@ func (m *Manager) pushFail(job *Job, err error) {
 	m.onChange()
 	m.fireFail(job)
 }
+
+// pushTarget is the host:port a push is talking to, for the transfer log.
+func pushTarget(host string, port int) string {
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+// pushFP is the peer short fingerprint for the transfer log (never the full id).
+func pushFP(job *Job) string { return identity.ShortID(job.PeerID) }
 
 // pushSmall sends a small file and its digest in one request; the receiver
 // verifies and finalizes it in the same call.
@@ -317,9 +372,20 @@ func (m *Manager) pushSmall(ctx context.Context, job *Job, pushID string, f *Fil
 	if mbps := m.bandwidth(); mbps > 0 {
 		body = &throttleReader{r: body, mbps: mbps, start: time.Now()}
 	}
+	putAt := time.Now()
 	if err := m.client.PushFileSHA(ctx, job.Host, job.Port, job.PeerID, pushID, f.Rel, body, f.Size, hex.EncodeToString(sum[:])); err != nil {
+		m.xfer(xferlog.Entry{
+			Direction: xferlog.DirectionSend, Step: xferlog.StepFile, Level: xferlog.LevelError,
+			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+			File: filepath.Base(f.Rel), Elapsed: time.Since(putAt), Error: err.Error(),
+		})
 		return err
 	}
+	m.xfer(xferlog.Entry{
+		Direction: xferlog.DirectionSend, Step: xferlog.StepFile, Level: xferlog.LevelInfo,
+		Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+		File: filepath.Base(f.Rel), Bytes: f.Size, Elapsed: time.Since(putAt),
+	})
 	job.mu.Lock()
 	setFileDone(job, f, f.Size)
 	f.State = FileDone
