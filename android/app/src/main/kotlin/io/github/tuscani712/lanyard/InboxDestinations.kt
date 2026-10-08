@@ -6,6 +6,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import androidx.annotation.RequiresApi
+import io.github.tuscani712.lanyard.core.InboxPaths
 import io.github.tuscani712.lanyard.core.PushDestination
 import java.io.File
 import java.io.IOException
@@ -26,15 +27,17 @@ fun defaultInboxDestination(context: Context): PushDestination =
     }
 
 /** The folder name shown next to Downloads. */
-const val INBOX_FOLDER_NAME = "LANyard"
+const val INBOX_FOLDER_NAME = InboxPaths.FOLDER_NAME
 
 /** MediaStore Downloads/LANyard on Android 10+. */
 @RequiresApi(Build.VERSION_CODES.Q)
 private class MediaStoreInboxDestination(private val context: Context) : PushDestination {
+    override fun folder(): String = InboxPaths.DEFAULT_LABEL
+
     override fun place(relPath: String, spool: File, size: Long): String {
         val sub = relPath.substringBeforeLast('/', "")
         val name = relPath.substringAfterLast('/').ifEmpty { "received-file" }
-        val relative = "Download/$INBOX_FOLDER_NAME" + if (sub.isEmpty()) "" else "/$sub"
+        val relative = InboxPaths.defaultRelative(sub)
 
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
@@ -70,6 +73,8 @@ private class MediaStoreInboxDestination(private val context: Context) : PushDes
 
 /** App-specific external files dir on Android 9 and below (no permission). */
 private class AppExternalInboxDestination(private val context: Context) : PushDestination {
+    override fun folder(): String = InboxPaths.DEFAULT_LABEL
+
     override fun place(relPath: String, spool: File, size: Long): String {
         val root = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), INBOX_FOLDER_NAME)
         val dir = relPath.substringBeforeLast('/', "").let { if (it.isEmpty()) root else File(root, it) }

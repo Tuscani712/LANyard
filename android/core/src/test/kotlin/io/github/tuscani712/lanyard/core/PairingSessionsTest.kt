@@ -133,9 +133,36 @@ class PairingSessionsTest {
     fun onePendingPerPeer() {
         val s = sessions()
         val peer = "22".repeat(32)
-        s.createIncoming("pair", peer, "P", "p", "h", nonce(), Permissions())
+        // Connect requests keep the flood cap; only a fresh pair request supersedes.
+        s.createIncoming("connect", peer, "P", "p", "h", nonce(), Permissions())
         val ex = assertThrows(PeerHttpException::class.java) {
-            s.createIncoming("pair", peer, "P", "p", "h", nonce(), Permissions())
+            s.createIncoming("connect", peer, "P", "p", "h", nonce(), Permissions())
+        }
+        assertEquals(409, ex.code)
+    }
+
+    @Test
+    fun rePairSupersedesALeftoverPendingRequest() {
+        val s = sessions()
+        val peer = "77".repeat(32)
+        val first = s.createIncoming("pair", peer, "P", "p", "h", nonce(), Permissions())
+        // A newer pair request from the same device replaces the stale one
+        // instead of being refused, so a re-pair after an abandoned handshake
+        // is never trapped by the old prompt.
+        val second = s.createIncoming("pair", peer, "P", "p", "h", nonce(), Permissions())
+        assertTrue(second.id != first.id, "the newer request must be a new session")
+        val pendingForPeer = s.pending().count { it.peerFp == peer }
+        assertEquals(1, pendingForPeer, "only the newer pair request remains pending")
+    }
+
+    @Test
+    fun connectingWhileAPairRequestIsPendingIsStillCapped() {
+        val s = sessions()
+        val peer = "78".repeat(32)
+        s.createIncoming("pair", peer, "P", "p", "h", nonce(), Permissions())
+        // A connect request is not a re-pair and keeps the one-pending-per-peer rule.
+        val ex = assertThrows(PeerHttpException::class.java) {
+            s.createIncoming("connect", peer, "P", "p", "h", nonce(), Permissions())
         }
         assertEquals(409, ex.code)
     }

@@ -11,7 +11,7 @@ import io.github.tuscani712.lanyard.core.PairingFlow
 import io.github.tuscani712.lanyard.core.PeerAddresses
 import io.github.tuscani712.lanyard.core.DiscoveredAddr
 import io.github.tuscani712.lanyard.core.PeerClient
-import io.github.tuscani712.lanyard.core.PeerStatusException
+import io.github.tuscani712.lanyard.core.PeerErrors
 import io.github.tuscani712.lanyard.core.ProbeClient
 import io.github.tuscani712.lanyard.core.SelfFilter
 import io.github.tuscani712.lanyard.core.TrustStore
@@ -25,6 +25,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -91,6 +92,16 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     private val _state = MutableStateFlow(DevicesUiState())
     val state: StateFlow<DevicesUiState> = _state.asStateFlow()
 
+    init {
+        // A peer that refused a request with "not paired" removed us; surface it
+        // in the same Unpaired dialog the deliberate unpair uses.
+        viewModelScope.launch {
+            PeerService.unpairedByPeer.collect { message ->
+                if (message != null) _state.update { it.copy(unpairNotice = message) }
+            }
+        }
+    }
+
     fun refreshPaired() {
         viewModelScope.launch {
             _state.update { it.copy(refreshing = true) }
@@ -98,6 +109,8 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
             val own = SelfFilter.ownShortId(identity?.deviceId.orEmpty())
             val paired = withContext(Dispatchers.IO) {
                 if (identity == null) return@withContext emptyList()
+                // A device unpaired while offline may be reachable now.
+                PeerService.retryPendingUnpairs()
                 // A desktop that paired *to* this phone is stored without a port
                 // (the request carries none). Fill it from mDNS once discovered.
                 val discovered = _state.value.nearby.map { DiscoveredAddr(it.shortId, it.host, it.port) }
@@ -123,6 +136,11 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                     PeerService.diagnostics.record("[discovery] peer=${device.shortId.take(8)} seen addr=${device.host}:${device.port} source=mdns result=ok")
                     _state.update { current ->
                         current.copy(nearby = (current.nearby.filterNot { it.shortId == device.shortId } + device))
+                    }
+                    // A device unpaired while it was offline: deliver now that we
+                    // can see its address.
+                    viewModelScope.launch(Dispatchers.IO) {
+                        PeerService.retryPendingUnpairFor(device.shortId, device.host, device.port)
                     }
                     // A newly seen device may supply the address of a paired peer.
                     refreshPaired()
@@ -189,6 +207,9 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 store.remove(peer.fingerprint)
                 TransferManager.cancelForPeer(peer.fingerprint)
+                // The peer is offline: keep the notification so it is retried
+                // when that device is next seen.
+                if (ok) PeerService.clearPendingUnpair(peer.fingerprint) else PeerService.rememberPendingUnpair(peer)
                 ok
             }
             PeerService.diagnostics.record("[pairing] peer=${peer.fingerprint.take(8)} unpair source=phone remote=$remoteOk result=ok")
@@ -205,7 +226,10 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun dismissUnpairNotice() = _state.update { it.copy(unpairNotice = null) }
+    fun dismissUnpairNotice() {
+        _state.update { it.copy(unpairNotice = null) }
+        PeerService.acknowledgeUnpairedByPeer()
+    }
 
     fun openPeer(peer: PairedPeer) {
         _state.update { it.copy(detail = PeerDetail(peer = peer, loading = true)) }
@@ -350,10 +374,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         PairResult.InvalidLink -> "That is not a valid pairing link."
     }
 
-    private fun friendly(t: Throwable): String = when (t) {
-        is PeerStatusException -> if (t.code == 403) "This device is not permitted to browse that peer." else "The peer answered with an error (HTTP ${t.code})."
-        else -> "Could not reach the device."
-    }
+    private fun friendly(t: Throwable): String = PeerErrors.userMessage(t)
 
     private fun JsonObject.str(key: String): String =
         get(key)?.takeIf { !it.isJsonNull }?.asString ?: ""

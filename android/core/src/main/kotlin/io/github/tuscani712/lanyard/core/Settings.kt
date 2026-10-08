@@ -25,6 +25,12 @@ data class AppSettings(
     val downloadFolder: String? = null,
     /** Bandwidth cap in MB/s; 0 means unlimited. */
     val bandwidthLimitMBps: Int = 0,
+    /**
+     * The port the peer listener bound last time, tried first on the next
+     * launch so a paired desktop's stored address stays valid. 0 means no
+     * preference (use an ephemeral port).
+     */
+    val preferredPort: Int = 0,
 )
 
 /** Persists [AppSettings]. Implementations must never throw on read. */

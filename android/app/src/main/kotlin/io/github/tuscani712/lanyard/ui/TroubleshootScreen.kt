@@ -3,6 +3,8 @@ package io.github.tuscani712.lanyard.ui
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -43,8 +45,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.core.content.FileProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import io.github.tuscani712.lanyard.DevicesViewModel
+import io.github.tuscani712.lanyard.PeerService
 import io.github.tuscani712.lanyard.core.CheckResult
 import io.github.tuscani712.lanyard.core.CheckStatus
 import io.github.tuscani712.lanyard.core.DiagTarget
@@ -129,16 +133,22 @@ fun TroubleshootScreen(padding: PaddingValues, vm: DevicesViewModel, onBack: () 
                         copyToClipboard(
                             context,
                             "LANyard log",
-                            Diagnostics.copyLog(io.github.tuscani712.lanyard.PeerService.diagnostics.snapshot()),
+                            Diagnostics.copyLog(
+                                PeerService.diagnostics.snapshot(),
+                                PeerService.diagnostics.persistedLog(),
+                            ),
                         )
                     }) { Text("Copy log") }
                     TextButton(onClick = {
                         copyToClipboard(
                             context,
                             "LANyard diagnostics",
-                            Diagnostics.copyReport(results, io.github.tuscani712.lanyard.PeerService.diagnostics.snapshot()),
+                            Diagnostics.copyReport(results, PeerService.diagnostics.snapshot()),
                         )
                     }) { Text("Copy report") }
+                }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    TextButton(onClick = { shareLogFile(context) }) { Text("Share log file") }
                 }
             }
         }
@@ -175,4 +185,27 @@ private fun statusVisual(status: CheckStatus): Pair<ImageVector, Color> = when (
 private fun copyToClipboard(context: Context, label: String, value: String) {
     val manager = context.getSystemService(ClipboardManager::class.java) ?: return
     manager.setPrimaryClip(ClipData.newPlainText(label, value))
+}
+
+/** Sends the durable log file through the system share sheet via FileProvider. */
+private fun shareLogFile(context: Context) {
+    val file = PeerService.logFile()
+    if (file == null || !file.exists()) {
+        Toast.makeText(context, "No log file yet", Toast.LENGTH_SHORT).show()
+        return
+    }
+    val uri = runCatching {
+        FileProvider.getUriForFile(context, context.packageName + ".fileprovider", file)
+    }.getOrNull()
+    if (uri == null) {
+        Toast.makeText(context, "Could not share the log file", Toast.LENGTH_SHORT).show()
+        return
+    }
+    val intent = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_STREAM, uri)
+        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    }
+    runCatching { context.startActivity(Intent.createChooser(intent, "Share log file")) }
+        .onFailure { Toast.makeText(context, "No app can share the log file", Toast.LENGTH_SHORT).show() }
 }

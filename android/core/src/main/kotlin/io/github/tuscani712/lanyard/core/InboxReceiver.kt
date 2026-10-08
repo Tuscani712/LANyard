@@ -14,6 +14,12 @@ import java.util.concurrent.TimeUnit
  */
 fun interface PushDestination {
     fun place(relPath: String, spool: File, size: Long): String
+
+    /**
+     * The folder this destination writes into, for the Transfers row and the
+     * diagnostics log. Empty when the destination cannot name itself.
+     */
+    fun folder(): String = ""
 }
 
 /** One file in an accepted push. */
@@ -86,8 +92,29 @@ class InboxReceiver(
         var total: Long,
         val createdAt: Long,
     ) {
-        /** True while a body is actually being read for this push. */
-        @Volatile var inFlight: Boolean = false
+        // Which file bodies are actually being read right now. A push can have
+        // several concurrent bodies (the desktop opens parallel PUTs), and one
+        // body finishing must not make the others look idle: the reaper judges
+        // a push by the short stall timeout only while at least one body is in
+        // flight, and by the long idle timeout once they are all done.
+        private val inFlightFiles: MutableSet<String> =
+            java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+        /** Number of file bodies currently being read for this push. */
+        val inFlightCount: Int get() = inFlightFiles.size
+
+        /** True while any body is actually being read for this push. */
+        val inFlight: Boolean get() = inFlightFiles.isNotEmpty()
+
+        /** Marks [rel]'s body as started so the reaper uses the stall timeout. */
+        fun bodyStarted(rel: String) {
+            inFlightFiles.add(rel)
+        }
+
+        /** Marks [rel]'s body as finished; other bodies keep the push in flight. */
+        fun bodyFinished(rel: String) {
+            inFlightFiles.remove(rel)
+        }
 
         /** Set by the reaper so a read still blocked aborts on its next byte. */
         @Volatile var dead: Boolean = false
@@ -127,6 +154,29 @@ class InboxReceiver(
     }
 
     /**
+     * Runs a UI/diagnostic callback so an unexpected exception inside it can
+     * never escape back into the body read and turn a healthy transfer into a
+     * 500 that closes the socket. The event is logged, with its top stack frame,
+     * and then ignored. A callback is a notification, never a participant in the
+     * transfer's correctness.
+     */
+    private fun safeCallback(event: String, block: () -> Unit) {
+        try {
+            block()
+        } catch (t: Throwable) {
+            runCatching {
+                diag("[push] callback-failed event=$event ${t.javaClass.simpleName}: ${t.message?.take(160)} at ${topFrame(t)}")
+            }
+        }
+    }
+
+    /** The top stack frame of [t], for the diagnostics log. */
+    private fun topFrame(t: Throwable): String {
+        val f = t.stackTrace.firstOrNull() ?: return "unknown"
+        return "${f.className.substringAfterLast('.')}.${f.methodName}(${f.fileName}:${f.lineNumber})"
+    }
+
+    /**
      * Fails every session whose body has made no progress for the short stall
      * timeout, or that has sat idle with no body in flight for the much longer
      * idle timeout. The `.lanpart` spool is deliberately kept so a re-offer can
@@ -151,8 +201,8 @@ class InboxReceiver(
         for ((id, fp, reason) in reaped) {
             diag("[push] peer=${Display.shortFp(fp)} stalled id=$id reason=$reason")
         }
-        onChange()
-        for ((id, _, reason) in reaped) onFailed(id, reason)
+        safeCallback("change") { onChange() }
+        for ((id, _, reason) in reaped) safeCallback("failed") { onFailed(id, reason) }
         return reaped.size
     }
 
@@ -211,8 +261,8 @@ class InboxReceiver(
             if (sessions.remove(old.id) != null) {
                 old.dead = true
                 diag("[push] peer=${Display.shortFp(peerFp)} offer superseded session=${old.id} age=${clock() - old.createdAt}ms")
-                onChange()
-                onFailed(old.id, "replaced by a new offer from the same device")
+                safeCallback("change") { onChange() }
+                safeCallback("failed") { onFailed(old.id, "replaced by a new offer from the same device") }
             }
         }
 
@@ -229,8 +279,8 @@ class InboxReceiver(
         val sess = Session(id, peerFp, Display.safeName(peerName), files, total, clock())
         sessions[id] = sess
         diag("[push] peer=${Display.shortFp(peerFp)} offer accepted id=$id files=${files.size} bytes=$total resumed=${files.values.count { it.done > 0 }}")
-        onChange()
-        onOffer(id, peerFp, files.size, total)
+        safeCallback("change") { onChange() }
+        safeCallback("offer") { onOffer(id, peerFp, files.size, total) }
         val offsets = files.mapValues { it.value.done }
         return PushOffer(id, true, if (maxBytes > 0) maxBytes else 0, offsets)
     }
@@ -266,7 +316,7 @@ class InboxReceiver(
             writeStream(s, st, 0, input, sha256)
             st.placedName = place(st)
             synchronized(this) { st.done = st.size }
-            onChange()
+            safeCallback("change") { onChange() }
             st.size
         } catch (e: Exception) {
             fail(s.id, reasonFor(e))
@@ -295,7 +345,7 @@ class InboxReceiver(
         st.placedName = place(st)
         synchronized(this) { st.done = st.size }
         diag("[push] peer=${Display.shortFp(peerFp)} file complete id=$id cls=${Display.pathClass(rel)} size=${st.size}")
-        onChange()
+        safeCallback("change") { onChange() }
         return st
     }
 
@@ -308,8 +358,8 @@ class InboxReceiver(
         val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
         for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
         diag("[push] peer=${Display.shortFp(peerFp)} complete id=$id files=${s.files.size} bytes=${s.total}")
-        onChange()
-        onDone(id, peerFp, s.files.size, s.total)
+        safeCallback("change") { onChange() }
+        safeCallback("done") { onDone(id, peerFp, s.files.size, s.total) }
         return true
     }
 
@@ -322,8 +372,8 @@ class InboxReceiver(
         val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
         for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
         diag("[push] peer=${Display.shortFp(peerFp)} cancelled id=$id spool=deleted")
-        onChange()
-        onCancelled(id, "The transfer was cancelled")
+        safeCallback("change") { onChange() }
+        safeCallback("cancelled") { onCancelled(id, "The transfer was cancelled") }
         return true
     }
 
@@ -342,8 +392,8 @@ class InboxReceiver(
         val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
         for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
         diag("[push] peer=${Display.shortFp(s.peerFp)} cancelled id=$id source=local spool=deleted")
-        onChange()
-        onCancelled(id, "The transfer was cancelled")
+        safeCallback("change") { onChange() }
+        safeCallback("cancelled") { onCancelled(id, "The transfer was cancelled") }
         return s.peerFp
     }
 
@@ -359,8 +409,8 @@ class InboxReceiver(
     fun fail(id: String, reason: String): Boolean {
         val s = sessions.remove(id) ?: return false
         diag("[push] peer=${Display.shortFp(s.peerFp)} failed id=$id reason=$reason")
-        onChange()
-        onFailed(id, reason)
+        safeCallback("change") { onChange() }
+        safeCallback("failed") { onFailed(id, reason) }
         return true
     }
 
@@ -421,10 +471,11 @@ class InboxReceiver(
         val out = java.io.FileOutputStream(st.part, offset > 0)
         val limit = st.size - offset
         var written = 0L
-        // Mark the body in flight so the reaper judges it by the short stall
+        // Mark this body in flight so the reaper judges it by the short stall
         // timeout, and touch the deadline on every byte so a slow (but live)
-        // transfer is never reaped.
-        s.inFlight = true
+        // transfer is never reaped. Tracking is per file: a push with several
+        // concurrent bodies stays in flight until the last one finishes.
+        s.bodyStarted(st.relPath)
         s.lastProgress = clock()
         try {
             val buf = ByteArray(256 * 1024)
@@ -441,7 +492,7 @@ class InboxReceiver(
                 digest.update(buf, 0, n)
                 written += n
                 synchronized(this) { st.done = offset + written; s.lastProgress = clock() }
-                onProgress(s.id, offset + written, st.size)
+                safeCallback("progress") { onProgress(s.id, offset + written, st.size) }
             }
             if (written >= limit && input.read() >= 0) {
                 // One byte past the offered size: truncate the part and refuse.
@@ -453,7 +504,7 @@ class InboxReceiver(
             out.fd.sync()
         } finally {
             runCatching { out.close() }
-            s.inFlight = false
+            s.bodyFinished(st.relPath)
             s.lastProgress = clock()
         }
         if (offset == 0L && st.size > 0 && st.part.length() != st.size && wantSha != null) {
@@ -485,9 +536,17 @@ class InboxReceiver(
         synchronized(placeLock) {
             val name = destination.place(st.relPath, st.part, st.size)
             st.part.delete()
+            val folder = destination.folder()
+            diag(
+                "[push] placed cls=${Display.pathClass(st.relPath)} " +
+                    "dest=${if (folder.isBlank()) "unknown" else folder}",
+            )
             return name
         }
     }
+
+    /** The folder received files are placed into, for the UI and the log. */
+    fun destinationFolder(): String = destination.folder()
 
     private fun hashFile(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")

@@ -7,7 +7,9 @@ package io.github.tuscani712.lanyard.core
  * fingerprints (only a short prefix), no tokens, no secrets. The report is
  * redacted again on the way out by [Redaction].
  *
- * Not persisted: it is diagnostic breadcrumbs for the current app run only.
+ * A [RotatingWriter] can be attached (Batch 4F): every event is then also
+ * redacted and appended to a durable, rotating file, so the log survives a
+ * restart. The in-memory ring stays the fast, current-run view.
  */
 class ServerDiagnostics(
     private val capacity: Int = 1000,
@@ -20,6 +22,10 @@ class ServerDiagnostics(
     @Volatile
     var onRecord: ((String) -> Unit)? = null
 
+    /** An optional durable, rotating file. Lines are redacted before they hit it. */
+    @Volatile
+    var file: RotatingWriter? = null
+
     fun record(event: String) {
         val line = timestamp() + " " + event
         synchronized(lock) {
@@ -27,12 +33,27 @@ class ServerDiagnostics(
             events.addLast(line)
         }
         onRecord?.invoke(line)
+        file?.append(Redaction.redact(line))
     }
 
     /** The events oldest-first. */
     fun snapshot(): List<String> = synchronized(lock) { events.toList() }
 
     fun clear() = synchronized(lock) { events.clear() }
+
+    /**
+     * Marks the start of this run in the durable log so restarts are visible.
+     * No-op when no file is attached.
+     */
+    fun markAppStart(epochMillis: Long = clock()) {
+        file?.append(Diagnostics.appStartDivider(epochMillis))
+    }
+
+    /**
+     * The durable log oldest-first, previous runs included, or the empty string
+     * when no file is attached. Already redacted at write time.
+     */
+    fun persistedLog(): String = file?.readAll().orEmpty()
 
     private fun timestamp(): String {
         val ms = clock()

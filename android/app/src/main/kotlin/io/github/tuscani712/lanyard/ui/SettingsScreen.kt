@@ -68,6 +68,7 @@ import io.github.tuscani712.lanyard.IdentityHolder
 import io.github.tuscani712.lanyard.PairedStatus
 import io.github.tuscani712.lanyard.SettingsHolder
 import io.github.tuscani712.lanyard.core.Bandwidth
+import io.github.tuscani712.lanyard.core.InboxPaths
 import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.SpeedUnit
 import io.github.tuscani712.lanyard.core.ThemeMode
@@ -196,7 +197,7 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("Default download folder", style = MaterialTheme.typography.bodyLarge)
                 Text(
-                    folderName ?: "Downloads/LANyard (default)",
+                    folderName ?: "${InboxPaths.DEFAULT_LABEL} (default)",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

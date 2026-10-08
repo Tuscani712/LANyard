@@ -57,6 +57,40 @@ class PeerClient(
     private val base = "https://$host:$port/api/v1"
     private val socketFactory = Tls.socketFactory(identity, expectedFingerprint)
 
+    /**
+     * Whether this client pins the peer to a known certificate. [Tls.socketFactory]
+     * refuses the handshake unless the peer's presented Device ID equals
+     * [expectedFingerprint], so any HTTP response — and therefore any 403 seen
+     * below — can only come from the verified, pinned peer. Never act on a
+     * signal from an unpinned identity.
+     */
+    private val pinned: Boolean = expectedFingerprint.isNotBlank()
+
+    companion object {
+        /**
+         * Called when a peer we pinned by its certificate answers a request with
+         * a 403 whose reason is exactly "not paired": it has dropped the pairing
+         * on its side, so the app removes the stale local entry and tells the
+         * person. Wired by [io.github.tuscani712.lanyard.PeerService]. The
+         * argument is the fingerprint of the peer that refused. A permission
+         * refusal (e.g. "pull not permitted") or a revoke we initiated ourselves
+         * does not fire this.
+         */
+        @Volatile
+        var onNotPaired: ((String) -> Unit)? = null
+    }
+
+    private fun maybeNotifyNotPaired(code: Int, body: String) {
+        if (code != 403) return
+        // Gate the auto-unpair on the pinned, verified identity: the trust
+        // manager already enforces this for the handshake, and we require it
+        // again here so no unpinned path can ever delete a pairing.
+        if (!pinned) return
+        if (PeerErrors.isNotPaired(PeerStatusException(code, body))) {
+            onNotPaired?.invoke(expectedFingerprint)
+        }
+    }
+
     fun hello(): PeerHello {
         val json = requestJson("GET", "/hello")
         return PeerHello(
@@ -200,7 +234,10 @@ class PeerClient(
             val status = conn.responseCode
             val text = (if (status in 200..299) conn.inputStream else conn.errorStream)
                 ?.bufferedReader()?.use { it.readText() } ?: ""
-            if (status !in 200..299) throw PeerStatusException(status, text)
+            if (status !in 200..299) {
+                maybeNotifyNotPaired(status, text)
+                throw PeerStatusException(status, text)
+            }
         } finally {
             runCatching { source.close() }
         }
@@ -226,7 +263,7 @@ class PeerClient(
      * also removes it there. The peer only ever drops the caller's own entry, so
      * this needs no extra authorization and is safe to repeat.
      */
-    fun revokeTrust(): JsonObject = requestJson("POST", "/trust/revoke", "{}")
+    fun revokeTrust(): JsonObject = requestJson("POST", "/trust/revoke", "{}", notifyNotPaired = false)
 
     /**
      * Notifies the peer of an unpair, idempotently. A `403`/"not paired" means
@@ -285,8 +322,13 @@ class PeerClient(
 
     // --- transport ---
 
-    private fun requestJson(method: String, path: String, body: String? = null): JsonObject =
-        JsonParser.parseString(request(method, path, body?.toByteArray(), emptyMap())).asJsonObject
+    private fun requestJson(
+        method: String,
+        path: String,
+        body: String? = null,
+        notifyNotPaired: Boolean = true,
+    ): JsonObject =
+        JsonParser.parseString(request(method, path, body?.toByteArray(), emptyMap(), notifyNotPaired)).asJsonObject
 
     private fun requestArray(method: String, path: String): JsonArray =
         JsonParser.parseString(request(method, path, null, emptyMap())).asJsonArray
@@ -296,12 +338,16 @@ class PeerClient(
         path: String,
         body: ByteArray?,
         headers: Map<String, String>,
+        notifyNotPaired: Boolean = true,
     ): String {
         val conn = open(method, path, body, headers)
         val status = conn.responseCode
         val stream = if (status in 200..299) conn.inputStream else conn.errorStream
         val text = stream?.bufferedReader()?.use { it.readText() } ?: ""
-        if (status !in 200..299) throw PeerStatusException(status, text)
+        if (status !in 200..299) {
+            if (notifyNotPaired) maybeNotifyNotPaired(status, text)
+            throw PeerStatusException(status, text)
+        }
         return text
     }
 
@@ -334,6 +380,7 @@ class PeerClient(
         val status = conn.responseCode
         if (status !in 200..299) {
             val text = conn.errorStream?.bufferedReader()?.use { it.readText() } ?: ""
+            maybeNotifyNotPaired(status, text)
             throw PeerStatusException(status, text)
         }
         return conn.inputStream

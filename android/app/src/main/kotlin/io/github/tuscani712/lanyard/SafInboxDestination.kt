@@ -17,6 +17,13 @@ class SafInboxDestination(
     private val context: Context,
     private val treeUri: () -> Uri?,
 ) : PushDestination {
+    /** The chosen folder's display name, for the Transfers row and the log. */
+    override fun folder(): String =
+        treeUri()?.let { runCatching { DocumentFile.fromTreeUri(context, it)?.name }.getOrNull() }
+            ?.takeIf { it.isNotBlank() }
+            ?.let { "$it (chosen folder)" }
+            ?: "the chosen folder"
+
     override fun place(relPath: String, spool: File, size: Long): String {
         val uri = treeUri() ?: throw IOException("Choose a download folder in Settings first.")
         val root = DocumentFile.fromTreeUri(context, uri)

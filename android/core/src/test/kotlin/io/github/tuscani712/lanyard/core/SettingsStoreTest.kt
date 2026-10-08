@@ -25,6 +25,7 @@ class SettingsStoreTest {
         assertTrue(store.load().wifiOnly)
         assertNull(store.load().downloadFolder)
         assertEquals(0, store.load().bandwidthLimitMBps)
+        assertEquals(0, store.load().preferredPort)
     }
 
     @Test
@@ -39,6 +40,7 @@ class SettingsStoreTest {
                 wifiOnly = false,
                 downloadFolder = "content://com.android.externalstorage.documents/tree/primary%3ADownload",
                 bandwidthLimitMBps = 7,
+                preferredPort = 4242,
             ),
         )
 
@@ -50,6 +52,7 @@ class SettingsStoreTest {
         assertFalse(reopened.wifiOnly)
         assertEquals("content://com.android.externalstorage.documents/tree/primary%3ADownload", reopened.downloadFolder)
         assertEquals(7, reopened.bandwidthLimitMBps)
+        assertEquals(4242, reopened.preferredPort)
     }
 
     @Test

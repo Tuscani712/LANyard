@@ -218,11 +218,24 @@ object Diagnostics {
         return Redaction.redact(checks + events)
     }
 
+    /** The divider written to the durable log when the app starts. */
+    fun appStartDivider(epochMillis: Long): String =
+        "===== app start ${java.time.Instant.ofEpochMilli(epochMillis)} ====="
+
     /**
-     * The full in-memory event log on its own, redacted, for the "Copy log"
-     * action on the troubleshoot screen.
+     * The full log for the "Copy log" action on the troubleshoot screen. When a
+     * durable [persistedLog] is present it wins: it already carries every run,
+     * each separated by an app-start divider and the current run included. The
+     * in-memory ring is only a fallback for when no file could be written.
      */
-    fun copyLog(serverEvents: List<String>): String = Redaction.redact(serverEvents.joinToString("\n"))
+    fun copyLog(serverEvents: List<String>, persistedLog: String = ""): String {
+        val body = if (persistedLog.isNotBlank()) {
+            persistedLog.trimEnd()
+        } else {
+            serverEvents.joinToString("\n")
+        }
+        return Redaction.redact(body)
+    }
 }
 
 /** Removes secrets from report text: tokens, invites and full fingerprints. */

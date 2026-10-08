@@ -14,6 +14,7 @@ import io.github.tuscani712.lanyard.core.DownloadTarget
 import io.github.tuscani712.lanyard.core.MeteredNetwork
 import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PeerClient
+import io.github.tuscani712.lanyard.core.PeerErrors
 import io.github.tuscani712.lanyard.core.PushResult
 import io.github.tuscani712.lanyard.core.PushSession
 import io.github.tuscani712.lanyard.core.PushSource
@@ -312,7 +313,7 @@ object TransferManager {
             PeerClient(peer.host, peer.port, identity, peer.fingerprint).sendSnippet(text)
             null
         } catch (e: Exception) {
-            e.message ?: "could not send text"
+            PeerErrors.userMessage(e)
         }
         if (failure == null) end(id, TransferState.Done, "Text sent") else end(id, TransferState.Failed, failure)
     }
@@ -339,7 +340,7 @@ object TransferManager {
                     isCancelled = { cancel.get() },
                 )
             } catch (e: Exception) {
-                PushResult.Failed(e.message ?: "send failed")
+                PushResult.Failed(PeerErrors.userMessage(e))
             }
             cancels.remove(id)
             finish(id, result)
@@ -375,7 +376,7 @@ object TransferManager {
                 isCancelled = { cancel.get() },
             )
         } catch (e: Exception) {
-            DownloadResult.Failed(e.message ?: "download failed")
+            DownloadResult.Failed(PeerErrors.userMessage(e))
         }
         cancels.remove(id)
         finishDownload(id, result)

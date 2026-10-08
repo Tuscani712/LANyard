@@ -98,11 +98,11 @@ class PeerServer(
     /** Unpaired connections currently parked waiting for their next request. */
     fun idleUnpairedConnections(): Int = idleUnpaired.get()
 
-    fun start(identity: Identity, hello: (Int) -> JsonObject): Int {
+    fun start(identity: Identity, preferredPort: Int = 0, hello: (Int) -> JsonObject): Int {
         stop()
         this.hello = hello
         val ctx = Tls.serverContext(identity)
-        val ss = ctx.serverSocketFactory.createServerSocket(0) as SSLServerSocket
+        val ss = bindServerSocket(ctx, preferredPort)
         ss.needClientAuth = true
         ss.enabledProtocols = arrayOf("TLSv1.3")
 
@@ -119,6 +119,24 @@ class PeerServer(
         port = ss.localPort
         Thread({ acceptLoop(ss, executor) }, "lanyard-peer-accept").apply { isDaemon = true }.start()
         return port
+    }
+
+    /**
+     * Binds [preferredPort] when it is a usable port and still free, else an
+     * ephemeral one. A stable port means a desktop's stored address stays valid
+     * across phone launches; an ephemeral fallback keeps the app starting when
+     * the port is taken.
+     */
+    private fun bindServerSocket(ctx: javax.net.ssl.SSLContext, preferredPort: Int): SSLServerSocket {
+        val factory = ctx.serverSocketFactory
+        if (preferredPort in 1..65535) {
+            try {
+                return factory.createServerSocket(preferredPort) as SSLServerSocket
+            } catch (_: Exception) {
+                // The preferred port is taken; fall back to an ephemeral one.
+            }
+        }
+        return factory.createServerSocket(0) as SSLServerSocket
     }
 
     fun stop() {
@@ -180,6 +198,16 @@ class PeerServer(
         e is java.net.SocketException -> "client-reset"
         e is java.io.IOException -> "client-reset"
         else -> "error:" + e.javaClass.simpleName
+    }
+
+    /**
+     * The top stack frame of [e], so a logged failure names the exact line, not
+     * only the message. The frame is a class/method/file:line triple; no file
+     * contents or user paths are involved.
+     */
+    private fun topFrame(e: Throwable): String {
+        val f = e.stackTrace.firstOrNull() ?: return "unknown"
+        return "${f.className.substringAfterLast('.')}.${f.methodName}(${f.fileName}:${f.lineNumber})"
     }
 
     /** A person-readable reason for the diagnostics report. */
@@ -354,7 +382,7 @@ class PeerServer(
                     // reused; a small request can.
                     val mustClose = closing || fileBody
                     respond(out, 500, errorJson("could not save the file on this device"), mustClose)
-                    logResp(500, head, fp, started, "${e.javaClass.simpleName}: ${e.message?.take(160)}")
+                    logResp(500, head, fp, started, "${e.javaClass.simpleName}: ${e.message?.take(160)} at ${topFrame(e)}")
                     if (mustClose) return "handler-error"
                 }
                 if (closing) return closeWhy!!

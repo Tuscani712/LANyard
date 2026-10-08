@@ -117,6 +117,21 @@ class PairingSessions(
         sweep()
         // Caps are checked before the one-time invite is spent.
         if (sessions.size >= MAX_SESSIONS) throw PeerHttpException(503, "too many sessions")
+        // A fresh pair request replaces a leftover pending pairing from the same
+        // device (for example a re-pair after a stale or abandoned handshake).
+        // Refusing would trap the person: the old prompt may be long gone from
+        // their screen while the session lingers. Connect requests keep the
+        // flood cap.
+        if (mode == MODE_PAIR) {
+            val stale = sessions.values.filter {
+                it.peerFp.equals(peerFp, ignoreCase = true) &&
+                    it.status == STATUS_PENDING && it.mode == MODE_PAIR
+            }
+            for (s in stale) {
+                sessions.remove(s.id)
+                diag("[pairing] peer=${Display.shortFp(peerFp)} supersede id=${s.id} replaced by a newer pair request")
+            }
+        }
         val pendingFromPeer = sessions.values.count { it.peerFp == peerFp && it.status == STATUS_PENDING }
         if (pendingFromPeer >= MAX_PENDING_PER_PEER) {
             throw PeerHttpException(409, "a request from this device is already waiting")
