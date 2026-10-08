@@ -6,6 +6,7 @@ import androidx.documentfile.provider.DocumentFile
 import com.google.gson.JsonObject
 import io.github.tuscani712.lanyard.core.ApprovalOutcome
 import io.github.tuscani712.lanyard.core.BackgroundListenerPolicy
+import io.github.tuscani712.lanyard.core.DiagLevel
 import io.github.tuscani712.lanyard.core.Display
 import io.github.tuscani712.lanyard.core.Identity
 import io.github.tuscani712.lanyard.core.InboxReceiver
@@ -18,6 +19,7 @@ import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PeerClient
 import io.github.tuscani712.lanyard.core.PeerServer
 import io.github.tuscani712.lanyard.core.PendingUnpair
+import io.github.tuscani712.lanyard.core.PendingUnpairRetry
 import io.github.tuscani712.lanyard.core.PendingUnpairStore
 import io.github.tuscani712.lanyard.core.JsonFilePendingUnpairStore
 import io.github.tuscani712.lanyard.core.Permissions
@@ -28,7 +30,6 @@ import io.github.tuscani712.lanyard.core.ServerDiagnostics
 import io.github.tuscani712.lanyard.core.ShareServer
 import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.core.Unpair
-import io.github.tuscani712.lanyard.core.UnpairRetry
 import io.github.tuscani712.lanyard.net.AndroidMeteredNetwork
 import io.github.tuscani712.lanyard.net.NetAddrs
 import io.github.tuscani712.lanyard.net.NsdAdvertiser
@@ -37,10 +38,12 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeoutOrNull
@@ -67,6 +70,7 @@ object PeerService {
     private var initialized = false
     private lateinit var trustStore: TrustStore
     private lateinit var pendingUnpairs: PendingUnpairStore
+    private lateinit var unpairRetries: PendingUnpairRetry
     private lateinit var sessionStore: PairingSessions
     private lateinit var inviteStore: PairInvites
     private lateinit var receiver: InboxReceiver
@@ -121,7 +125,14 @@ object PeerService {
      * saw. Never contains file contents, full fingerprints or secrets.
      */
     val diagnostics = ServerDiagnostics().apply {
-        onRecord = { line -> android.util.Log.d("lanyard-diag", line) }
+        onRecord = { level, line ->
+            when (level) {
+                DiagLevel.Debug -> android.util.Log.v("lanyard-diag", line)
+                DiagLevel.Info -> android.util.Log.d("lanyard-diag", line)
+                DiagLevel.Warn -> android.util.Log.w("lanyard-diag", line)
+                DiagLevel.Error -> android.util.Log.e("lanyard-diag", line)
+            }
+        }
     }
 
     /** The durable diagnostics file, or null until [init] ran. */
@@ -153,22 +164,31 @@ object PeerService {
     }
 
     /** Records an unpair notification that could not be delivered, for retry. */
-    fun rememberPendingUnpair(peer: PairedPeer) {
+    fun rememberPendingUnpair(peer: PairedPeer, generation: Long) {
         if (!initialized) return
-        pendingUnpairs.upsert(
+        val stored = pendingUnpairs.upsertIfCurrent(
             PendingUnpair(peer.fingerprint, peer.name, peer.host, peer.port, System.currentTimeMillis()),
+            generation,
         )
-        diagnostics.record("[pairing] peer=${peer.fingerprint.take(8)} unpair pending retry")
+        if (stored) {
+            diagnostics.record("[pairing] peer=${peer.fingerprint.take(8)} unpair pending retry")
+        } else {
+            diagnostics.record("[pairing] peer=${peer.fingerprint.take(8)} unpair retry ignored; already notified")
+        }
     }
+
+    /** The delivery generation for a pending unpair, captured before a notify attempt. */
+    fun pendingUnpairGeneration(fingerprint: String): Long =
+        if (initialized) pendingUnpairs.deliveryGeneration(fingerprint) else 0L
 
     fun clearPendingUnpair(fingerprint: String) {
         if (initialized) pendingUnpairs.remove(fingerprint)
     }
 
-    /** Retries every undelivered unpair notification. */
+    /** Retries every undelivered unpair notification now. */
     fun retryPendingUnpairs() {
         if (!initialized) return
-        UnpairRetry.retry(pendingUnpairs, IdentityHolder.identity) { diagnostics.record(it) }
+        unpairRetries.onPeerReachable()
     }
 
     /**
@@ -177,10 +197,23 @@ object PeerService {
      */
     fun retryPendingUnpairFor(shortId: String, host: String, port: Int) {
         if (!initialized) return
-        UnpairRetry.matchByShortId(pendingUnpairs, shortId)?.let { p ->
-            pendingUnpairs.upsert(p.copy(host = host, port = port))
-        }
-        UnpairRetry.retry(pendingUnpairs, IdentityHolder.identity) { diagnostics.record(it) }
+        unpairRetries.onPeerReachable(shortId, host, port)
+    }
+
+    /**
+     * One of the "peer reachable" signals fired (a successful hello either way,
+     * an inbound handshake, an mDNS sighting). Retries pending unpairs off the
+     * caller's thread, since the notify is blocking TLS.
+     */
+    fun onPeerReachable(shortId: String? = null, host: String? = null, port: Int? = null) {
+        if (!initialized) return
+        lifetimeScope.launch(Dispatchers.IO) { unpairRetries.onPeerReachable(shortId, host, port) }
+    }
+
+    /** The app came to the foreground: pending unpairs may now be deliverable. */
+    fun onAppForeground() {
+        if (!initialized) return
+        lifetimeScope.launch(Dispatchers.IO) { unpairRetries.onPeerReachable() }
     }
 
     fun init(context: Context) {
@@ -195,6 +228,14 @@ object PeerService {
         diagnostics.markAppStart()
         trustStore = JsonFileTrustStore(File(app.filesDir, "trust/peers.json"))
         pendingUnpairs = JsonFilePendingUnpairStore(File(app.filesDir, "trust/pending-unpair.json"))
+        // Every delivery consults the current pairing, so a revoke queued before
+        // a re-pair is refused instead of unpairing the fresh device.
+        unpairRetries = PendingUnpairRetry(
+            store = pendingUnpairs,
+            identity = { IdentityHolder.identity },
+            trust = trustStore,
+            diag = { diagnostics.record(it) },
+        )
         // Any pinned client that sees a generic 403 means that peer dropped us,
         // so the stale local pairing is removed and the person is told.
         PeerClient.onNotPaired = { fp -> onPeerRefusedPairing(fp) }
@@ -203,6 +244,8 @@ object PeerService {
             trust = trustStore,
             onChange = { publish() },
             diag = { diagnostics.record(it) },
+            // A successful (re-)pair forgets any unpair queued for that peer.
+            onPaired = { fp -> pendingUnpairs.remove(fp) },
         )
         inviteStore = PairInvites()
         spoolDir = File(app.filesDir, "spool").apply { mkdirs() }
@@ -228,9 +271,10 @@ object PeerService {
                 TransferManager.noteReceiveStarted(pushId, trustStore.find(fp)?.name?.takeIf { it.isNotBlank() } ?: "A device", fp, "Inbox", total)
             },
             onProgress = { pushId, done, total -> TransferManager.noteReceiveProgress(pushId, done, total) },
+            onFinishing = { pushId, bytes -> TransferManager.noteFinishing(pushId, bytes) },
             onDone = { pushId, _, files, _ ->
-                val where = receiver.destinationFolder().takeIf { it.isNotBlank() }?.let { " into $it" } ?: ""
-                TransferManager.noteReceiveDone(pushId, "Received $files file(s)$where")
+                val folder = receiver.destinationFolder().takeIf { it.isNotBlank() }
+                TransferManager.noteReceiveDone(pushId, "Received $files file(s)", folder)
             },
             onCancelled = { pushId, reason -> TransferManager.noteReceiveFailed(pushId, reason) },
             onFailed = { pushId, reason -> TransferManager.noteReceiveFailed(pushId, reason) },
@@ -255,6 +299,23 @@ object PeerService {
         }.getOrNull().orEmpty()
         initialized = true
         watchLifetime()
+        startUnpairRetryTimer()
+    }
+
+    /**
+     * While any pending-unpair record exists, retry it every
+     * [PendingUnpairRetry.RETRY_INTERVAL_MS]. The timer is a safety net for a
+     * peer that returns without any hello, handshake or mDNS signal.
+     */
+    private fun startUnpairRetryTimer() {
+        lifetimeScope.launch {
+            while (isActive) {
+                delay(PendingUnpairRetry.RETRY_INTERVAL_MS)
+                if (unpairRetries.hasPending()) {
+                    runCatching { unpairRetries.tick() }
+                }
+            }
+        }
     }
 
     /**
@@ -281,6 +342,9 @@ object PeerService {
         if (!initialized) init(context)
         // Foregrounded again before a deferred stop ran: keep listening.
         lifetimePolicy.foreground()
+        // The app coming forward is itself a "peer reachable" moment: a peer
+        // unpaired while offline may be back now. Off the main thread.
+        onAppForeground()
         if (server != null) return
         val id = IdentityHolder.identity ?: return
         val app = context.applicationContext
@@ -296,6 +360,8 @@ object PeerService {
             wifiOnly = { SettingsHolder.settings.value.wifiOnly },
             approval = pushApproval,
             onUnpair = { trustStore.remove(it) },
+            // A peer that just handshook with us is reachable: retry its unpair.
+            onPeerReachable = { fp -> onPeerReachable(fp.take(16)) },
             shares = ShareServer(shareSource, diag = { diagnostics.record(it) }).also { shareServer = it },
             diagnostics = diagnostics,
         )
@@ -311,11 +377,8 @@ object PeerService {
             SettingsHolder.update { it.copy(preferredPort = port) }
         }
         diagnostics.record("[discovery] peer-server started port=$port")
-        advertiser = NsdAdvertiser(app, diag = { diagnostics.record(it) })
+        advertiser = NsdAdvertiser(app, diag = { msg, level -> diagnostics.record(msg, level) })
             .also { it.start(id.deviceId.take(16), txt(id, port), port, trigger = "lifecycle") }
-        // A device unpaired while offline may be reachable again now. Off the
-        // main thread: the retry does blocking TLS.
-        lifetimeScope.launch(Dispatchers.IO) { retryPendingUnpairs() }
     }
 
     /**

@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
@@ -53,6 +54,9 @@ import io.github.tuscani712.lanyard.DevicesViewModel
 import io.github.tuscani712.lanyard.PeerDetail
 import io.github.tuscani712.lanyard.ShareItem
 import io.github.tuscani712.lanyard.TreeItem
+import io.github.tuscani712.lanyard.core.PeerDetailBody
+import io.github.tuscani712.lanyard.core.UnpairPrompt
+import io.github.tuscani712.lanyard.core.peerDetailBody
 
 @Composable
 fun PeerDetailScreen(padding: PaddingValues, vm: DevicesViewModel) {
@@ -82,19 +86,27 @@ fun PeerDetailScreen(padding: PaddingValues, vm: DevicesViewModel) {
             }
         }
 
-        when {
-            detail.loading -> CenterMessage("Loading…", spinner = true)
-            detail.error != null && detail.openShare == null -> CenterMessage(detail.error!!)
-            detail.openShare == null -> DevicePage(detail, vm)
-            else -> TreeView(
-                share = detail.openShare!!,
-                path = detail.treePath,
-                items = detail.tree,
-                loading = detail.treeLoading,
-                error = detail.error,
-                onBack = vm::backToShares,
-                onOpenPath = vm::openPath,
-            )
+        when (peerDetailBody(loading = detail.loading, openShare = detail.openShare != null)) {
+            PeerDetailBody.LOADING -> CenterMessage("Loading…", spinner = true)
+            // The error/offline case is deliberately a normal peer page, not a
+            // bare message: Unpair and its confirmation (and Back-to-list) must
+            // stay reachable when a peer cannot be reached.
+            PeerDetailBody.PEER_PAGE -> DevicePage(detail, vm)
+            PeerDetailBody.SHARE_TREE -> {
+                // Back inside a share walks up the folder hierarchy, then to the
+                // share list, then closes the detail; it never exits the app.
+                BackHandler { vm.detailBack() }
+                TreeView(
+                    share = detail.openShare!!,
+                    path = detail.treePath,
+                    items = detail.tree,
+                    loading = detail.treeLoading,
+                    error = detail.error,
+                    onBack = vm::backToShares,
+                    onUp = vm::treeUp,
+                    onOpenPath = vm::openPath,
+                )
+            }
         }
     }
 }
@@ -166,6 +178,11 @@ private fun PeerActions(detail: PeerDetail, vm: DevicesViewModel) {
     }
     val ensureNotifications = rememberNotificationPermission()
     var text by rememberSaveable { mutableStateOf("") }
+    var prompt by remember { mutableStateOf(UnpairPrompt()) }
+
+    // Back closes the unpair confirm first (the dialog also consumes Back), and
+    // otherwise returns to the Devices list rather than exiting the app.
+    BackHandler(enabled = !prompt.isConfirming) { vm.closePeer() }
 
     Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
         Button(
@@ -195,6 +212,26 @@ private fun PeerActions(detail: PeerDetail, vm: DevicesViewModel) {
                 enabled = text.isNotBlank(),
             ) { Text("Send") }
         }
+        Spacer(Modifier.height(12.dp))
+        OutlinedButton(
+            onClick = { prompt = prompt.request(detail.peer) },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Text("Unpair this device")
+        }
+    }
+
+    if (prompt.isConfirming) {
+        ConfirmDialog(
+            title = "Unpair ${detail.peer.name.ifEmpty { "this device" }}?",
+            message = "This removes the pairing on both devices. Any transfer to it in progress is cancelled.",
+            confirmLabel = "Unpair",
+            onConfirm = {
+                prompt.confirmed()?.let(vm::unpair)
+                prompt = prompt.confirm()
+            },
+            onDismiss = { prompt = prompt.cancel() },
+        )
     }
 }
 
@@ -245,6 +282,7 @@ private fun TreeView(
     loading: Boolean,
     error: String?,
     onBack: () -> Unit,
+    onUp: () -> Unit,
     onOpenPath: (String) -> Unit,
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
@@ -279,7 +317,7 @@ private fun TreeView(
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clickable { onOpenPath(parentOf(path)) }
+                            .clickable { onUp() }
                             .padding(horizontal = 16.dp, vertical = 14.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
@@ -329,8 +367,6 @@ private fun CenterMessage(text: String, spinner: Boolean = false) {
         Text(text, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }
-
-private fun parentOf(path: String): String = path.substringBeforeLast('/', "")
 
 private fun humanSize(bytes: Long): String {
     if (bytes < 1024) return "$bytes B"

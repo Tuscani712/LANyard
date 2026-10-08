@@ -5,6 +5,7 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.widget.Toast
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -64,6 +65,7 @@ private val FailRed = Color(0xFFF85149)
 
 @Composable
 fun TroubleshootScreen(padding: PaddingValues, vm: DevicesViewModel, onBack: () -> Unit) {
+    BackHandler { onBack() }
     val context = LocalContext.current
     val state by vm.state.collectAsStateWithLifecycle()
     var selectedFingerprint by rememberSaveable { mutableStateOf<String?>(null) }

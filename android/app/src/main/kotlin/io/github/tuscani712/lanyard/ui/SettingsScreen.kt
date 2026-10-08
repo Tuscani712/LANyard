@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -286,6 +287,7 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
 
 @Composable
 fun LicensesScreen(padding: PaddingValues, onBack: () -> Unit) {
+    BackHandler { onBack() }
     val context = LocalContext.current
     val text by produceState("Loading…") {
         value = withContext(Dispatchers.IO) {
@@ -497,7 +499,7 @@ private fun PairedSettingRow(status: PairedStatus, onUnpair: () -> Unit) {
 }
 
 @Composable
-private fun ConfirmDialog(
+internal fun ConfirmDialog(
     title: String,
     message: String,
     confirmLabel: String,

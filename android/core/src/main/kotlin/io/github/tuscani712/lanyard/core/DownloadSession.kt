@@ -18,11 +18,20 @@ data class ManifestFile(
  * already present (for resume); [openAt] returns a stream positioned to receive
  * bytes starting at [offset], and [openExisting] (optional) re-reads the present
  * bytes so a resumed file's digest still covers the whole file.
+ *
+ * A destination may write under a temporary name and expose [commit]/[discard]:
+ * [commit] is invoked once the file is fully received and its SHA-256 verified,
+ * and [discard] when the download is cancelled locally. That keeps a partial or
+ * cancelled pull from being left behind under its final, normal-looking name.
  */
 data class DownloadTarget(
     val existingSize: Long = 0,
     val openAt: (offset: Long) -> OutputStream,
     val openExisting: (() -> InputStream)? = null,
+    /** Finalizes the file (e.g. renames `.part` to its real name) after verify. */
+    val commit: () -> Unit = {},
+    /** Removes the partial when the pull is cancelled by the person. */
+    val discard: () -> Unit = {},
 )
 
 /** The outcome of a download. */
@@ -116,7 +125,13 @@ class DownloadSession(private val reader: ShareReader, private val throttle: Thr
                     index = index,
                     onProgress = onProgress,
                     isCancelled = isCancelled,
-                ) ?: return DownloadResult.Cancelled
+                )
+                if (received == null) {
+                    // A cancel is deliberate: drop the partial so nothing that
+                    // looks like the finished file is left in the folder.
+                    runCatching { target.discard() }
+                    return DownloadResult.Cancelled
+                }
                 totalBytes += received
 
                 val got = digest.digest().joinToString("") { "%02x".format(it) }
@@ -133,6 +148,13 @@ class DownloadSession(private val reader: ShareReader, private val throttle: Thr
                 return if (e.code == 410) DownloadResult.ShareEnded else DownloadResult.PeerUnreachable
             } catch (_: Exception) {
                 return DownloadResult.PeerUnreachable
+            }
+            // The file is down and verified: finalize it (a `.part` becomes the
+            // real name). A failure here keeps the `.part` for a later attempt.
+            try {
+                target.commit()
+            } catch (_: Exception) {
+                return DownloadResult.Failed("could not save ${file.name}")
             }
         }
 

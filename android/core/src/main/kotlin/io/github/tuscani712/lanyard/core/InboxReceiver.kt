@@ -31,6 +31,20 @@ data class PushFileState(
     var placedName: String? = null,
 ) {
     internal lateinit var part: File
+
+    /**
+     * Serializes the finalize (hash + place) of this one file, so two concurrent
+     * complete requests for the same file cannot both place it.
+     */
+    internal val lock = Any()
+
+    /**
+     * Set once the file has been verified and handed to the destination. A
+     * repeated complete/whole-file request for this file is then an idempotent
+     * success instead of placing it a second time or erroring.
+     */
+    @Volatile
+    internal var placed: Boolean = false
 }
 
 /** One push being received, for the UI. */
@@ -59,6 +73,11 @@ class InboxReceiver(
     private val onChange: () -> Unit = {},
     private val onOffer: (pushId: String, peerFp: String, files: Int, total: Long) -> Unit = { _, _, _, _ -> },
     private val onProgress: (pushId: String, done: Long, total: Long) -> Unit = { _, _, _ -> },
+    // Fired once every body byte of a file has arrived and the receiver is now
+    // hashing the spool part and copying it into the destination (or, on the
+    // whole-file fast path, copying it). The bytes are all in but the file is
+    // not placed yet, so the row shows "Finishing…" instead of a silent 100%.
+    private val onFinishing: (pushId: String, bytes: Long) -> Unit = { _, _ -> },
     private val onDone: (pushId: String, peerFp: String, files: Int, total: Long) -> Unit = { _, _, _, _ -> },
     private val onCancelled: (pushId: String, reason: String) -> Unit = { _, _ -> },
     // Fired when an in-flight receive dies on its own (a file body threw, or the
@@ -297,6 +316,7 @@ class InboxReceiver(
     fun writeChunk(id: String, peerFp: String, rel: String, offset: Long, input: InputStream): Long {
         val s = session(id, peerFp)
         val st = s.files[rel] ?: throw PeerHttpException(404, "no such file in push")
+        if (st.placed) throw PeerHttpException(409, "file already complete")
         diag("[push] peer=${Display.shortFp(peerFp)} file id=$id cls=${Display.pathClass(rel)} offset=$offset size=${st.size} resume=${offset > 0}")
         return try {
             writeStream(s, st, offset, input, null)
@@ -310,17 +330,26 @@ class InboxReceiver(
     fun receiveWhole(id: String, peerFp: String, rel: String, sha256: String, input: InputStream): Long {
         val s = session(id, peerFp)
         val st = s.files[rel] ?: throw PeerHttpException(404, "no such file in push")
-        if (st.done != 0L) throw PeerHttpException(409, "file already partly received")
-        diag("[push] peer=${Display.shortFp(peerFp)} file id=$id cls=${Display.pathClass(rel)} offset=0 size=${st.size} whole=true")
-        return try {
-            writeStream(s, st, 0, input, sha256)
-            st.placedName = place(st)
-            synchronized(this) { st.done = st.size }
-            safeCallback("change") { onChange() }
-            st.size
-        } catch (e: Exception) {
-            fail(s.id, reasonFor(e))
-            throw e
+        synchronized(st.lock) {
+            if (st.placed) {
+                // Idempotent replay: drain the retried body so the connection
+                // stays healthy, then report the same result without re-placing.
+                input.copyTo(java.io.OutputStream.nullOutputStream())
+                return st.size
+            }
+            if (st.done != 0L) throw PeerHttpException(409, "file already partly received")
+            diag("[push] peer=${Display.shortFp(peerFp)} file id=$id cls=${Display.pathClass(rel)} offset=0 size=${st.size} whole=true")
+            return try {
+                writeStream(s, st, 0, input, sha256)
+                safeCallback("finishing") { onFinishing(s.id, st.size) }
+                st.placedName = place(st)
+                synchronized(this) { st.done = st.size }
+                safeCallback("change") { onChange() }
+                st.size
+            } catch (e: Exception) {
+                fail(s.id, reasonFor(e))
+                throw e
+            }
         }
     }
 
@@ -337,13 +366,22 @@ class InboxReceiver(
     fun complete(id: String, peerFp: String, rel: String, sha256: String): PushFileState {
         val s = session(id, peerFp)
         val st = s.files[rel] ?: throw PeerHttpException(404, "no such file in push")
-        if (st.part.length() != st.size) {
-            throw PeerHttpException(409, "size mismatch: have ${st.part.length()}, expected ${st.size}")
+        synchronized(st.lock) {
+            // A replayed complete for a file already verified and placed is an
+            // idempotent success: return the same result, place nothing again.
+            if (st.placed) return st
+            if (st.part.length() != st.size) {
+                throw PeerHttpException(409, "size mismatch: have ${st.part.length()}, expected ${st.size}")
+            }
+            // All bytes are in: the file is about to be hashed and copied into
+            // the destination, which for a large file takes seconds. Tell the UI
+            // before the slow part, not after.
+            safeCallback("finishing") { onFinishing(s.id, st.size) }
+            val got = hashFile(st.part)
+            if (!got.equals(sha256, ignoreCase = true)) throw PeerHttpException(409, "checksum mismatch")
+            st.placedName = place(st)
+            synchronized(this) { st.done = st.size }
         }
-        val got = hashFile(st.part)
-        if (!got.equals(sha256, ignoreCase = true)) throw PeerHttpException(409, "checksum mismatch")
-        st.placedName = place(st)
-        synchronized(this) { st.done = st.size }
         diag("[push] peer=${Display.shortFp(peerFp)} file complete id=$id cls=${Display.pathClass(rel)} size=${st.size}")
         safeCallback("change") { onChange() }
         return st
@@ -534,8 +572,13 @@ class InboxReceiver(
     /** Places one verified file, one at a time, then deletes the spool part. */
     private fun place(st: PushFileState): String {
         synchronized(placeLock) {
+            // Already placed by an earlier/duplicate request: return the same
+            // name without writing or deleting anything again.
+            if (st.placed) return st.placedName!!
             val name = destination.place(st.relPath, st.part, st.size)
             st.part.delete()
+            st.placedName = name
+            st.placed = true
             val folder = destination.folder()
             diag(
                 "[push] placed cls=${Display.pathClass(st.relPath)} " +

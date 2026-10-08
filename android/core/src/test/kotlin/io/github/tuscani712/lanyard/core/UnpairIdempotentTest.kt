@@ -11,9 +11,10 @@ import java.net.ServerSocket
 import java.nio.file.Files
 
 /**
- * Unpair notification is idempotent: a peer that has already dropped us answers
- * 403, which is the end state we wanted and must count as success, not failure.
- * A peer we cannot reach at all is the only case that reports "not notified".
+ * Unpair notification is idempotent: the phone answers 200 even when it has
+ * already dropped us, which is the end state we wanted and must count as
+ * success, not failure. A peer we cannot reach at all is the only case that
+ * reports "not notified".
  */
 class UnpairIdempotentTest {
 
@@ -62,9 +63,12 @@ class UnpairIdempotentTest {
             assertTrue(client.revokeTrustIdempotent(), "the first revoke must succeed")
             assertNull(phone.trust.find(desktop.deviceId), "the phone must drop the desktop")
 
-            // Repeating the notification: the phone answers 403 "not paired",
-            // which is the same end state, so it is still a success.
-            assertTrue(client.revokeTrustIdempotent(), "a repeat revoke (403) must still count as success")
+            // Repeating the notification: the phone now answers an idempotent
+            // 200 with no exception, so revokeTrust (which throws on non-2xx)
+            // must not throw on the repeat either.
+            client.revokeTrust()
+            assertNull(phone.trust.find(desktop.deviceId), "a repeat revoke leaves the peer unpaired")
+            assertTrue(client.revokeTrustIdempotent(), "a repeat revoke must still count as success")
         }
     }
 

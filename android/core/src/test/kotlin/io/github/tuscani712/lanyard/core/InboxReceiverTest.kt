@@ -67,6 +67,29 @@ class InboxReceiverTest {
     }
 
     @Test
+    fun completeReportsFinishingBeforeThePushIsDone() {
+        val ownSpool = Files.createTempDirectory("lanyard-spool-finishing").toFile()
+        val events = mutableListOf<String>()
+        val r = InboxReceiver(
+            spoolRoot = ownSpool,
+            destination = PushDestination { rel, f, _ -> placed[rel] = f.length(); rel.substringAfterLast('/') },
+            freeBytes = { 1L shl 40 },
+            onFinishing = { _, bytes -> events.add("finishing:$bytes") },
+            onDone = { _, _, files, _ -> events.add("done:$files") },
+        )
+        val o = r.offer("p", "P", listOf(req("big.bin", 4)), 0, 0)
+        val data = byteArrayOf(1, 2, 3, 4)
+        r.writeChunk(o.pushId, "p", "big.bin", 0, data.inputStream())
+
+        r.complete(o.pushId, "p", "big.bin", sha(data))
+        // The finishing window opens as the spool is hashed and copied; only the
+        // job-level finish closes it as Done.
+        assertEquals(listOf("finishing:4"), events, "complete must report Finishing before any Done")
+        r.finish(o.pushId, "p")
+        assertEquals(listOf("finishing:4", "done:1"), events)
+    }
+
+    @Test
     fun wrongChecksumIsRefused() {
         val r = receiver()
         val o = r.offer("p", "P", listOf(req("a.bin", 4)), 0, 0)
@@ -81,6 +104,46 @@ class InboxReceiverTest {
         val data = byteArrayOf(9, 8, 7)
         r.receiveWhole(o.pushId, "p", "a.bin", sha(data), data.inputStream())
         assertEquals(3L, placed["a.bin"])
+    }
+
+    @Test
+    fun duplicateWholeFileIsSafe() {
+        val ownSpool = Files.createTempDirectory("lanyard-spool-idem").toFile()
+        var places = 0
+        val r = InboxReceiver(
+            spoolRoot = ownSpool,
+            destination = PushDestination { rel, f, _ -> places++; placed[rel] = f.length(); rel },
+            freeBytes = { 1L shl 40 },
+        )
+        val o = r.offer("p", "P", listOf(req("a.bin", 3)), 0, 0)
+        val data = byteArrayOf(9, 8, 7)
+        r.receiveWhole(o.pushId, "p", "a.bin", sha(data), data.inputStream())
+        // A retried whole-file request is an idempotent success.
+        r.receiveWhole(o.pushId, "p", "a.bin", sha(data), data.inputStream())
+        assertEquals(1, places, "a duplicate whole-file send must not place the file twice")
+    }
+
+    @Test
+    fun completeIsIdempotent() {
+        val ownSpool = Files.createTempDirectory("lanyard-spool-idem").toFile()
+        var places = 0
+        val r = InboxReceiver(
+            spoolRoot = ownSpool,
+            destination = PushDestination { rel, f, _ -> places++; placed[rel] = f.length(); rel },
+            freeBytes = { 1L shl 40 },
+        )
+        val o = r.offer("p", "P", listOf(req("c.bin", 4)), 0, 0)
+        val data = byteArrayOf(1, 2, 3, 4)
+        r.writeChunk(o.pushId, "p", "c.bin", 0, data.inputStream())
+        val first = r.complete(o.pushId, "p", "c.bin", sha(data))
+        val second = r.complete(o.pushId, "p", "c.bin", sha(data))
+        assertEquals(first.placedName, second.placedName)
+        assertEquals(4L, second.done)
+        assertEquals(1, places, "a duplicate complete must not place the file twice")
+        assertFalse(
+            ownSpool.walkTopDown().any { it.isFile && it.name.endsWith(".lanpart") },
+            "the spool part should be gone after the first complete",
+        )
     }
 
     @Test

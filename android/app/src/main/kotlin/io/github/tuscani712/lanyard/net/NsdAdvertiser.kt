@@ -3,6 +3,7 @@ package io.github.tuscani712.lanyard.net
 import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
+import io.github.tuscani712.lanyard.core.DiagLevel
 
 /**
  * Advertises this device over mDNS as `_lanyard._tcp` with the same TXT records
@@ -14,8 +15,8 @@ import android.net.nsd.NsdServiceInfo
  */
 class NsdAdvertiser(
     context: Context,
-    // One line per mDNS advertise event for the diagnostics report.
-    private val diag: (String) -> Unit = {},
+    // One line per mDNS advertise event for the diagnostics report, with its level.
+    private val diag: (String, DiagLevel) -> Unit = { _, _ -> },
 ) {
     private val nsdManager =
         context.applicationContext.getSystemService(Context.NSD_SERVICE) as NsdManager
@@ -31,11 +32,11 @@ class NsdAdvertiser(
         }
         val l = object : NsdManager.RegistrationListener {
             override fun onServiceRegistered(info: NsdServiceInfo) =
-                diag("[discovery] mdns registered port=$port trigger=$trigger result=ok")
+                diag("[discovery] mdns registered port=$port trigger=$trigger result=ok", DiagLevel.Info)
 
             override fun onRegistrationFailed(info: NsdServiceInfo, errorCode: Int) {
                 if (listener === this) listener = null
-                diag("[discovery] mdns registered port=$port trigger=$trigger result=failed error=$errorCode")
+                diag("[discovery] mdns registered port=$port trigger=$trigger result=failed error=$errorCode", DiagLevel.Warn)
             }
 
             override fun onServiceUnregistered(info: NsdServiceInfo) = Unit
@@ -53,7 +54,7 @@ class NsdAdvertiser(
         val had = listener != null
         listener?.let { l -> runCatching { nsdManager.unregisterService(l) } }
         listener = null
-        if (had) diag("[discovery] mdns unregistered result=ok")
+        if (had) diag("[discovery] mdns unregistered result=ok", DiagLevel.Info)
     }
 
     companion object {

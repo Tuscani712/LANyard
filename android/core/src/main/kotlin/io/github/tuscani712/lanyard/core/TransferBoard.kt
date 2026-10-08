@@ -21,7 +21,21 @@ data class TransferRecord(
     val startedAt: Long,
     val lastProgressAt: Long = startedAt,
     val averageSpeed: Double = 0.0, // bytes per second, whole-transfer average (set when Done)
-)
+    val etaSeconds: Long? = null, // seconds left at the smoothed rate, or null
+    // Where a finished receive landed (the destination folder's label), for the
+    // "Done" row. Null for sends or when the destination cannot name itself.
+    val destinationFolder: String? = null,
+    // Set while a live row is in its final window: every byte has arrived
+    // (receive) or been written (send), but the transfer is still hashing,
+    // copying the spool into the destination, or waiting for the receiver's
+    // confirmation. Non-null means "Finishing…"; the value is the size in
+    // bytes being finalized, shown next to the label. Always cleared when the
+    // row ends (Done/Failed/Cancelled), on cancel, and on any fresh byte.
+    val finishingBytes: Long? = null,
+) {
+    /** True while this row is in its "Finishing…" window (set, not yet ended). */
+    val finishing: Boolean get() = finishingBytes != null
+}
 
 /**
  * The pure lifecycle of the transfer list: insertion, progress, cancellation and
@@ -33,10 +47,15 @@ data class TransferRecord(
  * left alone (Cancel is idempotent, never resurrects a finished row).
  */
 class TransferBoard(
-    private val historyCap: Int = 100,
+    private val historyCap: Int = HISTORY_CAP,
     private val stalledAfterMillis: Long = 10 * 60_000,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
+    companion object {
+        /** How many rows the list — and the persisted history — keeps. */
+        const val HISTORY_CAP = 100
+    }
+
     private var records: List<TransferRecord> = emptyList()
 
     fun snapshot(): List<TransferRecord> = records
@@ -63,13 +82,31 @@ class TransferBoard(
      * Records progress and resets the no-progress deadline, so a slow but live
      * transfer is never aged out.
      */
-    fun progress(id: String, done: Long, total: Long, speed: Double) = update(id) {
+    fun progress(id: String, done: Long, total: Long, speed: Double, etaSeconds: Long? = null) = update(id) {
         it.copy(
             done = maxOf(done, it.done),
             total = maxOf(total, it.total, done),
             speed = speed,
+            etaSeconds = etaSeconds,
             lastProgressAt = clock(),
+            // A fresh byte means the body is moving again (e.g. the next file of
+            // a multi-file send), so the previous file's finishing window is over.
+            finishingBytes = null,
         )
+    }
+
+    /**
+     * Enters the "Finishing…" window for a live row: all bytes have arrived or
+     * been written, and the row is now hashing, copying the spool into the
+     * destination, or waiting for the receiver's confirmation. [bytes] is the
+     * size being finalized, shown next to the label. Null (and a no-op) when the
+     * row is absent or already finished, so a late callback cannot revive a row.
+     */
+    fun markFinishing(id: String, bytes: Long): TransferRecord? {
+        val row = records.firstOrNull { it.id == id } ?: return null
+        if (row.state != TransferState.Running && row.state != TransferState.Queued) return null
+        update(id) { it.copy(finishingBytes = bytes) }
+        return row
     }
 
     /**
@@ -80,12 +117,18 @@ class TransferBoard(
     fun cancel(id: String): TransferRecord? {
         val row = records.firstOrNull { it.id == id } ?: return null
         if (row.state != TransferState.Running && row.state != TransferState.Queued) return null
-        update(id) { it.copy(state = TransferState.Cancelled, message = "Cancelled", speed = 0.0) }
+        update(id) {
+            it.copy(state = TransferState.Cancelled, message = "Cancelled", speed = 0.0, etaSeconds = null, finishingBytes = null)
+        }
         return row
     }
 
-    /** Ends a live row with [state] (Done/Failed/Cancelled). Null when not live. */
-    fun end(id: String, state: TransferState, message: String): TransferRecord? {
+    /**
+     * Ends a live row with [state] (Done/Failed/Cancelled). Null when not live.
+     * [destinationFolder] is recorded only for a completed receive, so a Done row
+     * can show where the files landed.
+     */
+    fun end(id: String, state: TransferState, message: String, destinationFolder: String? = null): TransferRecord? {
         val row = records.firstOrNull { it.id == id } ?: return null
         if (row.state != TransferState.Running && row.state != TransferState.Queued) return null
         val finishedAt = clock()
@@ -94,12 +137,19 @@ class TransferBoard(
                 state = state,
                 message = message,
                 speed = 0.0,
+                etaSeconds = null,
+                finishingBytes = null,
                 averageSpeed = if (state == TransferState.Done && finishedAt > it.startedAt) {
                     it.total * 1000.0 / (finishedAt - it.startedAt)
                 } else {
                     0.0
                 },
                 done = if (state == TransferState.Done) it.total else it.done,
+                destinationFolder = if (state == TransferState.Done) {
+                    destinationFolder ?: it.destinationFolder
+                } else {
+                    it.destinationFolder
+                },
             )
         }
         return row
@@ -126,7 +176,11 @@ class TransferBoard(
         if (aged.isEmpty()) return emptyList()
         val ids = aged.map { it.id }.toSet()
         records = records.map {
-            if (it.id in ids) it.copy(state = TransferState.Failed, message = "No progress", speed = 0.0) else it
+            if (it.id in ids) {
+                it.copy(state = TransferState.Failed, message = "No progress", speed = 0.0, etaSeconds = null, finishingBytes = null)
+            } else {
+                it
+            }
         }
         return aged
     }
@@ -137,7 +191,7 @@ class TransferBoard(
         if (interrupted.isEmpty()) return emptyList()
         records = records.map {
             if (it.state == TransferState.Running || it.state == TransferState.Queued) {
-                it.copy(state = TransferState.Failed, message = message, speed = 0.0)
+                it.copy(state = TransferState.Failed, message = message, speed = 0.0, etaSeconds = null, finishingBytes = null)
             } else {
                 it
             }

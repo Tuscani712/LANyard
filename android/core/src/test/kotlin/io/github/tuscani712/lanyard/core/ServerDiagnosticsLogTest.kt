@@ -80,4 +80,37 @@ class ServerDiagnosticsLogTest {
         val out = Diagnostics.copyLog(listOf("00:00:01.000 conn open"))
         assertTrue(out.contains("conn open"))
     }
+
+    @Test
+    fun debugEntryReachesTheRingNotTheDurableLog(@TempDir dir: Path) {
+        val d = ServerDiagnostics(clock = { 0 })
+        d.file = writer(dir)
+
+        d.record("[discovery] peer=ab12cd34 hello result=online", DiagLevel.Debug)
+        d.record("[discovery] peer=ab12cd34 hello result=offline", DiagLevel.Info)
+
+        // Routine chatter stays in the ring so the copied report stays complete.
+        assertTrue(d.snapshot().any { it.contains("result=online") })
+        val onDisk = d.persistedLog()
+        assertFalse(onDisk.contains("result=online"), "a routine success must not fill the durable log")
+        // A normal offline event stays visible, so a real problem can be seen.
+        assertTrue(onDisk.contains("result=offline"))
+    }
+
+    @Test
+    fun debugEntryReachesTheCallbackAtItsLevel() {
+        val d = ServerDiagnostics()
+        val seen = mutableListOf<Pair<DiagLevel, String>>()
+        d.onRecord = { level, line -> seen.add(level to line) }
+
+        d.record("routine", DiagLevel.Debug)
+        d.record("normal")
+        d.record("problem", DiagLevel.Warn)
+        d.record("broken", DiagLevel.Error)
+
+        assertEquals(
+            listOf(DiagLevel.Debug, DiagLevel.Info, DiagLevel.Warn, DiagLevel.Error),
+            seen.map { it.first },
+        )
+    }
 }

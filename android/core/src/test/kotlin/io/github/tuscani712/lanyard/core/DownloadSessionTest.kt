@@ -125,6 +125,44 @@ class DownloadSessionTest {
     }
 
     @Test
+    fun successRenamesThePartToTheFinalName() {
+        val dir = Files.createTempDirectory("dl").toFile()
+        val bytes = "hello world\n".toByteArray()
+        val result = DownloadSession(InMemoryReader("a.txt", bytes)).download("s", "", { partTarget(dir, "a.txt") })
+
+        assertTrue(result is DownloadResult.Done, "expected Done, got $result")
+        assertEquals("hello world\n", File(dir, "a.txt").readText())
+        assertFalse(File(dir, "a.txt.part").exists(), "the temporary .part must be gone after commit")
+    }
+
+    @Test
+    fun cancelDeletesThePartAndLeavesNoFinalFile() {
+        val dir = Files.createTempDirectory("dl").toFile()
+        val cancel = AtomicBoolean(false)
+        val result = DownloadSession(EndlessReader("big.bin", 8L * 1024 * 1024)).download(
+            "s", "",
+            targetFor = { partTarget(dir, "big.bin") },
+            onProgress = { _, _, received, _ -> if (received > 512 * 1024) cancel.set(true) },
+            isCancelled = { cancel.get() },
+        )
+
+        assertTrue(result is DownloadResult.Cancelled, "expected Cancelled, got $result")
+        assertFalse(File(dir, "big.bin.part").exists(), "a cancel must delete the partial")
+        assertFalse(File(dir, "big.bin").exists(), "a cancel must never leave a normal-looking file")
+    }
+
+    @Test
+    fun aFailedPullKeepsThePartButNoFinalFile() {
+        val dir = Files.createTempDirectory("dl").toFile()
+        val reader = InMemoryReader("a.bin", "real\n".toByteArray(), reportedHash = "00".repeat(32))
+        val result = DownloadSession(reader).download("s", "", { partTarget(dir, "a.bin") })
+
+        assertTrue(result is DownloadResult.HashMismatch, "expected HashMismatch, got $result")
+        assertTrue(File(dir, "a.bin.part").isFile, "a failed pull keeps a clearly-named .part")
+        assertFalse(File(dir, "a.bin").exists(), "a failed pull must not leave a final-named file")
+    }
+
+    @Test
     fun rejectsPathTraversalFromManifest() {
         val reader = FakeReader(
             manifest = jsonManifest(listOf(Triple("../evil.txt", "evil.txt", 1L))),
@@ -191,6 +229,62 @@ class DownloadSessionTest {
 
     private fun JsonObject.str(key: String): String =
         get(key)?.takeIf { !it.isJsonNull }?.asString ?: ""
+
+    /** A destination that writes `<name>.part` and renames it on commit. */
+    private fun partTarget(dir: File, name: String): DownloadTarget {
+        val part = File(dir, "$name.part")
+        val final = File(dir, name)
+        return DownloadTarget(
+            openAt = { FileOutputStream(part, false) },
+            commit = { if (!part.renameTo(final)) throw java.io.IOException("rename failed") },
+            discard = { part.delete() },
+        )
+    }
+
+    /** A reader serving one in-memory file, with an optionally wrong digest. */
+    private class InMemoryReader(
+        private val rel: String,
+        private val bytes: ByteArray,
+        private val reportedHash: String = sha256Hex(bytes),
+    ) : ShareReader {
+        override fun manifestFiles(shareId: String, path: String): JsonObject = oneFile(rel, bytes.size.toLong())
+        override fun openFileStream(shareId: String, path: String, rangeFrom: Long): InputStream {
+            val from = rangeFrom.coerceIn(0L, bytes.size.toLong()).toInt()
+            return ByteArrayInputStream(bytes.copyOfRange(from, bytes.size))
+        }
+        override fun wholeFileHash(shareId: String, path: String): String = reportedHash
+        override fun reportComplete(shareId: String, verified: List<Pair<String, String>>): Boolean = true
+    }
+
+    /** A reader whose body never ends, for exercising a mid-transfer cancel. */
+    private class EndlessReader(private val rel: String, private val size: Long) : ShareReader {
+        override fun manifestFiles(shareId: String, path: String): JsonObject = oneFile(rel, size)
+        override fun openFileStream(shareId: String, path: String, rangeFrom: Long): InputStream =
+            object : InputStream() {
+                override fun read(): Int = 0
+                override fun read(b: ByteArray, off: Int, len: Int): Int {
+                    java.util.Arrays.fill(b, off, off + len, 0)
+                    return len
+                }
+            }
+        override fun wholeFileHash(shareId: String, path: String): String = ""
+        override fun reportComplete(shareId: String, verified: List<Pair<String, String>>): Boolean = true
+    }
+
+    private companion object {
+        fun oneFile(path: String, size: Long): JsonObject = JsonObject().apply {
+            add("files", JsonArray().apply {
+                add(JsonObject().apply {
+                    addProperty("path", path)
+                    addProperty("name", path)
+                    addProperty("size", size)
+                    addProperty("etag", "")
+                })
+            })
+            addProperty("total_bytes", size)
+            addProperty("count", 1)
+        }
+    }
 
     /** Wraps a real client, corrupting the bytes of one file. */
     private class CorruptingReader(private val real: ShareReader, private val path: String) : ShareReader by real {

@@ -5,10 +5,12 @@ import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.gson.JsonObject
+import io.github.tuscani712.lanyard.core.NavBackStack
 import io.github.tuscani712.lanyard.core.PairResult
 import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PairingFlow
 import io.github.tuscani712.lanyard.core.PeerAddresses
+import io.github.tuscani712.lanyard.core.DiagLevel
 import io.github.tuscani712.lanyard.core.DiscoveredAddr
 import io.github.tuscani712.lanyard.core.PeerClient
 import io.github.tuscani712.lanyard.core.PeerErrors
@@ -29,6 +31,9 @@ import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+
+/** How long a paired peer's reachability result is reused before re-probing. */
+private const val ONLINE_PROBE_CACHE_MS = 5_000L
 
 /** A paired peer plus its last-known reachability. */
 data class PairedStatus(val peer: PairedPeer, val online: Boolean)
@@ -87,7 +92,16 @@ data class DevicesUiState(
 class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     // The same trust store the peer server writes to when a desktop pairs to us.
     private val store: TrustStore get() = PeerService.trust
-    private val discovery = NsdDiscovery(app, diag = { PeerService.diagnostics.record(it) })
+    private val discovery = NsdDiscovery(app, diag = { msg, level -> PeerService.diagnostics.record(msg, level) })
+
+    // Last reachability probe per peer fingerprint, so a burst of mDNS events
+    // does not re-probe (and re-log) the same peer. See [isOnline].
+    private val onlineCache = HashMap<String, Pair<Long, Boolean>>()
+
+    // Folder hierarchy inside one open share, so a system Back press walks up one
+    // folder at a time (and then back to the share list). The root entry is the
+    // share's own folder (`""`). See [treeUp] / [detailBack].
+    private val treeStack = NavBackStack("")
 
     private val _state = MutableStateFlow(DevicesUiState())
     val state: StateFlow<DevicesUiState> = _state.asStateFlow()
@@ -133,7 +147,14 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 // lists itself and invites a pairing that cannot work.
                 val own = SelfFilter.ownShortId(IdentityHolder.identity?.deviceId.orEmpty())
                 if (!SelfFilter.isSelf(device.shortId, own)) {
-                    PeerService.diagnostics.record("[discovery] peer=${device.shortId.take(8)} seen addr=${device.host}:${device.port} source=mdns result=ok")
+                    // A first sighting is worth one info line; the same peer
+                    // re-announcing over mDNS is routine chatter and is kept out
+                    // of the durable log.
+                    val known = _state.value.nearby.any { it.shortId == device.shortId }
+                    PeerService.diagnostics.record(
+                        "[discovery] peer=${device.shortId.take(8)} seen addr=${device.host}:${device.port} source=mdns result=ok",
+                        if (known) DiagLevel.Debug else DiagLevel.Info,
+                    )
                     _state.update { current ->
                         current.copy(nearby = (current.nearby.filterNot { it.shortId == device.shortId } + device))
                     }
@@ -147,7 +168,10 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 }
             },
             onLost = { shortId ->
-                PeerService.diagnostics.record("[discovery] peer=${shortId.take(8)} lost source=mdns result=evicted miss=1")
+                // A device that stopped advertising (or sent a goodbye) has
+                // normally just gone to sleep or left: a normal eviction, not an
+                // error, so it stays at info rather than filling the log.
+                PeerService.diagnostics.record("[discovery] peer=${shortId.take(8)} left source=mdns result=ok", DiagLevel.Info)
                 _state.update { current -> current.copy(nearby = current.nearby.filterNot { it.shortId == shortId }) }
             },
             trigger = "screen",
@@ -184,7 +208,11 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
             _state.update {
                 it.copy(pairing = PairingStatus.Done(resultMessage(result), result is PairResult.Paired))
             }
-            if (result is PairResult.Paired) refreshPaired()
+            if (result is PairResult.Paired) {
+                // A fresh pairing supersedes any unpair we queued for this peer.
+                PeerService.clearPendingUnpair(result.peer.fingerprint)
+                refreshPaired()
+            }
         }
     }
 
@@ -200,19 +228,29 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     fun unpair(peer: PairedPeer) {
         viewModelScope.launch {
             val identity = IdentityHolder.identity
-            val remoteOk = withContext(Dispatchers.IO) {
-                var ok = false
-                if (identity != null) {
-                    ok = PeerClient(peer.host, peer.port, identity, peer.fingerprint).revokeTrustIdempotent()
-                }
-                store.remove(peer.fingerprint)
-                TransferManager.cancelForPeer(peer.fingerprint)
-                // The peer is offline: keep the notification so it is retried
-                // when that device is next seen.
-                if (ok) PeerService.clearPendingUnpair(peer.fingerprint) else PeerService.rememberPendingUnpair(peer)
-                ok
+            // Capture the pending-unpair generation before the attempt: if a
+            // racing sibling notifies the peer first, this token stops a losing
+            // retry from re-arming the record after the fact.
+            val generation = PeerService.pendingUnpairGeneration(peer.fingerprint)
+            // The same idempotent routine Settings uses: the peer is told (403
+            // counts as success), the local entry is always removed, and an
+            // offline peer is remembered for a retry.
+            val outcome = withContext(Dispatchers.IO) {
+                Unpair.perform(
+                    notifyPeer = {
+                        if (identity != null) {
+                            PeerClient(peer.host, peer.port, identity, peer.fingerprint).revokeTrustIdempotent()
+                        } else {
+                            false
+                        }
+                    },
+                    removeLocal = { store.remove(peer.fingerprint) },
+                    cancelTransfers = { TransferManager.cancelForPeer(peer.fingerprint) },
+                    onRemoteNotified = { PeerService.clearPendingUnpair(peer.fingerprint) },
+                    onRemoteNotNotified = { PeerService.rememberPendingUnpair(peer, generation) },
+                )
             }
-            PeerService.diagnostics.record("[pairing] peer=${peer.fingerprint.take(8)} unpair source=phone remote=$remoteOk result=ok")
+            PeerService.diagnostics.record("[pairing] peer=${peer.fingerprint.take(8)} unpair source=phone remote=${outcome.remoteNotified} result=ok")
             _state.update { current ->
                 val detail = current.detail
                 val cleared = if (detail != null && detail.peer.fingerprint.equals(peer.fingerprint, ignoreCase = true)) {
@@ -220,7 +258,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 } else {
                     current
                 }
-                cleared.copy(unpairNotice = if (remoteOk) null else Unpair.REMOTE_NOT_NOTIFIED)
+                cleared.copy(unpairNotice = outcome.notice)
             }
             refreshPaired()
         }
@@ -232,6 +270,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun openPeer(peer: PairedPeer) {
+        treeStack.reset()
         _state.update { it.copy(detail = PeerDetail(peer = peer, loading = true)) }
         viewModelScope.launch {
             val identity = IdentityHolder.identity ?: return@launch
@@ -247,21 +286,52 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun openShare(share: ShareItem) = loadTree(share, "")
+    fun openShare(share: ShareItem) {
+        treeStack.reset()
+        loadTree(share, "")
+    }
 
+    /** Descends into a folder of the open share. */
     fun openPath(path: String) {
         val share = _state.value.detail?.openShare ?: return
+        treeStack.push(path)
         loadTree(share, path)
     }
 
+    /** Moves up one folder inside the open share, or back to the share list. */
+    fun treeUp() {
+        val detail = _state.value.detail ?: return
+        val share = detail.openShare ?: return
+        val parent = treeStack.back()
+        if (parent == null) {
+            backToShares()
+        } else {
+            loadTree(share, parent)
+        }
+    }
+
     fun backToShares() {
+        treeStack.reset()
         _state.update { current ->
             val detail = current.detail ?: return@update current
             current.copy(detail = detail.copy(openShare = null, tree = emptyList(), treePath = "", error = null))
         }
     }
 
-    fun closePeer() = _state.update { it.copy(detail = null) }
+    fun closePeer() {
+        treeStack.reset()
+        _state.update { it.copy(detail = null) }
+    }
+
+    /**
+     * System Back while a peer's detail is open: up one folder, then back to the
+     * share list, then close the detail. Never exits the app and never touches a
+     * running transfer.
+     */
+    fun detailBack() {
+        val detail = _state.value.detail ?: return
+        if (detail.openShare == null) closePeer() else treeUp()
+    }
 
     /** Sends a text snippet (the desktop caps these at 64 KB), through the same gate as files. */
     fun sendText(peer: PairedPeer, text: String) {
@@ -351,18 +421,50 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun isOnline(peer: PairedPeer): Boolean {
         val identity = IdentityHolder.identity ?: return false
-        val started = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
+        // Probe at most once per window per peer (the desktop's discovery manager
+        // throttles the same way): a repeated mDNS event must not re-probe and
+        // re-log the same peer.
+        synchronized(onlineCache) {
+            onlineCache[peer.fingerprint]?.let { (at, value) ->
+                if (now - at < ONLINE_PROBE_CACHE_MS) return value
+            }
+        }
+        val started = now
         val short = peer.fingerprint.take(8)
-        return try {
+        val online = try {
             val probe = ProbeClient(peer.host, peer.port, identity)
             probe.hello()
             val match = probe.observedFingerprint().equals(peer.fingerprint, ignoreCase = true)
-            PeerService.diagnostics.record("[discovery] peer=$short hello addr=${peer.host}:${peer.port} result=${if (match) "online" else "mismatch"} elapsed=${System.currentTimeMillis() - started}ms")
+            if (match) {
+                // A successful outbound hello means the peer is reachable right
+                // now: let a pending unpair be delivered without waiting.
+                PeerService.onPeerReachable(peer.fingerprint.take(16), peer.host, peer.port)
+                // A routine, successful hello is healthy chatter: debug keeps it
+                // in the copied report but out of the durable log.
+                PeerService.diagnostics.record(
+                    "[discovery] peer=$short hello addr=${peer.host}:${peer.port} result=online elapsed=${System.currentTimeMillis() - started}ms",
+                    DiagLevel.Debug,
+                )
+            } else {
+                // A changed identity is a genuine fault, so it stays visible.
+                PeerService.diagnostics.record(
+                    "[discovery] peer=$short hello addr=${peer.host}:${peer.port} result=mismatch elapsed=${System.currentTimeMillis() - started}ms",
+                    DiagLevel.Warn,
+                )
+            }
             match
         } catch (e: Exception) {
-            PeerService.diagnostics.record("[discovery] peer=$short hello addr=${peer.host}:${peer.port} result=offline elapsed=${System.currentTimeMillis() - started}ms error=${e.javaClass.simpleName}")
+            // A peer that is asleep or has left is a normal, recoverable event,
+            // not an error: info stays visible without being alarming.
+            PeerService.diagnostics.record(
+                "[discovery] peer=$short hello addr=${peer.host}:${peer.port} result=offline elapsed=${System.currentTimeMillis() - started}ms error=${e.javaClass.simpleName}",
+                DiagLevel.Info,
+            )
             false
         }
+        synchronized(onlineCache) { onlineCache[peer.fingerprint] = System.currentTimeMillis() to online }
+        return online
     }
 
     private fun resultMessage(result: PairResult): String = when (result) {

@@ -1,5 +1,6 @@
 package io.github.tuscani712.lanyard.share
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -46,6 +47,9 @@ fun SharePickerScreen(
     onOpenApp: () -> Unit,
     onClose: () -> Unit,
 ) {
+    // Back finishes this activity exactly like Cancel, so the person lands back
+    // in the app that shared, never on LANyard's own Devices screen.
+    BackHandler { onClose() }
     Scaffold(topBar = { TopAppBar(title = { Text("Send to…") }) }) { padding ->
         Column(modifier = Modifier.fillMaxSize().padding(padding).padding(16.dp)) {
             Text(summary, style = MaterialTheme.typography.bodyLarge)

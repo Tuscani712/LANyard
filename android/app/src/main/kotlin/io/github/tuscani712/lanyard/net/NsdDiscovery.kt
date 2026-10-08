@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import android.net.wifi.WifiManager
+import io.github.tuscani712.lanyard.core.DiagLevel
 import io.github.tuscani712.lanyard.core.Display
 
 /**
@@ -16,8 +17,8 @@ import io.github.tuscani712.lanyard.core.Display
  */
 class NsdDiscovery(
     context: Context,
-    // One line per discovery event for the diagnostics report.
-    private val diag: (String) -> Unit = {},
+    // One line per discovery event for the diagnostics report, with its level.
+    private val diag: (String, DiagLevel) -> Unit = { _, _ -> },
 ) {
     private val appContext = context.applicationContext
     private val nsdManager = appContext.getSystemService(Context.NSD_SERVICE) as NsdManager
@@ -34,13 +35,13 @@ class NsdDiscovery(
             setReferenceCounted(true)
             acquire()
         }
-        diag("[discovery] mdns browse start trigger=$trigger result=ok")
+        diag("[discovery] mdns browse start trigger=$trigger result=ok", DiagLevel.Info)
 
         val discovery = object : NsdManager.DiscoveryListener {
             override fun onDiscoveryStarted(serviceType: String) = Unit
             override fun onDiscoveryStopped(serviceType: String) = Unit
             override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-                diag("[discovery] mdns browse start result=failed error=$errorCode")
+                diag("[discovery] mdns browse start result=failed error=$errorCode", DiagLevel.Warn)
                 stop()
             }
             override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) = stop()
@@ -76,7 +77,7 @@ class NsdDiscovery(
                 // already stopped
             }
         }
-        if (listener != null) diag("[discovery] mdns browse stop result=ok")
+        if (listener != null) diag("[discovery] mdns browse stop result=ok", DiagLevel.Info)
         listener = null
         resolving.clear()
         lock?.let {
@@ -92,7 +93,7 @@ class NsdDiscovery(
     private fun resolver(onFound: (NearbyDevice) -> Unit) = object : NsdManager.ResolveListener {
         override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
             resolving.remove(info.serviceName)
-            diag("[discovery] mdns resolve service=${info.serviceName} result=failed error=$errorCode")
+            diag("[discovery] mdns resolve service=${info.serviceName} result=failed error=$errorCode", DiagLevel.Warn)
         }
 
         override fun onServiceResolved(info: NsdServiceInfo) {
@@ -100,7 +101,7 @@ class NsdDiscovery(
             val attrs = info.attributes.mapValues { String(it.value) }
             val shortId = attrs["id"] ?: info.serviceName
             shortByService[info.serviceName] = shortId
-            diag("[discovery] mdns resolved id=${Display.shortFp(shortId)} addr=$host:${attrs["p"]?.toIntOrNull() ?: info.port} source=mdns result=ok")
+            diag("[discovery] mdns resolved id=${Display.shortFp(shortId)} addr=$host:${attrs["p"]?.toIntOrNull() ?: info.port} source=mdns result=ok", DiagLevel.Debug)
             onFound(
                 NearbyDevice(
                     shortId = shortId,

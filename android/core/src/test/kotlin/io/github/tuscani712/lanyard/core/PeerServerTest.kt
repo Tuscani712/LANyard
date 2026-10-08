@@ -303,11 +303,15 @@ class PeerServerTest {
 
     @Test
     @Timeout(60)
-    fun unpairedClientCannotRevoke() {
+    fun unpairedClientRevokeIsIdempotentOk() {
         Harness().use { h ->
             val desk = Identity.generate("Desk")
+            // A caller we are not paired with is exactly the state revoke wants,
+            // so it must get an idempotent 200 rather than a 403 that the peer
+            // would read as a failure and keep retrying.
             val resp = h.request(desk, post("/api/v1/trust/revoke", "{}"))
-            assertEquals(403, status(resp))
+            assertEquals(200, status(resp))
+            assertNull(h.trust.find(desk.deviceId), "revoking must never create an entry")
         }
     }
 

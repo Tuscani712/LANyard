@@ -187,6 +187,17 @@ fun DevicesScreen(padding: PaddingValues, vm: DevicesViewModel) {
             confirmButton = { TextButton(onClick = { explain = null }) { Text("Got it") } },
         )
     }
+
+    // Same result the Settings list shows when an unpair removed the local entry
+    // but the desktop could not be told (it is retried when next seen).
+    state.unpairNotice?.let { message ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissUnpairNotice() },
+            title = { Text("Unpaired") },
+            text = { Text(message) },
+            confirmButton = { TextButton(onClick = { vm.dismissUnpairNotice() }) { Text("OK") } },
+        )
+    }
 }
 
 @Composable

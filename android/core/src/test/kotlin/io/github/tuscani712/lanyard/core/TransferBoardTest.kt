@@ -121,6 +121,69 @@ class TransferBoardTest {
     }
 
     @Test
+    fun finishingWindowThenDone() {
+        val b = board()
+        b.add(row("t_fin", "receive", TransferState.Running))
+
+        b.markFinishing("t_fin", 700L)
+
+        val finishing = b.firstOrNull("t_fin")
+        assertEquals(TransferState.Running, finishing?.state, "Finishing is a window, not a terminal state")
+        assertTrue(finishing?.finishing == true)
+        assertEquals(700L, finishing?.finishingBytes)
+
+        b.end("t_fin", TransferState.Done, "Received 1 file(s)")
+
+        val done = b.firstOrNull("t_fin")
+        assertEquals(TransferState.Done, done?.state)
+        assertTrue(done?.finishing == false, "Done must clear the Finishing window")
+        assertNull(done?.finishingBytes)
+    }
+
+    @Test
+    fun endingFinishingAsFailedClearsIt() {
+        val b = board()
+        b.add(row("t_fin", "receive", TransferState.Running))
+        b.markFinishing("t_fin", 700L)
+
+        b.end("t_fin", TransferState.Failed, "checksum mismatch")
+
+        assertTrue(b.firstOrNull("t_fin")?.finishing == false)
+    }
+
+    @Test
+    fun cancellingAFinishingRowClearsIt() {
+        val b = board()
+        b.add(row("t_fin", "receive", TransferState.Running))
+        b.markFinishing("t_fin", 700L)
+
+        assertNotNull(b.cancel("t_fin"))
+
+        assertEquals(TransferState.Cancelled, b.firstOrNull("t_fin")?.state)
+        assertTrue(b.firstOrNull("t_fin")?.finishing == false)
+    }
+
+    @Test
+    fun freshBytesLeaveTheFinishingWindow() {
+        val b = board()
+        b.add(row("t_fin", "send", TransferState.Running))
+        b.markFinishing("t_fin", 700L)
+
+        // A later file's bytes arrive: the send is moving again, not finishing.
+        b.progress("t_fin", done = 700, total = 1_400, speed = 10.0)
+
+        assertTrue(b.firstOrNull("t_fin")?.finishing == false)
+    }
+
+    @Test
+    fun markFinishingIgnoresFinishedRows() {
+        val b = board()
+        b.add(row("t_done", "receive", TransferState.Done))
+        assertNull(b.markFinishing("t_done", 700L))
+        assertTrue(b.firstOrNull("t_done")?.finishing == false)
+    }
+
+    @Test
     fun aFailedRowHasNoAverageSpeed() {
         val b = board()
         b.add(row("t_send", "send", TransferState.Running, startedAt = 1_000))

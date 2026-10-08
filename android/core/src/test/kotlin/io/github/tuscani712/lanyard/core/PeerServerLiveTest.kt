@@ -84,9 +84,9 @@ class PeerServerLiveTest {
                     "desktop did not list the phone",
                 )
 
-                // A replayed confirm is refused.
+                // A replayed confirm is a no-op success, not an error.
                 val replay = runCatching { peer.confirmSession(desktopSession) }
-                assertTrue(replay.isFailure, "a replayed confirm should be refused")
+                assertTrue(replay.isSuccess, "a replayed confirm should be a no-op success, not an error")
             }
         }
     }

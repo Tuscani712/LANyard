@@ -86,6 +86,39 @@ class PushProgressTest {
 
     @Test
     @Timeout(60)
+    fun finishingFiresAfterTheLastByteAndBeforeTheReceiverAccepts() {
+        val placed = mutableListOf<String>()
+        Phone(PushDestination { rel, f, _ -> placed.add("$rel:${f.length()}"); rel.substringAfterLast('/') }).use { phone ->
+            val client = Identity.generate("Desktop")
+            phone.pair(client.deviceId)
+            val bytes = bytesOf(512 * 1024 + 7)
+            val total = bytes.size.toLong()
+            val events = mutableListOf<String>()
+
+            val result = PushSession(clientFor(phone, client)).push(
+                listOf(PushSource("big.bin", total, 0) { ByteArrayInputStream(bytes) }),
+                onProgress = { _, sent, _ -> events.add("progress:$sent") },
+                onFinishing = { _, size -> events.add("finishing:$size") },
+            )
+
+            assertTrue(result is PushResult.Sent, "expected Sent, got $result")
+            val finishing = events.indexOf("finishing:$total")
+            assertTrue(finishing >= 0, "the send must enter the Finishing window: $events")
+            // Every byte-progress before the finishing mark is below 100%; the
+            // single 100% report comes only after the finishing window.
+            assertTrue(
+                events.take(finishing).filter { it.startsWith("progress:") }
+                    .all { it != "progress:$total" },
+                "no 100% may be shown before the finishing window: $events",
+            )
+            val full = events.indices.filter { events[it] == "progress:$total" }
+            assertEquals(1, full.size, "exactly one honest 100% report: $events")
+            assertTrue(full.first() > finishing, "the 100% report must follow the finishing window: $events")
+        }
+    }
+
+    @Test
+    @Timeout(60)
     fun failedCompleteNeverReportsFull() {
         // The file body streams fine, but the receiver rejects it when placing
         // it (an unwritable inbox): the complete request is answered with 500.

@@ -3,14 +3,12 @@ package io.github.tuscani712.lanyard.transfer
 import android.app.Application
 import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
-import com.google.gson.Gson
-import com.google.gson.GsonBuilder
-import com.google.gson.reflect.TypeToken
 import io.github.tuscani712.lanyard.IdentityHolder
 import io.github.tuscani712.lanyard.core.Display
 import io.github.tuscani712.lanyard.core.DownloadResult
 import io.github.tuscani712.lanyard.core.DownloadSession
 import io.github.tuscani712.lanyard.core.DownloadTarget
+import io.github.tuscani712.lanyard.core.JsonFileTransferHistoryStore
 import io.github.tuscani712.lanyard.core.MeteredNetwork
 import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PeerClient
@@ -18,15 +16,17 @@ import io.github.tuscani712.lanyard.core.PeerErrors
 import io.github.tuscani712.lanyard.core.PushResult
 import io.github.tuscani712.lanyard.core.PushSession
 import io.github.tuscani712.lanyard.core.PushSource
+import io.github.tuscani712.lanyard.core.RateEtaDisplay
 import io.github.tuscani712.lanyard.core.RateThrottle
 import io.github.tuscani712.lanyard.core.ShareValidation
 import io.github.tuscani712.lanyard.core.SpoolEntry
-import io.github.tuscani712.lanyard.core.SpeedMeter
 import io.github.tuscani712.lanyard.core.Throttle
 import io.github.tuscani712.lanyard.core.TransferBoard
+import io.github.tuscani712.lanyard.core.TransferHistoryStore
 import io.github.tuscani712.lanyard.core.TransferPolicy
 import io.github.tuscani712.lanyard.core.TransferRecord
 import io.github.tuscani712.lanyard.core.TransferState
+import io.github.tuscani712.lanyard.core.TransferTuning
 import io.github.tuscani712.lanyard.SettingsHolder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -53,7 +53,8 @@ import java.util.concurrent.atomic.AtomicBoolean
  * cancelling a live receive on the peer server.
  */
 object TransferManager {
-    private const val HISTORY_CAP = 100
+    /** How many rows the in-memory list and the persisted history keep. */
+    private const val HISTORY_CAP = TransferBoard.HISTORY_CAP
 
     /** A running row with no progress for this long is failed as "No progress". */
     const val STALLED_AFTER_MS = 10 * 60_000L
@@ -62,19 +63,27 @@ object TransferManager {
     private const val AGE_SWEEP_MS = 60_000L
 
     private lateinit var app: Application
+    private var initialized = false
     private var meter: MeteredNetwork = MeteredNetwork { false }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val gson: Gson = GsonBuilder().create()
-    private val historyType = object : TypeToken<MutableList<TransferRecord>>() {}.type
 
-    private val board = TransferBoard(stalledAfterMillis = STALLED_AFTER_MS)
+    /**
+     * The persisted history. Wired on [init]; every list change is mirrored here,
+     * so a finished row survives an app restart.
+     */
+    private var history: TransferHistoryStore? = null
+
+    private val board = TransferBoard(historyCap = HISTORY_CAP, stalledAfterMillis = STALLED_AFTER_MS)
 
     private val _state = MutableStateFlow<List<TransferRecord>>(emptyList())
     val state: StateFlow<List<TransferRecord>> = _state.asStateFlow()
 
     private val cancels = HashMap<String, AtomicBoolean>()
     private val pushReceives = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
-    private val speedMeters = java.util.concurrent.ConcurrentHashMap<String, SpeedMeter>()
+    private val rateDisplays = java.util.concurrent.ConcurrentHashMap<String, RateEtaDisplay>()
+
+    /** When the last live progress update was published, for the ~1/s gate. */
+    private var lastProgressPublishAt = 0L
     private val cleanups = java.util.concurrent.ConcurrentHashMap<String, () -> Unit>()
 
     /**
@@ -102,11 +111,19 @@ object TransferManager {
     }
 
     fun init(application: Application, meteredNetwork: MeteredNetwork = MeteredNetwork { false }) {
+        // Guard against a second Activity re-seeding the board from disk and
+        // wiping rows this process already holds (e.g. one that just finished).
+        if (initialized) return
+        initialized = true
         app = application
         meter = meteredNetwork
-        board.replaceAll(loadHistory())
+        history = JsonFileTransferHistoryStore(File(application.filesDir, "transfers.json"), cap = HISTORY_CAP)
+        board.replaceAll(history?.load() ?: emptyList())
+        // A row left Running/Queued has no live work after a restart: fail it,
+        // then persist that, so it cannot come back Running on the next launch.
         board.failInterrupted("Interrupted")
         publish()
+        persist()
         sweepSpool()
         scope.launch {
             while (isActive) {
@@ -153,7 +170,7 @@ object TransferManager {
         if (pushReceives.remove(row.id)) receiveCanceller?.invoke(row.id)
         cleanups.remove(row.id)?.invoke()
         cancels.remove(row.id)
-        speedMeters.remove(row.id)
+        rateDisplays.remove(row.id)
     }
 
     fun cancelAllRunning() {
@@ -251,14 +268,28 @@ object TransferManager {
 
     fun noteReceiveProgress(id: String, done: Long, total: Long) {
         if (!board.isLive(id)) return
-        board.progress(id, done, total, sampleSpeed(id, done))
+        val snap = sampleRate(id, done, total)
+        board.progress(id, done, total, snap.bytesPerSecond, snap.etaSeconds)
+        publishProgress()
+    }
+
+    /**
+     * Enters the "Finishing…" window for a live row: every byte has arrived
+     * (receive) or been written (send), and the row is now hashing, copying the
+     * spool into the destination, or waiting for the receiver's confirmation.
+     * [bytes] is the size being finalized. Published immediately (not throttled)
+     * so the state appears as soon as the last byte lands, and cleared by the
+     * next [noteReceiveProgress] byte or when the row ends.
+     */
+    fun noteFinishing(id: String, bytes: Long) {
+        if (board.markFinishing(id, bytes) == null) return
         publish()
     }
 
-    fun noteReceiveDone(id: String, message: String) {
+    fun noteReceiveDone(id: String, message: String, folder: String? = null) {
         pushReceives.remove(id)
         if (!board.isLive(id)) return
-        end(id, TransferState.Done, message)
+        end(id, TransferState.Done, message, folder)
     }
 
     /** Marks a push this phone abandoned (declined or cut off) as failed. */
@@ -333,10 +364,13 @@ object TransferManager {
                         sent[index] = bytes
                         val done = sent.sum()
                         if (board.isLive(id)) {
-                            board.progress(id, done, maxOf(board.firstOrNull(id)?.total ?: 0, done), sampleSpeed(id, done))
-                            publish()
+                            val total = maxOf(board.firstOrNull(id)?.total ?: 0, done)
+                            val snap = sampleRate(id, done, total)
+                            board.progress(id, done, total, snap.bytesPerSecond, snap.etaSeconds)
+                            publishProgress()
                         }
                     },
+                    onFinishing = { _, bytes -> noteFinishing(id, bytes) },
                     isCancelled = { cancel.get() },
                 )
             } catch (e: Exception) {
@@ -369,8 +403,10 @@ object TransferManager {
                     sent[index] = received
                     val done = sent.values.sum()
                     if (board.isLive(id)) {
-                        board.progress(id, done, maxOf(total, done), sampleSpeed(id, done))
-                        publish()
+                        val bounded = maxOf(total, done)
+                        val snap = sampleRate(id, done, bounded)
+                        board.progress(id, done, bounded, snap.bytesPerSecond, snap.etaSeconds)
+                        publishProgress()
                     }
                 },
                 isCancelled = { cancel.get() },
@@ -379,21 +415,26 @@ object TransferManager {
             DownloadResult.Failed(PeerErrors.userMessage(e))
         }
         cancels.remove(id)
-        finishDownload(id, result)
+        finishDownload(id, result, DocumentFile.fromTreeUri(app, tree)?.name)
     }
 
     private fun docTarget(root: DocumentFile, rel: String): DownloadTarget? {
         val dir = ensureDirs(root, rel.substringBeforeLast('/', "")) ?: return null
-        val name = rel.substringAfterLast('/')
-        val existing = dir.findFile(name)
-        val target = if (existing == null) {
-            dir.createFile("application/octet-stream", name)
-        } else {
-            dir.createFile("application/octet-stream", uniqueName(dir, name))
-        } ?: return null
+        val name = rel.substringAfterLast('/').ifEmpty { "download" }
+        // Download under a clear `.part` name so a cancel or crash never leaves
+        // a normal-looking file. Only a fully verified file is renamed.
+        val partName = if (dir.findFile("$name.part") == null) "$name.part" else uniqueName(dir, "$name.part")
+        val part = dir.createFile("application/octet-stream", partName) ?: return null
         return DownloadTarget(
             existingSize = 0,
-            openAt = { app.contentResolver.openOutputStream(target.uri, "wt") ?: error("cannot open output") },
+            openAt = { app.contentResolver.openOutputStream(part.uri, "wt") ?: error("cannot open output") },
+            commit = {
+                val finalName = if (dir.findFile(name) == null) name else uniqueName(dir, name)
+                if (part.name != finalName && !part.renameTo(finalName)) {
+                    throw java.io.IOException("could not finalize the download")
+                }
+            },
+            discard = { runCatching { part.delete() } },
         )
     }
 
@@ -433,6 +474,20 @@ object TransferManager {
         _state.value = board.snapshot()
     }
 
+    /**
+     * Publishes a live progress update at most once per
+     * [TransferTuning.DISPLAY_REFRESH_MS]. The board is still updated on every
+     * callback (sampling is unchanged); only the UI/notification emission is
+     * throttled, so the screen redraws about once a second instead of ~20.
+     */
+    @Synchronized
+    private fun publishProgress() {
+        val t = now()
+        if (t - lastProgressPublishAt < TransferTuning.DISPLAY_REFRESH_MS) return
+        lastProgressPublishAt = t
+        publish()
+    }
+
     private fun finish(id: String, result: PushResult) {
         when (result) {
             is PushResult.Sent -> end(id, TransferState.Done, "Sent ${result.files} file(s)")
@@ -443,9 +498,9 @@ object TransferManager {
         }
     }
 
-    private fun finishDownload(id: String, result: DownloadResult) {
+    private fun finishDownload(id: String, result: DownloadResult, folder: String? = null) {
         when (result) {
-            is DownloadResult.Done -> end(id, TransferState.Done, "Received ${result.files} file(s)")
+            is DownloadResult.Done -> end(id, TransferState.Done, "Received ${result.files} file(s)", folder)
             DownloadResult.Cancelled -> end(id, TransferState.Cancelled, "Cancelled")
             DownloadResult.ShareEnded -> end(id, TransferState.Failed, "The sender stopped this share")
             DownloadResult.PeerUnreachable -> end(id, TransferState.Failed, "The other device is unreachable")
@@ -456,12 +511,12 @@ object TransferManager {
     }
 
     /** Ends a live row; a row already ended (e.g. by Cancel) is left alone. */
-    private fun end(id: String, state: TransferState, message: String) {
-        if (board.end(id, state, message) == null) return
+    private fun end(id: String, state: TransferState, message: String, folder: String? = null) {
+        if (board.end(id, state, message, folder) == null) return
         pushReceives.remove(id)
         cleanups.remove(id)?.invoke()
         cancels.remove(id)
-        speedMeters.remove(id)
+        rateDisplays.remove(id)
         publish()
         persist()
         if (state == TransferState.Done) {
@@ -491,12 +546,12 @@ object TransferManager {
     }
 
     /**
-     * The smoothed live rate for [id], or 0.0 to show nothing. A stall followed
-     * by a resume returns null from [SpeedMeter] and becomes 0.0 here, so the
-     * row and notification go blank rather than flashing a spike.
+     * The smoothed live rate and ETA for [id]. A stall followed by a resume
+     * yields 0.0 / null, so the row and notification go blank rather than
+     * flashing a spike; the ETA always comes from that same smoothed rate.
      */
-    private fun sampleSpeed(id: String, done: Long): Double =
-        speedMeters.getOrPut(id) { SpeedMeter() }.sample(now(), done) ?: 0.0
+    private fun sampleRate(id: String, done: Long, total: Long): RateEtaDisplay.Snapshot =
+        rateDisplays.getOrPut(id) { RateEtaDisplay() }.sample(now(), done, total)
 
     private fun newId(): String {
         val buf = ByteArray(6)
@@ -508,19 +563,8 @@ object TransferManager {
 
     // --- persistence ---
 
-    private fun historyFile(): File = File(app.filesDir, "transfers.json")
-
-    private fun loadHistory(): List<TransferRecord> = try {
-        val f = historyFile()
-        if (!f.isFile) emptyList()
-        else gson.fromJson<MutableList<TransferRecord>>(f.readText(), historyType) ?: mutableListOf()
-    } catch (_: Exception) {
-        emptyList()
-    }
-
+    /** Mirrors the whole list to private storage; the newest [HISTORY_CAP] rows. */
     private fun persist() {
-        runCatching {
-            historyFile().writeText(gson.toJson(board.snapshot().take(HISTORY_CAP), historyType))
-        }
+        runCatching { history?.save(board.snapshot()) }
     }
 }

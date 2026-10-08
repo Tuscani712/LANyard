@@ -48,6 +48,10 @@ class PairingSessions(
     // One line per pairing event for the diagnostics report:
     // `[pairing] peer=<short> <event> ...`.
     private val diag: (String) -> Unit = {},
+    // Called with the peer's fingerprint once a pair-mode confirm has written
+    // the trust entry. The app clears any pending-unpair record for that peer
+    // here, so a revoke queued before this pairing can never undo it.
+    private val onPaired: (String) -> Unit = {},
 ) {
     companion object {
         const val MODE_CONNECT = "connect"
@@ -220,6 +224,9 @@ class PairingSessions(
     @Synchronized
     fun confirm(id: String, callerFp: String): SessionView {
         val sess = requirePeer(id, callerFp)
+        // A replayed confirm is a no-op success: the session is already active,
+        // the pairing was written once, so do not save or log a second time.
+        if (sess.status == STATUS_ACTIVE) return view(sess)
         if (sess.status == STATUS_PENDING) throw PeerHttpException(409, "the request was not accepted")
         if (sess.status != STATUS_ACCEPTED) throw PeerHttpException(409, "session is ${sess.status}")
         sess.status = STATUS_ACTIVE
@@ -238,6 +245,10 @@ class PairingSessions(
                     askOver = sess.granted.askOver,
                 ),
             )
+            // A successful re-pair supersedes any unpair that was queued while
+            // this peer was offline; forgetting it here prevents a later retry
+            // from revoking the fresh pairing.
+            onPaired(sess.peerFp)
         }
         diag("[pairing] peer=${Display.shortFp(sess.peerFp)} confirmed id=$id stored=${sess.mode == MODE_PAIR}")
         onChange()

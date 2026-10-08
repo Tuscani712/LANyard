@@ -15,7 +15,10 @@ import androidx.core.content.ContextCompat
 import io.github.tuscani712.lanyard.SettingsHolder
 import io.github.tuscani712.lanyard.core.TransferRecord
 import io.github.tuscani712.lanyard.core.TransferState
-import io.github.tuscani712.lanyard.core.formatSpeed
+import io.github.tuscani712.lanyard.core.TransferTuning
+import io.github.tuscani712.lanyard.core.estimateEtaSeconds
+import io.github.tuscani712.lanyard.core.formatBytes
+import io.github.tuscani712.lanyard.core.formatRateAndEta
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -45,12 +48,22 @@ class TransferService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
         scope.launch {
+            // The active set is rebuilt on every state emission, but a progress
+            // emission only redraws the notification text about once a second.
+            // A change in which rows are active (start/finish) is always shown.
+            var lastStructure = ""
+            var lastNotifyAt = 0L
             TransferManager.state.collect { list ->
                 val active = list.filter { it.state == TransferState.Running || it.state == TransferState.Queued }
                 if (active.isEmpty()) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                 } else {
+                    val now = System.currentTimeMillis()
+                    val structure = active.joinToString("|") { "${it.id}:${it.state}" }
+                    if (structure == lastStructure && now - lastNotifyAt < TransferTuning.DISPLAY_REFRESH_MS) return@collect
+                    lastStructure = structure
+                    lastNotifyAt = now
                     val notification = buildNotification(active)
                     ContextCompat.getSystemService(this@TransferService, NotificationManager::class.java)
                         ?.notify(NOTIFICATION_ID, notification)
@@ -69,18 +82,32 @@ class TransferService : Service() {
         val done = active.sumOf { it.done }
         val total = active.sumOf { it.total }
         val sending = active.any { it.direction == "send" }
+        val unit = SettingsHolder.settings.value.speedUnit
         val text = when {
             active.isEmpty() -> "Preparing…"
             active.size == 1 -> {
                 val a = active[0]
-                val speed = if (a.speed > 0) " · " + formatSpeed(a.speed, SettingsHolder.settings.value.speedUnit) else ""
-                (if (sending) "Sending " else "Receiving ") + a.label + speed
+                // Every byte is in/out and the row is hashing, copying or waiting
+                // for the receiver's confirmation: say so, with the size, rather
+                // than a silent 100% (or, for a send, the honest <100% cap).
+                if (a.finishing) {
+                    val size = formatBytes(a.finishingBytes ?: a.total)
+                    "Finishing… " + a.label + " · " + size
+                } else {
+                    val rate = formatRateAndEta(a.speed, a.etaSeconds, unit)
+                    val suffix = if (rate.isNotEmpty()) " · $rate" else ""
+                    (if (sending) "Sending " else "Receiving ") + a.label + suffix
+                }
             }
             else -> {
-                // Keep a rate visible even with several transfers in flight.
+                // Keep a rate + ETA visible even with several transfers in
+                // flight: combined remaining at the combined smoothed rate.
                 val combined = active.sumOf { it.speed }
-                val speed = if (combined > 0) " · " + formatSpeed(combined, SettingsHolder.settings.value.speedUnit) else ""
-                "${active.size} transfers$speed"
+                val remaining = active.sumOf { (it.total - it.done).coerceAtLeast(0L) }
+                val rate = formatRateAndEta(combined, estimateEtaSeconds(remaining, combined), unit)
+                val suffix = if (rate.isNotEmpty()) " · $rate" else ""
+                val finishing = if (active.any { it.finishing }) " · Finishing…" else ""
+                "${active.size} transfers$suffix$finishing"
             }
         }
         val cancel = PendingIntent.getBroadcast(

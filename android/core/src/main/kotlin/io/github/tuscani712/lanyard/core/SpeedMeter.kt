@@ -3,6 +3,9 @@ package io.github.tuscani712.lanyard.core
 /**
  * A smoothed transfer rate over a sliding ~[windowMillis] window.
  *
+ * The default window is [TransferTuning.WINDOW_MS] (5 seconds), shared with the
+ * row and the notification so neither surface can drift.
+ *
  * [sample] is fed the cumulative bytes moved and the wall-clock time of each
  * progress callback. It returns the average rate (bytes/second) across the
  * window, or null when no honest rate can be shown yet:
@@ -23,7 +26,7 @@ package io.github.tuscani712.lanyard.core
  */
 class SpeedMeter(
     private val windowMillis: Long = DEFAULT_WINDOW_MS,
-    private val stallAfterMillis: Long = DEFAULT_WINDOW_MS,
+    private val stallAfterMillis: Long = DEFAULT_STALL_MS,
 ) {
     private val times = ArrayDeque<Long>()
     private val bytes = ArrayDeque<Long>()
@@ -81,7 +84,10 @@ class SpeedMeter(
     }
 
     companion object {
-        /** The rolling window, ~3 seconds as required. */
-        const val DEFAULT_WINDOW_MS = 3_000L
+        /** The rolling window, ~5 seconds as required. */
+        const val DEFAULT_WINDOW_MS = TransferTuning.WINDOW_MS
+
+        /** A gap this long is a resume; the window resets and no rate is shown. */
+        const val DEFAULT_STALL_MS = TransferTuning.STALL_AFTER_MS
     }
 }

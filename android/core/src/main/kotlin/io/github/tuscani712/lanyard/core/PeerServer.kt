@@ -60,6 +60,9 @@ class PeerServer(
     private val wifiOnly: () -> Boolean = { true },
     private val approval: PushApproval? = null,
     private val onUnpair: (String) -> Unit = {},
+    // A verified peer finished the TLS handshake with us: it is reachable right
+    // now. The app uses this to retry a pending-unpair notification promptly.
+    private val onPeerReachable: (String) -> Unit = {},
     private val shares: ShareServer? = null,
     private val headerTimeoutMillis: Int = 15_000,
     private val stallTimeoutMillis: Int = 30_000,
@@ -181,6 +184,10 @@ class PeerServer(
             val fp = peerFingerprint(ssl) ?: run { reason = "no-cert"; return }
             peerShort = fp.take(8)
             diag("[conn] handshake ok peer=$peerShort paired=${if (isPaired(fp) != null) "yes" else "no"}")
+            // An inbound handshake means this peer is reachable; a pending
+            // unpair for it can be delivered now. Notify off this thread so a
+            // slow revoke can never stall the request loop.
+            runCatching { onPeerReachable(fp) }
             reason = requestLoop(ssl, fp)
         } catch (e: Exception) {
             // handshake/read failure or a timeout: classify for the report.
@@ -681,9 +688,13 @@ class PeerServer(
     }
 
     private fun handleTrustRevoke(fp: String): Pair<Int, String> {
-        if (isPaired(fp) == null) throw PeerHttpException(403, "not paired")
-        onUnpair(fp) // only ever the caller's own entry
-        diag("[pairing] peer=${fp.take(8)} unpair source=remote result=ok")
+        // Idempotent: revoking only ever drops the caller's own entry, so a
+        // caller we already do not trust is exactly the end state we want and
+        // must still get a 200. A racing duplicate retry therefore cannot make
+        // the desktop see a spurious 403 "not paired" and re-arm/retry.
+        val wasPaired = isPaired(fp) != null
+        onUnpair(fp)
+        diag("[pairing] peer=${fp.take(8)} unpair source=remote result=ok paired=$wasPaired")
         return 200 to """{"ok":true}"""
     }
 

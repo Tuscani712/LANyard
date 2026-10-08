@@ -112,13 +112,42 @@ class PairingSessionsTest {
     }
 
     @Test
-    fun replayConfirmRefused() {
+    fun replayConfirmIsNoOpSuccess() {
         val s = sessions()
         val peer = "ee".repeat(32)
         val v = s.createIncoming("pair", peer, "E", "e", "h", nonce(), Permissions())
         s.accept(v.id, Permissions())
+        val first = s.confirm(v.id, peer)
+        assertEquals(PairingSessions.STATUS_ACTIVE, first.status)
+        assertNotNull(trust.find(peer))
+        // A replayed confirm is a no-op success, not an error, and does not
+        // write a second trust entry or change the active session.
+        val replay = s.confirm(v.id, peer)
+        assertEquals(PairingSessions.STATUS_ACTIVE, replay.status)
+        assertNotNull(trust.find(peer))
+    }
+
+    @Test
+    fun pairConfirmForgetsPendingUnpairAndConnectDoesNot() {
+        val cleared = ArrayList<String>()
+        val s = PairingSessions(
+            selfFp = { self },
+            trust = trust,
+            clock = { now },
+            onPaired = { cleared.add(it) },
+        )
+        val peer = "6a".repeat(32)
+        val v = s.createIncoming("pair", peer, "P", "p", "h", nonce(), Permissions())
+        s.accept(v.id, Permissions())
         s.confirm(v.id, peer)
-        assertThrows(PeerHttpException::class.java) { s.confirm(v.id, peer) }
+        assertEquals(listOf(peer), cleared, "a successful pair confirm must forget a queued unpair")
+
+        // A connect-mode confirm stores nothing and must not clear anything.
+        val other = "6b".repeat(32)
+        val c = s.createIncoming("connect", other, "C", "c", "h", nonce(), Permissions())
+        s.accept(c.id, Permissions())
+        s.confirm(c.id, other)
+        assertEquals(listOf(peer), cleared, "a connect confirm is not a re-pair")
     }
 
     @Test

@@ -37,9 +37,15 @@ class SafInboxDestination(
         } else {
             dir.createFile(MIME, uniqueName(dir, name))
         } ?: throw IOException("Could not create the file.")
-        context.contentResolver.openOutputStream(target.uri, "wt")?.use { out ->
-            spool.inputStream().use { it.copyTo(out, 256 * 1024) }
-        } ?: throw IOException("Could not write the file.")
+        try {
+            context.contentResolver.openOutputStream(target.uri, "wt")?.use { out ->
+                spool.inputStream().use { it.copyTo(out, 256 * 1024) }
+            } ?: throw IOException("Could not write the file.")
+        } catch (e: Exception) {
+            // Never leave a partial file under its final, normal-looking name.
+            runCatching { target.delete() }
+            throw e
+        }
         return target.name ?: name
     }
 

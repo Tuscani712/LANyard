@@ -33,6 +33,8 @@ import io.github.tuscani712.lanyard.SettingsHolder
 import io.github.tuscani712.lanyard.core.SpeedUnit
 import io.github.tuscani712.lanyard.core.TransferRecord
 import io.github.tuscani712.lanyard.core.TransferState
+import io.github.tuscani712.lanyard.core.formatBytes
+import io.github.tuscani712.lanyard.core.formatRateAndEta
 import io.github.tuscani712.lanyard.core.formatSpeed
 import io.github.tuscani712.lanyard.transfer.TransferManager
 
@@ -52,14 +54,28 @@ fun TransfersScreen(padding: PaddingValues) {
         return
     }
 
-    LazyColumn(modifier = Modifier.fillMaxSize().padding(padding)) {
-        items(records, key = { it.id }) { record ->
-            TransferRow(
-                record,
-                settings.speedUnit,
-                onCancel = { TransferManager.cancel(record.id) },
-                onDismiss = { TransferManager.dismiss(record.id) },
-            )
+    val finished = records.count { it.state != TransferState.Running && it.state != TransferState.Queued }
+
+    Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+        if (finished > 0) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.End,
+            ) {
+                OutlinedButton(onClick = { TransferManager.clearFinished() }) {
+                    Text("Clear finished")
+                }
+            }
+        }
+        LazyColumn(modifier = Modifier.fillMaxSize().weight(1f)) {
+            items(records, key = { it.id }) { record ->
+                TransferRow(
+                    record,
+                    settings.speedUnit,
+                    onCancel = { TransferManager.cancel(record.id) },
+                    onDismiss = { TransferManager.dismiss(record.id) },
+                )
+            }
         }
     }
 }
@@ -96,18 +112,27 @@ private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: 
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Spacer(Modifier.height(4.dp))
-                // Live speed while running (blank when the meter has no honest
-                // rate, e.g. just after a resume); the whole-transfer average
-                // once finished, so a receive row shows its speed too.
-                val speed = when {
-                    record.state == TransferState.Running && record.speed > 0 ->
-                        " · " + formatSpeed(record.speed, speedUnit)
+                // Live speed + ETA while running (blank when the meter has no
+                // honest rate, e.g. just after a resume); the whole-transfer
+                // average once finished, so a receive row shows its speed too.
+                // In the finishing window the size is called out first; the live
+                // rate/ETA is still appended when the meter has one, so neither
+                // the size nor the speed display is lost.
+                val rate = when {
+                    record.state == TransferState.Running && record.finishing -> {
+                        val live = formatRateAndEta(record.speed, record.etaSeconds, speedUnit)
+                        "Finishing… · " + formatBytes(record.finishingBytes ?: record.total) +
+                            if (live.isNotEmpty()) " · $live" else ""
+                    }
+                    record.state == TransferState.Running ->
+                        formatRateAndEta(record.speed, record.etaSeconds, speedUnit)
                     record.state == TransferState.Done && record.averageSpeed > 0 ->
-                        " · avg " + formatSpeed(record.averageSpeed, speedUnit)
+                        "avg " + formatSpeed(record.averageSpeed, speedUnit)
                     else -> ""
                 }
                 Text(
-                    "${humanSize(record.done)} / ${humanSize(record.total)}$speed",
+                    "${formatBytes(record.done)} / ${formatBytes(record.total)}" +
+                        if (rate.isNotEmpty()) " · $rate" else "",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -115,6 +140,18 @@ private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: 
             record.message?.takeIf { record.state != TransferState.Running }?.let {
                 Spacer(Modifier.height(4.dp))
                 Text(it, style = MaterialTheme.typography.bodySmall)
+            }
+            // A finished receive names the folder it landed in, so the files are
+            // findable after the transfer has left the notification.
+            record.destinationFolder?.takeIf {
+                record.state == TransferState.Done && record.direction == "receive" && it.isNotBlank()
+            }?.let {
+                Spacer(Modifier.height(2.dp))
+                Text(
+                    "Saved to $it",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
             if (record.state == TransferState.Running || record.state == TransferState.Queued) {
                 Spacer(Modifier.height(8.dp))
@@ -133,20 +170,12 @@ private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: 
 
 private fun stateLabel(record: TransferRecord): String = when (record.state) {
     TransferState.Queued -> "Waiting"
-    TransferState.Running -> if (record.direction == "send") "Sending" else "Receiving"
+    TransferState.Running -> when {
+        record.finishing -> "Finishing…"
+        record.direction == "send" -> "Sending"
+        else -> "Receiving"
+    }
     TransferState.Done -> "Done"
     TransferState.Failed -> "Failed"
     TransferState.Cancelled -> "Cancelled"
-}
-
-private fun humanSize(bytes: Long): String {
-    if (bytes < 1024) return "$bytes B"
-    val units = listOf("KB", "MB", "GB", "TB")
-    var value = bytes.toDouble() / 1024
-    var unit = 0
-    while (value >= 1024 && unit < units.lastIndex) {
-        value /= 1024
-        unit++
-    }
-    return "%.1f %s".format(value, units[unit])
 }

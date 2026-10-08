@@ -41,6 +41,12 @@ class PushSession(private val client: PeerClient, private val throttle: Throttle
     fun push(
         sources: List<PushSource>,
         onProgress: (fileIndex: Int, sent: Long, fileTotal: Long) -> Unit = { _, _, _ -> },
+        // Fired after every byte of a file is on the wire but before the
+        // receiver's complete response is read: the file is still being hashed
+        // and placed there. Progress stays capped below 100% until that response
+        // (see [SendProgress]), so without this the row would sit silently at the
+        // cap. [bytes] is the file's full size being confirmed.
+        onFinishing: (fileIndex: Int, bytes: Long) -> Unit = { _, _ -> },
         isCancelled: () -> Boolean = { false },
     ): PushResult {
         if (sources.isEmpty()) return PushResult.Failed("nothing to send")
@@ -73,6 +79,9 @@ class PushSession(private val client: PeerClient, private val throttle: Throttle
                     isCancelled = isCancelled,
                     throttle = throttle,
                 )
+                // Every byte is written; the receiver still has to hash and place
+                // the file before it answers. That wait is the finishing window.
+                onFinishing(index, source.size)
                 client.pushCompleteFile(offer.pushId, source.relPath, result.sha256)
                 overall += result.bytes
                 onProgress(index, source.size, source.size)
