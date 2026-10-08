@@ -1218,7 +1218,6 @@ async function downloadUpdate() {
 }
 
 async function saveSettings() {
-  const msg = $("set-msg");
   const body = {
     device_name: $("set-name").value.trim(),
     device_id_label: $("set-label").value.trim(),
@@ -1238,10 +1237,17 @@ async function saveSettings() {
   const opts = { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   let r = await fetch("/api/settings", opts);
   if (r.status === 409) { const j = await r.json(); if (!confirm(j.warning)) return; body.confirm_device_id = true; r = await fetch("/api/settings", opts); }
-  if (!r.ok) { msg.hidden = false; msg.className = "msg err"; msg.textContent = (await r.text()).trim(); return; }
+  if (!r.ok) { const m = $("set-msg"); if (m) { m.hidden = false; m.className = "msg err"; m.textContent = (await r.text()).trim(); } return; }
   const s = await r.json();
   applySettings(s); renderSettings(s); loadSelf();
-  msg.hidden = false; msg.className = "msg"; msg.textContent = "Saved.";
+  // renderSettings rebuilt #set-msg, so re-query the live node before writing
+  // the result; otherwise the message lands in a detached element and is never seen.
+  const msg = $("set-msg");
+  if (msg) {
+    msg.hidden = false;
+    if (s.warning) { msg.className = "msg err"; msg.textContent = "Saved, but " + s.warning; }
+    else { msg.className = "msg"; msg.textContent = "Saved."; }
+  }
 }
 async function cancelAllShares() {
   if (!confirm("Cancel ALL shares and stop every in-progress transfer?")) return;
