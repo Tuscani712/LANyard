@@ -55,7 +55,7 @@ func TestOnPeerSeenFiresOnHello(t *testing.T) {
 // request is validated or accepted, so onSeen fires for it too.
 func TestOnPeerSeenFiresOnInboundHandshake(t *testing.T) {
 	s, seen := peerSeenServer(t)
-	body := `{"mode":"connect","name":"Bob","device_id":"bob-dev","nonce":"0123456789abcdef"}`
+	body := `{"mode":"connect","name":"Bob","device_id":"peer-fp","nonce":"0123456789abcdef"}`
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/session/request", strings.NewReader(body))
 	req = req.WithContext(context.WithValue(req.Context(), peerIDKey, "peer-fp"))
 	rr := httptest.NewRecorder()

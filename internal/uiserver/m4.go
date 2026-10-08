@@ -336,7 +336,7 @@ func (s *Server) handleSessionStart(w http.ResponseWriter, r *http.Request) {
 	sess := s.d.Trust.CreateOutgoing(req.Mode, p.DeviceID, firstNonEmpty(p.Name, req.Device), self.Name, req.Permissions)
 	nonce, _ := s.d.Trust.SelfNonce(sess.ID)
 	resp, err := s.d.Client.StartSession(r.Context(), host, port, p.DeviceID, peerapi.SessionRequestPayload{
-		Mode: req.Mode, Name: self.Name, DeviceID: self.Name,
+		Mode: req.Mode, Name: self.Name, DeviceID: self.DeviceID,
 		Nonce: nonce, Requested: req.Permissions, Invite: req.Invite,
 	})
 	if err != nil {

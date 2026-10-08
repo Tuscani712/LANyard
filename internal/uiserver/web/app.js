@@ -188,6 +188,7 @@ const S = {
   view: "devices",
   search: "",
   mode: "grid",
+  settingsTab: "general",
   ex: {
     roots: null,
     hist: [{ kind: "home" }],
@@ -1154,25 +1155,101 @@ function actionBtn(label, url) { const b = el("button", "btn ghost", label); b.a
 function btn(label, fn, cls) { const b = el("button", "btn" + (cls ? " " + cls : ""), label); b.addEventListener("click", (e) => { e.stopPropagation(); fn(); }); return b; }
 
 // ---------- settings ----------
+// Settings is a two-column layout: a left tab strip of seven categories and a
+// right pane. The chosen tab persists so a reload (or reopening Settings)
+// reopens the same category.
+const SETTINGS_TAB_KEY = "lanyard.settings.tab";
+const SETTINGS_TABS = [
+  { id: "general", label: "General" },
+  { id: "receiving", label: "Receiving" },
+  { id: "network", label: "Network & Discovery" },
+  { id: "notifications", label: "Notifications" },
+  { id: "pairing", label: "Pairing & Security" },
+  { id: "logs", label: "Logs & Diagnostics" },
+  { id: "about", label: "About" },
+];
+function savedSettingsTab() {
+  try {
+    const t = localStorage.getItem(SETTINGS_TAB_KEY);
+    return SETTINGS_TABS.some((x) => x.id === t) ? t : "general";
+  } catch (e) { return "general"; }
+}
+function setSettingsTab(id) {
+  S.settingsTab = id;
+  try { localStorage.setItem(SETTINGS_TAB_KEY, id); } catch (e) { }
+}
+
 async function openSettings() {
-  const box = $("settings-body");
-  clear(box); box.appendChild(el("div", "empty", "Loading\u2026"));
+  const tabs = $("settings-tabs"), pane = $("settings-pane");
+  clear(tabs); clear(pane); pane.appendChild(el("div", "empty", "Loading\u2026"));
   const r = await fetch("/api/settings");
-  if (!r.ok) { clear(box); box.appendChild(el("div", "empty", (await r.text()).trim())); return; }
+  if (!r.ok) { clear(pane); pane.appendChild(el("div", "empty", (await r.text()).trim())); return; }
   const s = await r.json();
   applySettings(s);
-  renderSettings(s);
+  S.settingsTab = savedSettingsTab();
+  renderSettingsTabs(s);
+  renderSettingsPane(s);
 }
 function renderSettings(s) {
-  const box = $("settings-body");
-  clear(box);
+  renderSettingsTabs(s);
+  renderSettingsPane(s);
+}
+function renderSettingsTabs(s) {
+  const tabs = $("settings-tabs");
+  clear(tabs);
+  for (const t of SETTINGS_TABS) {
+    const active = t.id === S.settingsTab;
+    const b = el("button", "set-tab" + (active ? " active" : ""), t.label);
+    b.type = "button";
+    b.setAttribute("role", "tab");
+    b.setAttribute("aria-selected", active ? "true" : "false");
+    b.addEventListener("click", () => { setSettingsTab(t.id); renderSettingsTabs(s); renderSettingsPane(s); });
+    tabs.appendChild(b);
+  }
+}
+// settingsFooter adds a per-tab message node (id "set-msg-<tab>") that a save
+// writes to *after* re-rendering, so "Saved." lands in a node that is live.
+function settingsFooter(pane, tab, extras) {
+  const msg = el("div", "msg err", "");
+  msg.hidden = true; msg.id = "set-msg-" + tab;
+  pane.appendChild(msg);
+  const acts = el("div", "actions");
+  acts.appendChild(btn("Save", saveSettings));
+  for (const b of (extras || [])) acts.appendChild(b);
+  pane.appendChild(acts);
+}
+function renderSettingsPane(s) {
+  const pane = $("settings-pane");
+  clear(pane);
+  switch (S.settingsTab) {
+    case "receiving": renderSettingsReceiving(pane, s); break;
+    case "network": renderSettingsNetwork(pane, s); break;
+    case "notifications": renderSettingsNotifications(pane, s); break;
+    case "pairing": renderSettingsPairing(pane, s); break;
+    case "logs": renderSettingsLogs(pane, s); break;
+    case "about": renderSettingsAbout(pane, s); break;
+    default: renderSettingsGeneral(pane, s);
+  }
+}
+function renderSettingsGeneral(pane, s) {
   const name = textInput(s.device_name, "set-name");
   const label = textInput(s.device_id_label, "set-label"); label.placeholder = s.generated_label || "";
-  const theme = selectEl([["dark", "Dark"], ["light", "Light"]], s.theme === "light" ? "light" : "dark", "set-theme");
+  const theme = selectEl([["system", "System"], ["dark", "Dark"], ["light", "Light"]], s.theme || "dark", "set-theme");
   const speed = selectEl([["mbs", "MB/s"], ["mbps", "Mbps"]], s.speed_unit || "mbs", "set-speed");
-  const sound = checkInput(s.sound_on_complete, "set-sound");
-  const notif = checkInput(s.notifications, "set-notif");
   const startup = checkInput(s.start_on_login, "set-startup");
+  const tray = checkInput(s.minimize_to_tray, "set-tray");
+  pane.appendChild(settingsField("Device name", name));
+  pane.appendChild(settingsField("Device ID (label)", label));
+  pane.appendChild(el("p", "muted", "The Device ID is a label; identity stays bound to the certificate fingerprint (" + (s.fingerprint || "").slice(0, 16) + "\u2026). Changing it does not affect pairings."));
+  pane.appendChild(settingsField("Theme", theme));
+  pane.appendChild(settingsField("Speed unit", speed));
+  pane.appendChild(settingsField("Start LANyard when I sign in", startup));
+  tray.disabled = !s.tray_supported;
+  pane.appendChild(settingsField("Minimize to system tray (closing or minimizing hides the window; use the tray icon to reopen or quit)", tray));
+  if (!s.tray_supported) pane.appendChild(el("p", "muted", s.tray_reason || "The system tray is not available in this mode."));
+  settingsFooter(pane, "general");
+}
+function renderSettingsReceiving(pane, s) {
   const dl = textInput(s.default_download_folder, "set-dl"); dl.readOnly = true; dl.placeholder = "Ask each time";
   const dlWrap = withBrowse(dl, "Choose the default download folder");
   dlWrap.appendChild(btn("Clear", () => { dl.value = ""; }, "ghost"));
@@ -1180,54 +1257,30 @@ function renderSettings(s) {
   const inboxWrap = withBrowse(inbox, "Choose the Inbox folder");
   inboxWrap.appendChild(btn("Use default", () => { inbox.value = ""; }, "ghost"));
   inboxWrap.appendChild(btn("Open folder", () => fetch("/api/inbox/open", { method: "POST" }), "ghost"));
-  const tray = checkInput(s.minimize_to_tray, "set-tray");
   const bw = numberInput(s.bandwidth_limit_mbps || 0, "set-bw");
+  pane.appendChild(settingsField("Default download folder", dlWrap));
+  pane.appendChild(settingsField("Inbox folder (pushes)", inboxWrap));
+  pane.appendChild(settingsField("Bandwidth limit (MB/s, 0 = unlimited)", bw));
+  settingsFooter(pane, "receiving");
+}
+function renderSettingsNetwork(pane, s) {
   const port = numberInput(s.peer_port || 47800, "set-port");
-
-  box.appendChild(settingsField("Device name", name));
-  box.appendChild(settingsField("Device ID (label)", label));
-  box.appendChild(el("p", "muted", "The Device ID is a label; identity stays bound to the certificate fingerprint (" + (s.fingerprint || "").slice(0, 16) + "\u2026). Changing it does not affect pairings."));
-  box.appendChild(settingsField("Theme", theme));
-  box.appendChild(settingsField("Speed unit", speed));
-  box.appendChild(settingsField("Sound when a transfer finishes", sound));
-  box.appendChild(settingsField("Show desktop notifications for pairing requests and finished transfers", notif));
-  box.appendChild(settingsField("Start LANyard when I sign in", startup));
-  tray.disabled = !s.tray_supported;
-  box.appendChild(settingsField("Minimize to system tray (closing or minimizing hides the window; use the tray icon to reopen or quit)", tray));
-  if (!s.tray_supported) box.appendChild(el("p", "muted", s.tray_reason || "The system tray is not available in this mode."));
-  box.appendChild(settingsField("Default download folder", dlWrap));
-  box.appendChild(settingsField("Inbox folder (pushes)", inboxWrap));
-  box.appendChild(settingsField("Bandwidth limit (MB/s, 0 = unlimited)", bw));
-  box.appendChild(settingsField("Peer port (restart to apply)", port));
-
-  // Updates. The whole block is hidden until a release channel is configured
-  // (the compiled default has none), so no update control is ever offered that
-  // could make the app contact the internet by itself.
-  if (s.update_url && s.update_url.trim()) {
-    const updURL = textInput(s.update_url, "set-update-url");
-    updURL.style.minWidth = "360px";
-    const auto = checkInput(s.auto_update, "set-auto-update");
-    const updResult = el("div", "msg", ""); updResult.hidden = true; updResult.id = "set-upd-result";
-    box.appendChild(el("div", "section-title", "Updates"));
-    box.appendChild(settingsField("Running version", el("div", "muted", s.version || "")));
-    box.appendChild(settingsField("Update manifest URL (https)", updURL));
-    box.appendChild(settingsField("Download new versions automatically", auto));
-    const updActions = el("div", "actions");
-    updActions.appendChild(btn("Check for updates", checkForUpdates, "ghost"));
-    updActions.appendChild(btn("Download update", downloadUpdate, "ghost"));
-    box.appendChild(updActions);
-    box.appendChild(updResult);
-  }
-
-  const msg = el("div", "msg err", ""); msg.hidden = true; msg.id = "set-msg"; box.appendChild(msg);
-  const acts = el("div", "actions");
-  acts.appendChild(btn("Save", saveSettings));
-  acts.appendChild(btn("Troubleshoot", () => openDiagnostics(), "ghost"));
-  acts.appendChild(btn("Cancel all shares", cancelAllShares, "ghost"));
-  box.appendChild(acts);
-
-  if (s.paired && s.paired.length) {
-    box.appendChild(el("div", "section-title", "Paired devices"));
+  pane.appendChild(el("p", "muted", "How this device is found and reached on the local network."));
+  pane.appendChild(settingsField("Peer port (restart to apply)", port));
+  settingsFooter(pane, "network");
+}
+function renderSettingsNotifications(pane, s) {
+  const sound = checkInput(s.sound_on_complete, "set-sound");
+  const notif = checkInput(s.notifications, "set-notif");
+  pane.appendChild(settingsField("Sound when a transfer finishes", sound));
+  pane.appendChild(settingsField("Show desktop notifications for pairing requests and finished transfers", notif));
+  settingsFooter(pane, "notifications");
+}
+function renderSettingsPairing(pane, s) {
+  if (!s.paired || !s.paired.length) {
+    pane.appendChild(el("p", "muted", "No paired devices yet."));
+  } else {
+    pane.appendChild(el("div", "section-title", "Paired devices"));
     for (const e of s.paired) {
       const p = e.permissions || {};
       const row = el("div", "row");
@@ -1260,10 +1313,36 @@ function renderSettings(s) {
       acts2.appendChild(btn("Edit", () => { editor.hidden = !editor.hidden; }, "ghost"));
       acts2.appendChild(btn("Unpair", () => unpair(e.cert_fingerprint, e), "ghost"));
       row.appendChild(acts2);
-      box.appendChild(row);
-      box.appendChild(editor);
+      pane.appendChild(row);
+      pane.appendChild(editor);
     }
   }
+  settingsFooter(pane, "pairing", [btn("Cancel all shares", cancelAllShares, "ghost")]);
+}
+function renderSettingsLogs(pane, s) {
+  pane.appendChild(el("p", "muted", "Diagnostics collects a snapshot of logs and connection state to help troubleshoot."));
+  settingsFooter(pane, "logs", [btn("Troubleshoot", () => openDiagnostics(), "ghost")]);
+}
+function renderSettingsAbout(pane, s) {
+  pane.appendChild(settingsField("Running version", el("div", "muted", s.version || "")));
+  // Updates. The whole block is hidden until a release channel is configured
+  // (the compiled default has none), so no update control is ever offered that
+  // could make the app contact the internet by itself.
+  if (s.update_url && s.update_url.trim()) {
+    const updURL = textInput(s.update_url, "set-update-url");
+    updURL.style.minWidth = "360px";
+    const auto = checkInput(s.auto_update, "set-auto-update");
+    const updResult = el("div", "msg", ""); updResult.hidden = true; updResult.id = "set-upd-result";
+    pane.appendChild(el("div", "section-title", "Updates"));
+    pane.appendChild(settingsField("Update manifest URL (https)", updURL));
+    pane.appendChild(settingsField("Download new versions automatically", auto));
+    const updActions = el("div", "actions");
+    updActions.appendChild(btn("Check for updates", checkForUpdates, "ghost"));
+    updActions.appendChild(btn("Download update", downloadUpdate, "ghost"));
+    pane.appendChild(updActions);
+    pane.appendChild(updResult);
+  }
+  settingsFooter(pane, "about");
 }
 function withBrowse(input, title) {
   const w = el("div", "browse-wrap");
@@ -1306,31 +1385,37 @@ async function downloadUpdate() {
 }
 
 async function saveSettings() {
+  // Only the active tab's fields are in the DOM; fall back to the last known
+  // settings for everything on the other tabs so a save never clobbers them.
+  const gv = (id, cur) => ($(id) ? $(id).value.trim() : cur);
+  const gc = (id, cur) => ($(id) ? $(id).checked : !!cur);
+  const gn = (id, cur) => ($(id) ? (parseInt($(id).value || "0", 10) || 0) : (cur || 0));
   const body = {
-    device_name: $("set-name").value.trim(),
-    device_id_label: $("set-label").value.trim(),
-    theme: $("set-theme").value,
-    speed_unit: $("set-speed").value,
-    sound_on_complete: $("set-sound").checked,
-    notifications: $("set-notif").checked,
-    start_on_login: $("set-startup").checked,
-    ...($("set-tray") ? { minimize_to_tray: $("set-tray").checked } : {}),
-    default_download_folder: $("set-dl").value.trim(),
-    inbox_folder: $("set-inbox").value.trim(),
-    bandwidth_limit_mbps: parseInt($("set-bw").value || "0", 10) || 0,
-    peer_port: parseInt($("set-port").value || "47800", 10) || 47800,
-    ...($("set-update-url") ? { update_url: $("set-update-url").value.trim() } : {}),
-    ...($("set-auto-update") ? { auto_update: $("set-auto-update").checked } : {}),
+    device_name: gv("set-name", settings.device_name || ""),
+    device_id_label: gv("set-label", settings.device_id_label || ""),
+    theme: $("set-theme") ? $("set-theme").value : (settings.theme || "dark"),
+    speed_unit: $("set-speed") ? $("set-speed").value : (settings.speed_unit || "mbs"),
+    sound_on_complete: gc("set-sound", settings.sound_on_complete),
+    notifications: gc("set-notif", settings.notifications !== false),
+    start_on_login: gc("set-startup", settings.start_on_login),
+    minimize_to_tray: gc("set-tray", settings.minimize_to_tray),
+    default_download_folder: gv("set-dl", settings.default_download_folder || ""),
+    inbox_folder: gv("set-inbox", settings.inbox_folder || ""),
+    bandwidth_limit_mbps: gn("set-bw", settings.bandwidth_limit_mbps),
+    peer_port: gn("set-port", settings.peer_port || 47800),
+    update_url: gv("set-update-url", settings.update_url || ""),
+    auto_update: gc("set-auto-update", settings.auto_update),
   };
   const opts = { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) };
   let r = await fetch("/api/settings", opts);
   if (r.status === 409) { const j = await r.json(); if (!confirm(j.warning)) return; body.confirm_device_id = true; r = await fetch("/api/settings", opts); }
-  if (!r.ok) { const m = $("set-msg"); if (m) { m.hidden = false; m.className = "msg err"; m.textContent = (await r.text()).trim(); } return; }
+  if (!r.ok) { const m = $("set-msg-" + S.settingsTab); if (m) { m.hidden = false; m.className = "msg err"; m.textContent = (await r.text()).trim(); } return; }
   const s = await r.json();
   applySettings(s); renderSettings(s); loadSelf();
-  // renderSettings rebuilt #set-msg, so re-query the live node before writing
-  // the result; otherwise the message lands in a detached element and is never seen.
-  const msg = $("set-msg");
+  // renderSettings rebuilt the per-tab message node, so re-query the live node
+  // before writing the result; otherwise the message lands in a detached
+  // element and is never seen.
+  const msg = $("set-msg-" + S.settingsTab);
   if (msg) {
     msg.hidden = false;
     if (s.warning) { msg.className = "msg err"; msg.textContent = "Saved, but " + s.warning; }
@@ -1401,6 +1486,7 @@ function renderPair() {
     const sasBox = el("div", "sasbox");
     sasBox.appendChild(el("div", "muted", "Both devices must show the same code:"));
     sasBox.appendChild(el("div", "sas", sasText(v.sas)));
+    if (v.peer_fp) sasBox.appendChild(el("div", "muted", "Device fingerprint: " + v.peer_fp.slice(0, 16) + "\u2026"));
     body.appendChild(sasBox);
   }
   const status = el("p", "muted", ""); body.appendChild(status);
@@ -1931,7 +2017,8 @@ function closeDiag() { $("diag").hidden = true; }
 function applyTheme(theme) {
   settings.theme = theme || "dark";
   try { localStorage.setItem("lanyard.theme", settings.theme); } catch (e) { }
-  document.documentElement.dataset.theme = settings.theme === "light" ? "light" : "dark";
+  const sysLight = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches;
+  document.documentElement.dataset.theme = (settings.theme === "light" || (settings.theme === "system" && sysLight)) ? "light" : "dark";
 }
 function applySettings(s) { settings = Object.assign(settings, s); applyTheme(settings.theme); }
 

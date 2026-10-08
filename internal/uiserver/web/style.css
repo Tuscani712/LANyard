@@ -188,6 +188,12 @@ input::placeholder { color: var(--muted-2); }
 .set-row { display: flex; align-items: center; gap: 12px; margin: 9px 0; }
 .set-row .set-label { flex: 0 0 250px; color: var(--muted); }
 .set-row input, .set-row select { flex: 1; min-width: 0; }
+.settings-layout { display: flex; gap: 16px; align-items: flex-start; flex: 1; min-height: 0; }
+.settings-tabs { flex: 0 0 190px; width: 190px; display: flex; flex-direction: column; gap: 4px; }
+.settings-pane { flex: 1; min-width: 0; }
+.set-tab { text-align: left; background: transparent; color: var(--text); border: 1px solid transparent; border-radius: 8px; padding: 9px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+.set-tab:hover { background: var(--hover); }
+.set-tab.active { background: var(--panel-2); border-color: var(--line-2); }
 .sasbox { text-align: center; margin: 8px 0; }
 .sas { font-family: ui-monospace, Consolas, monospace; font-size: 42px; font-weight: 700; letter-spacing: 7px; margin-top: 6px; }
 .qrbox { text-align: center; margin: 10px 0; }
@@ -229,6 +235,11 @@ input::placeholder { color: var(--muted-2); }
   .ex-side { width: 190px; flex-basis: 190px; }
   .search { width: 180px; }
   .view-head h1 { font-size: 22px; }
+  .settings-layout { flex-direction: column; }
+  .settings-tabs { flex-direction: row; flex-basis: auto; width: 100%; overflow-x: auto; padding-bottom: 4px; }
+  .set-tab { flex: 0 0 auto; white-space: nowrap; }
+  .set-row { flex-wrap: wrap; }
+  .set-row .set-label { flex: 0 0 100%; }
 }
 
 /* ---- notifications that wait for a click ---- */

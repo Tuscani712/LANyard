@@ -93,6 +93,13 @@ func (s *Server) handleSessionRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nonce required", http.StatusBadRequest)
 		return
 	}
+	// A supplied device_id must be the caller's own certificate fingerprint.
+	// The certificate is the identity (spec §3.3); a body that claims a
+	// different one is refused rather than trusted as a label.
+	if req.DeviceID != "" && !strings.EqualFold(req.DeviceID, fp) {
+		http.Error(w, "device id does not match the certificate", http.StatusBadRequest)
+		return
+	}
 	viaQR, code := s.acceptPairInvite(req.Mode, fp, req.Invite)
 	if code != 0 {
 		// A bad invite is a hard reject: never fall back to the SAS path, or an
