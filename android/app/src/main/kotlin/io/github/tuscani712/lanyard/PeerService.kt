@@ -128,6 +128,7 @@ object PeerService {
             onProgress = { pushId, done, total -> TransferManager.noteReceiveProgress(pushId, done, total) },
             onDone = { pushId, _, files, _ -> TransferManager.noteReceiveDone(pushId, "Received $files file(s)") },
             onCancelled = { pushId, reason -> TransferManager.noteReceiveFailed(pushId, reason) },
+            onFailed = { pushId, reason -> TransferManager.noteReceiveFailed(pushId, reason) },
             destinationReady = ready@{
                 val uri = SettingsHolder.settings.value.downloadFolder?.let { Uri.parse(it) } ?: return@ready true
                 runCatching { DocumentFile.fromTreeUri(app, uri)?.canWrite() == true }.getOrDefault(false)

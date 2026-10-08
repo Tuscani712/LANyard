@@ -29,10 +29,13 @@ class PeerServerTask30Test {
         val trust: TrustStore = JsonFileTrustStore(trustFile)
         val sessions = PairingSessions(selfFp = { identity.deviceId }, trust = trust)
         private val spool = Files.createTempDirectory("lanyard-spool").toFile()
+        /** (pushId, reason) for each in-flight receive the server reports failed. */
+        val failures = java.util.concurrent.CopyOnWriteArrayList<Pair<String, String>>()
         private val receiver = InboxReceiver(
             spoolRoot = spool,
             destination = destination,
             freeBytes = { 1L shl 40 },
+            onFailed = { id, reason -> failures.add(id to reason) },
             destinationReady = destinationReady,
         )
         private val server = PeerServer(
@@ -173,6 +176,38 @@ class PeerServerTask30Test {
             // Before the fix the server closed the socket here and the client saw
             // a bare EOF (error("connection closed before a status line")).
             assertEquals(500, put.code)
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun connectionDroppedMidBodyFailsTheReceive() {
+        Phone(PushDestination { rel, _, _ -> rel }).use { phone ->
+            val client = Identity.generate("Desktop")
+            phone.pair(client.deviceId)
+            val factory = Tls.socketFactory(client, phone.identity.deviceId)
+            val socket = factory.createSocket("127.0.0.1", phone.port) as SSLSocket
+            socket.enabledProtocols = arrayOf("TLSv1.3")
+            socket.startHandshake()
+            val http = Http(socket)
+
+            val offer = http.send("POST", "/api/v1/push/offer", mapOf("Content-Type" to "application/json"), offerBody("note.txt", 10))
+            assertEquals(200, offer.code)
+            val pushId = JsonParser.parseString(offer.body).asJsonObject.get("push_id").asString
+
+            // Declare 10 bytes, write 3, then drop the connection mid-body. The
+            // session must be failed, not left Running forever.
+            socket.outputStream.write(
+                "PUT /api/v1/push/$pushId/file?path=note.txt HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 10\r\n\r\n".toByteArray(),
+            )
+            socket.outputStream.write(byteArrayOf(1, 2, 3))
+            socket.outputStream.flush()
+            socket.close()
+
+            val deadline = System.currentTimeMillis() + 10_000
+            while (phone.failures.isEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(25)
+            assertEquals(listOf(pushId), phone.failures.map { it.first }, "a receive dropped mid-body must be failed")
+            assertTrue(phone.failures.single().second.isNotBlank(), "the failure must carry a readable reason")
         }
     }
 

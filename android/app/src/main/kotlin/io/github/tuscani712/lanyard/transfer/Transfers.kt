@@ -190,6 +190,10 @@ object TransferManager {
         if (_state.value.any { it.id == id }) return
         pushReceives.add(id)
         add(TransferRecord(id, "receive", peerName, peerFp, label, total, 0, TransferState.Running, null, 0.0, now()))
+        // An incoming push has no enqueue* call, so start the foreground service
+        // here too: the ongoing notification mirrors its progress and keeps it
+        // alive; the service stops itself once nothing is running or queued.
+        TransferService.start(app)
     }
 
     fun noteReceiveProgress(id: String, done: Long, total: Long) {

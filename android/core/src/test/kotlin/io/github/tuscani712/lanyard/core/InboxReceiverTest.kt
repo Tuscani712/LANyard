@@ -235,6 +235,65 @@ class InboxReceiverTest {
         assertEquals(listOf(o.pushId), cancelled, "a cancelled push must be reported so its row does not stay Running")
     }
 
+    @Test
+    fun midBodyFailureFiresFailedExactlyOnceAndNeverDone() {
+        val failures = mutableListOf<Pair<String, String>>()
+        val dones = mutableListOf<String>()
+        val r = InboxReceiver(
+            spoolRoot = spool,
+            destination = PushDestination { rel, _, _ -> rel },
+            freeBytes = { 1L shl 40 },
+            onDone = { pushId, _, _, _ -> dones.add(pushId) },
+            onFailed = { pushId, reason -> failures.add(pushId to reason) },
+        )
+        val o = r.offer("p", "P", listOf(req("a.bin", 100)), 0, 0)
+        assertThrows(java.io.IOException::class.java) {
+            // 10 bytes, then the source throws: the body dies mid-file.
+            r.writeChunk(o.pushId, "p", "a.bin", 0, ThrowingInput(10))
+        }
+        // A second terminal report (e.g. PeerServer also noticing the drop) must
+        // not double-fire: the session is already gone.
+        assertFalse(r.fail(o.pushId, "second"), "fail must be once-only per session")
+        assertEquals(listOf(o.pushId), failures.map { it.first }, "exactly one onFailed for the session")
+        assertEquals("Connection lost", failures.single().second)
+        assertTrue(dones.isEmpty(), "a failed receive must never report done")
+    }
+
+    @Test
+    fun happyPathFiresDoneAndNeverFailed() {
+        val failures = mutableListOf<String>()
+        val dones = mutableListOf<String>()
+        val r = InboxReceiver(
+            spoolRoot = spool,
+            destination = PushDestination { rel, _, _ -> rel },
+            freeBytes = { 1L shl 40 },
+            onDone = { pushId, _, _, _ -> dones.add(pushId) },
+            onFailed = { pushId, _ -> failures.add(pushId) },
+        )
+        val o = r.offer("p", "P", listOf(req("a.bin", 4)), 0, 0)
+        r.writeChunk(o.pushId, "p", "a.bin", 0, byteArrayOf(1, 2, 3, 4).inputStream())
+        r.finish(o.pushId, "p")
+        assertEquals(listOf(o.pushId), dones)
+        assertTrue(failures.isEmpty(), "the happy path must never fire onFailed")
+    }
+
+    /** A byte source that yields [prefix] bytes and then throws. */
+    private class ThrowingInput(private var left: Int) : InputStream() {
+        override fun read(): Int {
+            if (left <= 0) throw java.io.IOException("connection lost")
+            left--
+            return 7
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (left <= 0) throw java.io.IOException("connection lost")
+            val n = minOf(len, left)
+            for (i in 0 until n) b[off + i] = 7
+            left -= n
+            return n
+        }
+    }
+
     private fun genSha(total: Long): String {
         val md = MessageDigest.getInstance("SHA-256")
         GenInput(total).use { ins ->

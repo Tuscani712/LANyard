@@ -188,6 +188,11 @@ class PeerServer(
         val input = BufferedInputStream(ssl.getInputStream())
         val out = BufferedOutputStream(ssl.getOutputStream())
         var requests = 0
+        // Set only while a file body is being read; cleared once it is fully
+        // consumed. If the loop leaves (drop, timeout, stop) with it still set,
+        // the receive session is failed so its row cannot stay Running.
+        var inFlightBody: String? = null
+        try {
         while (requests < maxRequestsPerConnection) {
             // An unpaired connection parked between requests holds a worker
             // thread (the pool is sized maxUnpaired + maxPaired). A flood of
@@ -257,7 +262,9 @@ class PeerServer(
                 try {
                     if (fileBody) {
                         ssl.soTimeout = stallTimeoutMillis
+                        inFlightBody = runCatching { idBetween(head.path, "/api/v1/push/", "/file") }.getOrNull()
                         handleFileBody(out, head, fp, peer, input, closing)
+                        inFlightBody = null
                     } else {
                         val bodyCap = bodyCap(head.path)
                         val body = readSmallBody(ssl, input, head, bodyCap, started)
@@ -289,6 +296,9 @@ class PeerServer(
             }
         }
         return "max-requests"
+        } finally {
+            inFlightBody?.let { receiver.fail(it, "Connection lost") }
+        }
     }
 
     /** A request label for diagnostics: method path, query dropped, never a value. */
@@ -457,25 +467,55 @@ class PeerServer(
         // The Go client streams large files with chunked encoding (the body
         // length is not known up front); the small-file fast path carries
         // Content-Length. Both are accepted; our own framing stays HTTP/1.1.
+        var limited: LimitedInputStream? = null
         val body: InputStream = if (chunked) {
             ChunkedInputStream(input)
         } else {
             val cl = head.headers["content-length"] ?: throw PeerHttpException(411, "content-length required")
             val n = cl.toLongOrNull() ?: throw PeerHttpException(400, "bad content-length")
             if (n < 0) throw PeerHttpException(400, "bad content-length")
-            LimitedInputStream(input, n)
+            LimitedInputStream(input, n).also { limited = it }
         }
         val sha = head.headers["x-lanyard-sha256"]
         val offset = parseContentRange(head.headers["content-range"])
-        if (!sha.isNullOrEmpty() && offset == 0L) {
-            val written = receiver.receiveWhole(id, fp, rel, sha, body)
+        val whole = !sha.isNullOrEmpty() && offset == 0L
+        // Any exception out of the body write (a stream that throws, a checksum
+        // or size mismatch, or a save that fails) fails the receive session so
+        // its row cannot sit Running forever. fail() is once-only.
+        val written = try {
+            val w = if (whole) {
+                receiver.receiveWhole(id, fp, rel, sha, body)
+            } else {
+                receiver.writeChunk(id, fp, rel, offset, body)
+            }
+            // A Content-Length body that stopped before its declared length means
+            // the connection closed mid-file. Chunked bodies throw on truncation
+            // inside ChunkedInputStream; this is the Content-Length equivalent.
+            val lim = limited
+            if (lim != null && lim.remaining > 0) {
+                throw PeerHttpException(400, "body shorter than content-length")
+            }
+            w
+        } catch (e: Exception) {
+            receiver.fail(id, bodyFailureReason(e))
+            throw e
+        }
+        if (whole) {
             respond(out, 200, """{"written":$written,"offset":$written,"done":true}""", closing)
             diag("resp 200 ${head.method} ${reqLabel(head)}")
         } else {
-            val written = receiver.writeChunk(id, fp, rel, offset, body)
             respond(out, 200, """{"written":$written,"offset":${offset + written}}""", closing)
             diag("resp 200 ${head.method} ${reqLabel(head)} (wrote $written)")
         }
+    }
+
+    /** A person-readable reason for a file body that ended abnormally. */
+    private fun bodyFailureReason(e: Exception): String = when {
+        e is java.io.IOException -> "Connection lost"
+        e is PushCancelledException -> "The transfer was cancelled"
+        !e.message.isNullOrBlank() ->
+            if (e.message!!.contains("shorter", ignoreCase = true)) "Connection lost" else e.message!!
+        else -> "Connection lost"
     }
 
     private fun handleSessionRequest(body: ByteArray, fp: String, socket: SSLSocket): String {
@@ -555,6 +595,9 @@ class PeerServer(
     // --- helpers ---
 
     private class LimitedInputStream(private val src: InputStream, private var left: Long) : InputStream() {
+        /** Bytes the declared Content-Length still promises but has not delivered. */
+        val remaining: Long get() = left
+
         override fun read(): Int {
             if (left <= 0) return -1
             val b = src.read()

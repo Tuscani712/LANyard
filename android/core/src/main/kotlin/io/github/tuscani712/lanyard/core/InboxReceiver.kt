@@ -52,6 +52,10 @@ class InboxReceiver(
     private val onProgress: (pushId: String, done: Long, total: Long) -> Unit = { _, _, _ -> },
     private val onDone: (pushId: String, peerFp: String, files: Int, total: Long) -> Unit = { _, _, _, _ -> },
     private val onCancelled: (pushId: String, reason: String) -> Unit = { _, _ -> },
+    // Fired when an in-flight receive dies on its own (a file body threw, or the
+    // connection was closed mid-body) rather than finishing or being declined.
+    // It is mutually exclusive with [onDone] and [onCancelled].
+    private val onFailed: (pushId: String, reason: String) -> Unit = { _, _ -> },
     private val clock: () -> Long = System::currentTimeMillis,
     // Whether a verified file can actually be saved right now (a download folder
     // is set and writable). When false, an offer is refused up front with a clear
@@ -144,7 +148,12 @@ class InboxReceiver(
     fun writeChunk(id: String, peerFp: String, rel: String, offset: Long, input: InputStream): Long {
         val s = session(id, peerFp)
         val st = s.files[rel] ?: throw PeerHttpException(404, "no such file in push")
-        return writeStream(s, st, offset, input, null)
+        return try {
+            writeStream(s, st, offset, input, null)
+        } catch (e: Exception) {
+            fail(s.id, reasonFor(e))
+            throw e
+        }
     }
 
     /** Whole-file fast path: one request carries the bytes and the digest. */
@@ -152,11 +161,25 @@ class InboxReceiver(
         val s = session(id, peerFp)
         val st = s.files[rel] ?: throw PeerHttpException(404, "no such file in push")
         if (st.done != 0L) throw PeerHttpException(409, "file already partly received")
-        writeStream(s, st, 0, input, sha256)
-        st.placedName = place(st)
-        synchronized(this) { st.done = st.size }
-        onChange()
-        return st.size
+        return try {
+            writeStream(s, st, 0, input, sha256)
+            st.placedName = place(st)
+            synchronized(this) { st.done = st.size }
+            onChange()
+            st.size
+        } catch (e: Exception) {
+            fail(s.id, reasonFor(e))
+            throw e
+        }
+    }
+
+    /** A person-readable reason for a receive that died mid-body. */
+    private fun reasonFor(e: Exception): String = when {
+        e is java.io.IOException -> "Connection lost"
+        e is PushCancelledException -> "The transfer was cancelled"
+        !e.message.isNullOrBlank() ->
+            if (e.message!!.contains("shorter", ignoreCase = true)) "Connection lost" else e.message!!
+        else -> "Connection lost"
     }
 
     /** Verifies a streamed part against [sha256] and places it. */
@@ -197,6 +220,21 @@ class InboxReceiver(
         for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
         onChange()
         onCancelled(id, "The transfer was cancelled")
+        return true
+    }
+
+    /**
+     * Removes an in-flight session that died on its own and reports it failed
+     * exactly once. Returns false when the session was already gone (finished or
+     * explicitly cancelled), so [onDone]/[onCancelled]/[onFailed] never double.
+     */
+    @Synchronized
+    fun fail(id: String, reason: String): Boolean {
+        val s = sessions.remove(id) ?: return false
+        val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
+        for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
+        onChange()
+        onFailed(id, reason)
         return true
     }
 
