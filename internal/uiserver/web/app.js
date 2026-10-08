@@ -269,6 +269,7 @@ function showNotice(n) {
     case "send-start": toast("Sending " + files + size + " to " + who + "\u2026", "info"); break;
     case "receive-start": toast("Receiving " + files + size + " from " + who + "\u2026", "info"); break;
     case "receive": toast("Received " + files + size + " from " + who + ". Saved to your Inbox.", "ok"); break;
+    case "receive-failed": toast("Receiving failed" + (n.error ? ": " + n.error : "."), "err"); break;
     case "download-failed": toast("Download failed" + (n.error ? ": " + n.error : "."), "err"); break;
     case "send-failed": toast("Send failed" + (n.error ? ": " + n.error : "."), "err"); break;
     default: return;

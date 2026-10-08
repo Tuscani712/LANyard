@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -184,7 +185,13 @@ func (m *Manager) runPush(job *Job) {
 		m.onChange()
 		return
 	}
-	_ = m.client.PushComplete(ctx, job.Host, job.Port, job.PeerID, offer.PushID, "", "", true)
+	if err := m.client.PushComplete(ctx, job.Host, job.Port, job.PeerID, offer.PushID, "", "", true); err != nil {
+		// The whole push is not finalized on the receiver: the job must not be
+		// marked Done. Surface it like any other transfer failure.
+		m.log.Error("final push complete failed", "job", job.ID, "peer", job.PeerName, "err", err)
+		m.pushFail(job, fmt.Errorf("could not finalize the transfer: %w", err))
+		return
+	}
 	job.mu.Lock()
 	job.running = false
 	job.State = StateDone

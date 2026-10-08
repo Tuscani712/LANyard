@@ -68,6 +68,25 @@ func ValidateSnippet(text string) error {
 // into place. A smaller file lost to a crash is simply sent again.
 const syncMin = 1 << 20
 
+const (
+	// defaultProgressThrottle caps how often mid-copy byte progress drives an
+	// onChange (the SSE "incoming" event), so a fast LAN transfer cannot flood
+	// the UI. Roughly four updates a second.
+	defaultProgressThrottle = 250 * time.Millisecond
+	// defaultStallTimeout is how long a body that is actually being read may
+	// make no progress before the reaper treats its connection as dead. It only
+	// applies while a body is in flight: a slow 1 GB transfer on the LAN keeps
+	// resetting the deadline on every read.
+	defaultStallTimeout = 60 * time.Second
+	// defaultIdleTimeout is how long a push that has no body in flight may sit
+	// untouched before the reaper removes it. Senders legitimately pause between
+	// files (hashing the next one can take minutes on a large file), so this is
+	// far more generous than the in-flight stall timeout.
+	defaultIdleTimeout = 10 * time.Minute
+	// defaultSweepInterval is how often the reaper checks for stalled pushes.
+	defaultSweepInterval = 5 * time.Second
+)
+
 // FileReq is one file in a push offer.
 type FileReq struct {
 	RelPath string    `json:"rel_path"`
@@ -97,6 +116,19 @@ type Push struct {
 	CreatedAt time.Time
 
 	cancelled atomic.Bool
+	// dead marks a push whose connection died or whose body stalled: reads in
+	// flight are aborted, but unlike a receiver Cancel() the .lanpart files are
+	// kept so a re-offer can resume.
+	dead atomic.Bool
+	// inFlight is true while a body is actually being read for this push. The
+	// reaper uses it to choose between the short stall timeout (a body that has
+	// stopped producing bytes) and the long idle timeout (a push waiting between
+	// files or before its first byte).
+	inFlight atomic.Bool
+	// lastProgress is the UnixNano of the last byte received for this push, or
+	// of the last body start/end. The reaper uses it to decide a connection has
+	// stalled or a push has gone idle.
+	lastProgress atomic.Int64
 }
 
 // ErrCancelled is returned to the sender once the receiving person has
@@ -104,23 +136,46 @@ type Push struct {
 var ErrCancelled = errors.New("cancelled by the receiver")
 
 // cancelReader fails reads as soon as the push is cancelled, so a transfer in
-// flight stops within one buffer rather than at the end of the request.
+// flight stops within one buffer rather than at the end of the request. While
+// bytes arrive it touches the push's progress and drives the throttled
+// onChange so the receiving UI shows live progress.
 type cancelReader struct {
 	p  *Push
 	st *FileState
 	r  io.Reader
+	m  *Manager
 }
 
 func (c cancelReader) Read(b []byte) (int, error) {
-	if c.p.cancelled.Load() {
+	if c.p.cancelled.Load() || c.p.dead.Load() {
 		return 0, ErrCancelled
 	}
 	n, err := c.r.Read(b)
 	if c.st != nil {
 		c.st.live.Add(int64(n))
 	}
+	if n > 0 && c.m != nil {
+		c.p.touch(c.m.now())
+		c.m.notifyProgress()
+	}
 	return n, err
 }
+
+// beginRead records that a body is now being read for this push, so the reaper
+// judges it by the short stall timeout rather than the long idle timeout.
+func (p *Push) beginRead(now time.Time) {
+	p.inFlight.Store(true)
+	p.lastProgress.Store(now.UnixNano())
+}
+
+// endRead clears the in-flight marker and resets the idle deadline to now.
+func (p *Push) endRead(now time.Time) {
+	p.inFlight.Store(false)
+	p.lastProgress.Store(now.UnixNano())
+}
+
+// touch records fresh activity while a body is being read.
+func (p *Push) touch(now time.Time) { p.lastProgress.Store(now.UnixNano()) }
 
 // IncomingView is what the UI shows for a push being received.
 type IncomingView struct {
@@ -201,11 +256,23 @@ type Manager struct {
 	onOffer   func(peerFP string, files int, total int64)
 	onDone    func(peerFP string, files []ReceivedFile)
 	onSnippet func(peerFP, text string)
+	onFail    func(peerFP, reason string)
 
-	mu       sync.Mutex
-	pushes   map[string]*Push
-	gone     map[string]struct{} // cancelled push ids
-	snippets []*Snippet
+	// Tunables; overridable before or during use. now is injectable for tests.
+	now           func() time.Time
+	progressEvery time.Duration
+	stallTimeout  time.Duration
+	idleTimeout   time.Duration
+	sweepInterval time.Duration
+
+	mu         sync.Mutex
+	lastNotify time.Time
+	pushes     map[string]*Push
+	gone       map[string]struct{} // cancelled push ids
+	snippets   []*Snippet
+
+	done      chan struct{}
+	closeOnce sync.Once
 }
 
 // ReceivedFile describes one file that finished landing in the Inbox, for the
@@ -252,7 +319,158 @@ func New(dir string, onChange func()) *Manager {
 	if onChange == nil {
 		onChange = func() {}
 	}
-	return &Manager{dir: dir, onChange: onChange, pushes: map[string]*Push{}, gone: map[string]struct{}{}}
+	m := &Manager{
+		dir: dir, onChange: onChange, pushes: map[string]*Push{}, gone: map[string]struct{}{},
+		now: time.Now, progressEvery: defaultProgressThrottle,
+		stallTimeout: defaultStallTimeout, idleTimeout: defaultIdleTimeout,
+		sweepInterval: defaultSweepInterval,
+		done:          make(chan struct{}),
+	}
+	m.startReaper()
+	return m
+}
+
+// Close stops the background reaper. It is safe to call more than once.
+func (m *Manager) Close() {
+	m.closeOnce.Do(func() { close(m.done) })
+}
+
+// notifyProgress drives onChange at most once per progressEvery while bytes are
+// arriving. Completion and error paths call onChange directly, unthrottled.
+func (m *Manager) notifyProgress() {
+	m.mu.Lock()
+	now := m.now()
+	if now.Sub(m.lastNotify) < m.progressEvery {
+		m.mu.Unlock()
+		return
+	}
+	m.lastNotify = now
+	m.mu.Unlock()
+	m.onChange()
+}
+
+// SetOnFail registers a callback for a push that fails before it finishes: the
+// connection died or stalled. The reason is for logs and the transfer history.
+func (m *Manager) SetOnFail(fn func(peerFP, reason string)) { m.onFail = fn }
+
+// SetStallTimeout sets how long an in-flight body may make no progress before
+// the reaper removes the push, and scales the sweep interval to match. Intended
+// for tests; a non-positive value is ignored.
+func (m *Manager) SetStallTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.stallTimeout = d
+	m.refreshSweepLocked()
+	m.mu.Unlock()
+}
+
+// SetIdleTimeout sets how long a push with no body in flight may sit before the
+// reaper removes it, and scales the sweep interval to match. Intended for
+// tests; a non-positive value is ignored.
+func (m *Manager) SetIdleTimeout(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	m.mu.Lock()
+	m.idleTimeout = d
+	m.refreshSweepLocked()
+	m.mu.Unlock()
+}
+
+// refreshSweepLocked derives the sweep interval from the shorter of the two
+// timeouts so a test-sized timeout is noticed promptly. Caller holds m.mu.
+func (m *Manager) refreshSweepLocked() {
+	d := m.stallTimeout
+	if m.idleTimeout > 0 && m.idleTimeout < d {
+		d = m.idleTimeout
+	}
+	interval := d / 4
+	if interval < 10*time.Millisecond {
+		interval = 10 * time.Millisecond
+	}
+	m.sweepInterval = interval
+}
+
+func (m *Manager) startReaper() {
+	go func() {
+		for {
+			m.mu.Lock()
+			interval := m.sweepInterval
+			m.mu.Unlock()
+			if interval <= 0 {
+				interval = defaultSweepInterval
+			}
+			t := time.NewTimer(interval)
+			select {
+			case <-m.done:
+				t.Stop()
+				return
+			case <-t.C:
+				m.reapStalled()
+			}
+		}
+	}()
+}
+
+// reapStalled removes every push whose body has stopped producing bytes for the
+// short stall timeout, or that has sat idle with no body in flight for the much
+// longer idle timeout. For example a sender hashing a large next file holds no
+// body open, so it gets the idle limit; a body stalled mid-read gets the stall
+// limit. Those pushes are surfaced through onFail and the UI is refreshed. The
+// .lanpart files are deliberately kept so a re-offer can resume.
+func (m *Manager) reapStalled() {
+	now := m.now()
+	var stalled []*Push
+	m.mu.Lock()
+	for id, p := range m.pushes {
+		limit := m.idleTimeout
+		if p.inFlight.Load() {
+			limit = m.stallTimeout
+		}
+		if limit <= 0 {
+			continue
+		}
+		last := time.Unix(0, p.lastProgress.Load())
+		if now.Sub(last) > limit {
+			delete(m.pushes, id)
+			p.dead.Store(true) // abort any read still in flight
+			stalled = append(stalled, p)
+		}
+	}
+	m.mu.Unlock()
+	if len(stalled) == 0 {
+		return
+	}
+	for _, p := range stalled {
+		if m.onFail != nil {
+			m.onFail(p.PeerFP, "the connection stalled")
+		}
+	}
+	m.onChange()
+}
+
+// failPush removes a push whose body copy failed (a dropped or dead
+// connection), so it does not stay listed in /api/incoming forever. Like the
+// reaper it keeps the .lanpart files: the sender re-offers on every retry and
+// resumes from what already arrived.
+func (m *Manager) failPush(id, reason string) bool {
+	m.mu.Lock()
+	p, ok := m.pushes[id]
+	if ok {
+		delete(m.pushes, id)
+		p.dead.Store(true)
+	}
+	m.mu.Unlock()
+	if !ok {
+		return false
+	}
+	if m.onFail != nil {
+		m.onFail(p.PeerFP, reason)
+	}
+	m.onChange()
+	return true
 }
 
 // SetOnOffer registers a callback for each push that starts being received
@@ -415,7 +633,10 @@ func (m *Manager) Offer(peerFP, mode string, files []FileReq, maxBytes int64) (*
 	}
 	m.mu.Lock()
 	m.pushes[p.ID] = p
+	m.lastNotify = m.now()
 	m.mu.Unlock()
+	p.lastProgress.Store(m.now().UnixNano())
+	m.onChange()
 	if m.onOffer != nil {
 		m.onOffer(peerFP, len(p.Files), p.Total)
 	}
@@ -458,12 +679,19 @@ func (m *Manager) WriteChunk(id, peerFP, rel string, offset int64, r io.Reader) 
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return 0, err
 	}
-	n, err := io.CopyBuffer(f, cancelReader{p, st, io.LimitReader(r, st.Size-offset)}, make([]byte, 256*1024))
+	p.beginRead(m.now())
+	n, err := io.CopyBuffer(f, cancelReader{p: p, st: st, r: io.LimitReader(r, st.Size-offset), m: m}, make([]byte, 256*1024))
+	p.endRead(m.now())
 	if err != nil {
-		if p.cancelled.Load() { // a cancelled push leaves no partial file behind
-			f.Close()
+		f.Close()
+		if p.cancelled.Load() {
+			// An explicit receiver Cancel() removes the partial.
 			_ = os.Remove(st.Part)
+			return n, ErrCancelled
 		}
+		// A read/write error means the connection died; drop the push now but
+		// keep the .lanpart so a re-offer resumes from what already arrived.
+		m.failPush(id, err.Error())
 		return n, err
 	}
 	if st.Size >= syncMin {
@@ -502,7 +730,9 @@ func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileSt
 	}
 	h := sha256.New()
 	// Read one byte more than announced so an oversized body is noticed.
-	n, err := io.CopyBuffer(io.MultiWriter(f, h), cancelReader{p, st, io.LimitReader(r, st.Size+1)}, make([]byte, 64*1024))
+	p.beginRead(m.now())
+	n, err := io.CopyBuffer(io.MultiWriter(f, h), cancelReader{p: p, st: st, r: io.LimitReader(r, st.Size+1), m: m}, make([]byte, 64*1024))
+	p.endRead(m.now())
 	if err == nil && st.Size >= syncMin {
 		err = f.Sync()
 	}
@@ -514,7 +744,14 @@ func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileSt
 		return nil, e
 	}
 	if err != nil {
-		return fail(err)
+		if p.cancelled.Load() {
+			// An explicit receiver Cancel() removes the partial.
+			return fail(ErrCancelled)
+		}
+		// A read/write error means the connection died; drop the push now but
+		// keep the .lanpart so a re-offer can resume from what already arrived.
+		m.failPush(id, err.Error())
+		return nil, err
 	}
 	if n != st.Size {
 		return fail(fmt.Errorf("size mismatch: have %d, expected %d", n, st.Size))
