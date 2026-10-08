@@ -154,6 +154,33 @@ func TestOutgoingSessionDoesNotFireCallback(t *testing.T) {
 	}
 }
 
+// SetPeerAddr remembers the last address of a paired device so discovery can
+// probe it directly when mDNS is silent.
+func TestSetPeerAddr(t *testing.T) {
+	st := newStore(t)
+	st.Pair(Entry{DeviceID: "d", Name: "N", Fingerprint: "fp", Mode: ModePair})
+
+	if !st.SetPeerAddr("fp", []string{"10.0.0.5"}, 47800) {
+		t.Fatal("first address should be recorded")
+	}
+	e, ok := st.Entry("fp")
+	if !ok || e.Port != 47800 || len(e.Addrs) != 1 || e.Addrs[0] != "10.0.0.5" {
+		t.Fatalf("stored address = %+v, ok=%v", e, ok)
+	}
+	if st.SetPeerAddr("fp", []string{"10.0.0.5"}, 47800) {
+		t.Fatal("an unchanged address should not report a change")
+	}
+	if !st.SetPeerAddr("fp", []string{"10.0.0.6"}, 47800) {
+		t.Fatal("a new address should be recorded")
+	}
+	if st.SetPeerAddr("unknown", []string{"10.0.0.5"}, 47800) {
+		t.Fatal("an unknown fingerprint must not record an address")
+	}
+	if st.SetPeerAddr("fp", nil, 0) {
+		t.Fatal("a missing address/port must be ignored")
+	}
+}
+
 func TestPairInviteMintConsume(t *testing.T) {
 	st := newStore(t)
 	tok, exp := st.MintPairInvite()

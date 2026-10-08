@@ -12,6 +12,16 @@ import (
 	"lanyard/internal/identity"
 )
 
+// Liveness tuning. A peer is evicted only after this many consecutive failed
+// probes, so a busy or briefly-idle link is not dropped. The sweep runs every
+// livenessInterval, so the default ~6 misses is roughly a 30 s failure window.
+const (
+	defaultProbeTimeout     = 3 * time.Second
+	defaultEvictAfter       = 6
+	livenessInterval        = 5 * time.Second
+	defaultPairedProbeEvery = 5 * time.Second
+)
+
 type Manager struct {
 	selfMu sync.RWMutex
 	self   Announcement
@@ -21,12 +31,72 @@ type Manager struct {
 	log    *slog.Logger
 	wg     sync.WaitGroup
 	mdns   *mdnsNode
+
+	// active reports whether a transfer with this peer is in flight (either
+	// direction). A peer with an active transfer is never evicted and its
+	// LastSeen is refreshed even when probes fail. Injectable for tests.
+	active func(shortID, fingerprint string) bool
+
+	// paired supplies trusted devices (fingerprint + last-known address) that
+	// must be probed directly when mDNS is silent. Injectable for tests.
+	paired func() []PairedPeer
+
+	probeTimeout time.Duration
+	evictAfter   int
+
+	pairedMu     sync.Mutex
+	pairedProbed map[string]time.Time
+	pairedEvery  time.Duration
 }
 
 func New(self Announcement, selfFullID string, probe Prober, log *slog.Logger) *Manager {
 	self.Version = ProtocolVersion
 	self.ShortID = identity.ShortID(selfFullID)
-	return &Manager{self: self, selfID: selfFullID, probe: probe, reg: newRegistry(), log: log}
+	return &Manager{
+		self: self, selfID: selfFullID, probe: probe, reg: newRegistry(), log: log,
+		probeTimeout: defaultProbeTimeout,
+		evictAfter:   defaultEvictAfter,
+		pairedProbed: map[string]time.Time{},
+		pairedEvery:  defaultPairedProbeEvery,
+	}
+}
+
+// SetActiveTransfer installs the predicate that reports whether a transfer with
+// the given peer (short id or full fingerprint) is currently in flight. While
+// it returns true the peer is treated as alive: probe misses do not count and
+// it is never evicted.
+func (m *Manager) SetActiveTransfer(fn func(shortID, fingerprint string) bool) {
+	m.active = fn
+}
+
+// SetPairedProvider installs a source of trusted devices to probe directly at
+// their last-known address when they are absent from the discovery registry.
+func (m *Manager) SetPairedProvider(fn func() []PairedPeer) {
+	m.paired = fn
+}
+
+// SetLivenessThresholds overrides how many consecutive probe misses evict a
+// peer and how long a single probe may take. Intended for tests.
+func (m *Manager) SetLivenessThresholds(evictAfter int, probeTimeout time.Duration) {
+	if evictAfter > 0 {
+		m.evictAfter = evictAfter
+	}
+	if probeTimeout > 0 {
+		m.probeTimeout = probeTimeout
+	}
+}
+
+// SetPairedProbeInterval overrides how often a missing paired peer is probed
+// again (a short cache so the UI never drives probes). Intended for tests.
+func (m *Manager) SetPairedProbeInterval(d time.Duration) {
+	if d > 0 {
+		m.pairedEvery = d
+	}
+}
+
+// isActive consults the injected predicate, treating a nil predicate as idle.
+func (m *Manager) isActive(shortID, fingerprint string) bool {
+	return m.active != nil && m.active(shortID, fingerprint)
 }
 
 // selfAnn returns a copy of our announcement (it can change at runtime).
@@ -140,7 +210,7 @@ func (m *Manager) verifyAsync(shortID string) {
 func (m *Manager) tryAddrs(addrs []string, port int) (string, *Hello, error) {
 	last := errors.New("no addresses")
 	for _, a := range addrs {
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), m.probeTimeout)
 		id, h, err := m.probe(ctx, a, port)
 		cancel()
 		if err == nil {
@@ -184,7 +254,7 @@ func (m *Manager) AddManual(ctx context.Context, host string, port int, expected
 // livenessLoop probes known peers and drops ones that stop answering. It is
 // source-agnostic, so it works even though mDNS re-announces infrequently.
 func (m *Manager) livenessLoop(ctx context.Context) {
-	t := time.NewTicker(5 * time.Second)
+	t := time.NewTicker(livenessInterval)
 	defer t.Stop()
 	for {
 		select {
@@ -192,29 +262,135 @@ func (m *Manager) livenessLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		for _, p := range m.reg.list() {
-			p := p
-			m.wg.Add(1)
-			go func() {
-				defer m.wg.Done()
-				certID, _, err := m.tryAddrs(p.Addrs, p.Port)
-				m.reg.mu.Lock()
-				defer m.reg.mu.Unlock()
-				rp, ok := m.reg.peers[p.ShortID]
-				if !ok {
-					return
-				}
-				if err == nil && strings.HasPrefix(certID, p.ShortID) {
-					rp.fails = 0
-					rp.LastSeen = time.Now()
-					return
-				}
-				rp.fails++
-				if rp.fails >= 2 {
-					delete(m.reg.peers, p.ShortID)
-					m.reg.notify()
-				}
-			}()
-		}
+		m.sweep()
 	}
+}
+
+// sweep runs one liveness pass: probe every registry peer, then directly probe
+// paired peers that are missing from the registry (mDNS silent).
+func (m *Manager) sweep() {
+	for _, p := range m.reg.list() {
+		p := p
+		m.wg.Add(1)
+		go func() { defer m.wg.Done(); m.probeRegistryPeer(p) }()
+	}
+	m.probePairedPeers()
+}
+
+// probeRegistryPeer probes one peer once. A peer with an active transfer is
+// treated as alive regardless of the probe result: its miss counter is cleared
+// and LastSeen refreshed, so a busy link cannot evict it.
+func (m *Manager) probeRegistryPeer(p Peer) {
+	certID, _, err := m.tryAddrs(p.Addrs, p.Port)
+	active := m.isActive(p.ShortID, p.DeviceID)
+	m.reg.mu.Lock()
+	defer m.reg.mu.Unlock()
+	rp, ok := m.reg.peers[p.ShortID]
+	if !ok {
+		return
+	}
+	if err == nil && strings.HasPrefix(certID, p.ShortID) {
+		rp.fails = 0
+		rp.LastSeen = time.Now()
+		return
+	}
+	if active {
+		rp.fails = 0
+		rp.LastSeen = time.Now()
+		return
+	}
+	rp.fails++
+	if rp.fails >= m.evictAfter {
+		delete(m.reg.peers, p.ShortID)
+		m.reg.notify()
+	}
+}
+
+// probePairedPeers directly dials paired devices that are absent (or not yet
+// verified) in the registry, using the last-known address from the trust store.
+// A successful probe records the peer as verified, which is what the peers API
+// (and therefore the UI's online state) reports. A short per-peer cache means
+// the same address is not probed on every pass.
+func (m *Manager) probePairedPeers() {
+	if m.paired == nil {
+		return
+	}
+	for _, pp := range m.paired() {
+		if pp.Fingerprint == "" || pp.Port <= 0 || len(pp.Addrs) == 0 {
+			continue
+		}
+		short := pp.ShortID
+		if short == "" {
+			short = identity.ShortID(pp.Fingerprint)
+		}
+		m.reg.mu.Lock()
+		rp, ok := m.reg.peers[short]
+		verified := ok && rp.Verified
+		m.reg.mu.Unlock()
+		if verified || !m.pairedProbeDue(short) {
+			continue
+		}
+		m.wg.Add(1)
+		go func(pp PairedPeer, short string) {
+			defer m.wg.Done()
+			certID, h, err := m.tryAddrs(pp.Addrs, pp.Port)
+			if err != nil || (certID != pp.Fingerprint && !strings.HasPrefix(certID, short)) {
+				return
+			}
+			m.reg.upsert(Announcement{ShortID: short, DeviceLabel: pp.Name, Name: pp.Name, Port: pp.Port}, pp.Addrs, "paired")
+			m.reg.mu.Lock()
+			if rp, ok := m.reg.peers[short]; ok {
+				rp.Verified = true
+				rp.DeviceID = certID
+				rp.fails = 0
+				rp.LastSeen = time.Now()
+				if h != nil && h.Name != "" {
+					rp.Name = h.Name
+				}
+				if h != nil && h.DeviceID != "" {
+					rp.DeviceLabel = h.DeviceID
+				}
+			}
+			m.reg.mu.Unlock()
+			m.reg.notify()
+		}(pp, short)
+	}
+}
+
+// pairedProbeDue reports whether shortID may be probed now, recording the
+// attempt so a failing address is not retried until the cache interval passes.
+func (m *Manager) pairedProbeDue(shortID string) bool {
+	m.pairedMu.Lock()
+	defer m.pairedMu.Unlock()
+	now := time.Now()
+	if t, ok := m.pairedProbed[shortID]; ok && now.Sub(t) < m.pairedEvery {
+		return false
+	}
+	m.pairedProbed[shortID] = now
+	return true
+}
+
+// removeIfIdle drops a peer that stopped advertising, unless it has an active
+// transfer; in that case it is kept and its LastSeen refreshed.
+func (m *Manager) removeIfIdle(shortID string) {
+	m.reg.mu.Lock()
+	p, ok := m.reg.peers[shortID]
+	var fp string
+	if ok {
+		fp = p.DeviceID
+	}
+	m.reg.mu.Unlock()
+	if !ok {
+		return
+	}
+	if m.isActive(shortID, fp) {
+		m.reg.mu.Lock()
+		if rp, ok := m.reg.peers[shortID]; ok {
+			rp.fails = 0
+			rp.LastSeen = time.Now()
+		}
+		m.reg.mu.Unlock()
+		return
+	}
+	m.reg.remove(shortID)
 }

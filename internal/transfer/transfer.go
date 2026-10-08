@@ -26,6 +26,7 @@ import (
 	"unicode"
 
 	"lanyard/internal/config"
+	"lanyard/internal/identity"
 	"lanyard/internal/inbox"
 	"lanyard/internal/peerapi"
 	"lanyard/internal/shares"
@@ -52,8 +53,12 @@ const (
 )
 
 const (
-	flushBytes         = 4 << 20 // flush the sidecar every ~4 MB
-	flushEvery         = time.Second
+	flushBytes = 4 << 20 // flush the sidecar every ~4 MB
+	flushEvery = time.Second
+	// progressThrottle caps how often mid-transfer byte progress drives an
+	// onChange, so a fast LAN transfer cannot flood the UI. Roughly four
+	// updates a second, matching the receiver's inbox.
+	progressThrottle   = 250 * time.Millisecond
 	persistEvery       = 3 * time.Second
 	maxConcurrentFiles = 4 // total in-flight large-file transfers across all jobs (spec §8.4)
 	// Small files are latency-bound, not bandwidth-bound, so many may be in
@@ -227,6 +232,7 @@ type Manager struct {
 	mu            sync.Mutex
 	jobs          map[string]*Job
 	bandwidthMBps int // 0 = unlimited
+	lastNotify    time.Time
 }
 
 func (m *Manager) bandwidth() int {
@@ -671,6 +677,20 @@ func (m *Manager) SetBandwidthLimit(mbps int) {
 	m.mu.Unlock()
 }
 
+// notifyProgress drives onChange at most once per progressThrottle while bytes
+// are moving. Completion and error paths call onChange directly, unthrottled.
+func (m *Manager) notifyProgress() {
+	now := time.Now()
+	m.mu.Lock()
+	if now.Sub(m.lastNotify) < progressThrottle {
+		m.mu.Unlock()
+		return
+	}
+	m.lastNotify = now
+	m.mu.Unlock()
+	m.onChange()
+}
+
 // ClearFinished forgets completed jobs (the history list).
 func (m *Manager) ClearFinished() int {
 	m.mu.Lock()
@@ -762,6 +782,30 @@ func (m *Manager) Retry(ctx context.Context, id string) (*View, error) {
 	default:
 		return nil, errors.New("this transfer cannot be resent")
 	}
+}
+
+// ActiveTransfer reports whether a non-terminal, in-flight transfer is using
+// the peer identified by fingerprint (or its short ID, the first 16 hex
+// characters). Discovery uses it so a busy peer is not evicted on transient
+// probe misses. Paused and "waiting for peer" jobs do not count: no bytes are
+// moving then.
+func (m *Manager) ActiveTransfer(peerID string) bool {
+	if peerID == "" {
+		return false
+	}
+	short := identity.ShortID(peerID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, j := range m.jobs {
+		if j.PeerID != peerID && identity.ShortID(j.PeerID) != short {
+			continue
+		}
+		switch j.State {
+		case StateQueued, StateConnecting, StateTransferring, StateVerifying:
+			return true
+		}
+	}
+	return false
 }
 
 // PeerAvailable is called when discovery sees a verified peer. It refreshes

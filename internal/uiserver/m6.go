@@ -32,6 +32,10 @@ type settingsView struct {
 	UpdateURL             string        `json:"update_url"`
 	AutoUpdate            bool          `json:"auto_update"`
 	Paired                []trust.Entry `json:"paired"`
+
+	// Warning carries a non-fatal problem from a settings PUT (for example the
+	// OS sign-in entry could not be changed). Empty on success.
+	Warning string `json:"warning,omitempty"`
 }
 
 // TrayProbe is set by the native app to report whether a system tray is really
@@ -199,16 +203,27 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	if req.AutoUpdate != nil {
 		next.AutoUpdate = *req.AutoUpdate
 	}
+	warning := ""
 	if req.StartOnLogin != nil {
 		if s.d.SetStartOnLogin == nil {
 			http.Error(w, "start on login is not available here", http.StatusNotImplemented)
 			return
 		}
-		if err := s.d.SetStartOnLogin(*req.StartOnLogin); err != nil {
-			http.Error(w, "could not change start on login: "+err.Error(), http.StatusInternalServerError)
-			return
+		// Only touch the OS sign-in entry when the value actually changes, so a
+		// normal save never writes (or can fail on) the autostart files.
+		if *req.StartOnLogin != next.StartOnLogin {
+			if err := s.d.SetStartOnLogin(*req.StartOnLogin); err != nil {
+				// Non-fatal: keep every other requested setting, leave
+				// start_on_login at its previous value, and surface the failure as a
+				// warning instead of discarding the whole save. Never silent.
+				if s.d.Log != nil {
+					s.d.Log.Warn("settings: could not change start on login", "err", err, "enable", *req.StartOnLogin)
+				}
+				warning = "could not change start on login: " + err.Error()
+			} else {
+				next.StartOnLogin = *req.StartOnLogin
+			}
 		}
-		next.StartOnLogin = *req.StartOnLogin
 	}
 
 	if err := s.d.Cfg.Update(func(st *config.Settings) { *st = next }); err != nil {
@@ -219,7 +234,9 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		s.d.ApplySettings(next)
 	}
 	s.Notify()
-	writeJSON(w, s.settingsView())
+	view := s.settingsView()
+	view.Warning = warning
+	writeJSON(w, view)
 }
 
 // handleCancelAll (§11.3) is the hard stop: every share ends at once and all

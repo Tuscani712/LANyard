@@ -33,7 +33,7 @@ import (
 	"lanyard/internal/update"
 )
 
-const version = "1.1.0-beta.4"
+const version = "1.1.0-beta.5"
 
 type runInfo struct {
 	PID     int    `json:"pid"`
@@ -302,6 +302,35 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	disc := discovery.New(discovery.Announcement{
 		Name: st.DeviceName, OS: runtime.GOOS, Port: peerSrv.Port(), DeviceLabel: st.DeviceIDLabel,
 	}, id.DeviceID, client.Probe, log)
+	// A peer with a transfer in flight (either direction) must not be evicted
+	// when liveness probes briefly fail; a busy link can starve the probe.
+	disc.SetActiveTransfer(func(shortID, fingerprint string) bool {
+		for _, key := range []string{fingerprint, shortID} {
+			if key == "" {
+				continue
+			}
+			if trMgr.ActiveTransfer(key) || inboxMgr.HasActivePush(key) {
+				return true
+			}
+		}
+		return false
+	})
+	// Paired devices are probed directly at their last-known address when mDNS
+	// is silent, so they are reported online instead of a flat offline.
+	disc.SetPairedProvider(func() []discovery.PairedPeer {
+		entries := trustStore.Paired()
+		out := make([]discovery.PairedPeer, 0, len(entries))
+		for _, e := range entries {
+			out = append(out, discovery.PairedPeer{
+				Fingerprint: e.Fingerprint,
+				ShortID:     identity.ShortID(e.Fingerprint),
+				Name:        e.Name,
+				Addrs:       append([]string(nil), e.Addrs...),
+				Port:        e.Port,
+			})
+		}
+		return out
+	})
 	disc.Start(ctx)
 
 	// Notify the person on the receiving side when files start arriving and
@@ -393,6 +422,9 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 					continue
 				}
 				seen[p.DeviceID] = true
+				// Remember the last address of a paired device so discovery
+				// can probe it directly when mDNS goes quiet.
+				trustStore.SetPeerAddr(p.DeviceID, p.Addrs, p.Port)
 				addr := fmt.Sprintf("%s:%d", p.Addrs[0], p.Port)
 				if known[p.DeviceID] != addr {
 					known[p.DeviceID] = addr

@@ -94,7 +94,7 @@ func (m *Manager) startMDNS(ctx context.Context) {
 				ips = append(ips, ip.String())
 			}
 			if time.Until(e.Expiry) < 5*time.Second { // TTL 0 goodbye
-				m.reg.remove(a.ShortID)
+				m.removeIfIdle(a.ShortID)
 				continue
 			}
 			m.handle(a, ips, "mdns")

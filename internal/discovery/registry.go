@@ -38,6 +38,19 @@ type Hello struct {
 // certificate actually presented (never from the JSON body) plus its Hello.
 type Prober func(ctx context.Context, host string, port int) (certID string, h *Hello, err error)
 
+// PairedPeer is a trusted device, supplied by the trust store, with the last
+// address it was seen at. The discovery manager dials it directly when it is
+// absent from the registry, so a paired device that is not advertising is still
+// reported online rather than flatly offline.
+type PairedPeer struct {
+	Fingerprint string
+	ShortID     string
+	Name        string
+	Addrs       []string
+	Port        int
+}
+
+// Peer is a discovered or paired device.
 type Peer struct {
 	ShortID     string    `json:"short_id"`
 	DeviceID    string    `json:"device_id"` // full fingerprint, meaningful once Verified
