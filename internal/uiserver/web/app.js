@@ -292,6 +292,7 @@ function showNotice(n) {
     case "receive-failed": toast("Receiving failed" + (n.error ? ": " + n.error : "."), "err"); break;
     case "download-failed": toast("Download failed" + (n.error ? ": " + n.error : "."), "err"); break;
     case "send-failed": toast("Send failed" + (n.error ? ": " + n.error : "."), "err"); break;
+    case "peer-unpaired": toast(who + " is no longer paired with this device.", "info"); break;
     default: return;
   }
 }
@@ -676,7 +677,16 @@ function renderDevice(body, p) {
         listBox.appendChild(row);
       }
     })
-    .catch((err) => { clear(listBox); listBox.appendChild(el("div", "empty", peerErrorText(err, "Could not reach this device: "))); });
+    .catch((err) => {
+      clear(listBox);
+      const box = el("div", "empty", peerErrorText(err, "Could not reach this device: "));
+      // A 403 means the other device dropped the pairing; the message already
+      // says "Not paired with this device", so offer to pair again right here.
+      if (err && err.status === 403) {
+        box.appendChild(el("div", "actions")).appendChild(btn(paired ? "Pair again" : "Pair", () => startPair(p.device, peer.name, "pair")));
+      }
+      listBox.appendChild(box);
+    });
 }
 
 // -- everything other devices share with this one --

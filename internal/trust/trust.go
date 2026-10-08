@@ -152,6 +152,10 @@ type Store struct {
 	mu       sync.RWMutex
 	paired   map[string]*Entry // key: peer fingerprint
 	sessions map[string]*Session
+	// pendingUnpair holds devices we unpaired locally but could not yet tell to
+	// drop us (the peer was offline). The entry keeps the last-known address so
+	// the notification can be retried once discovery sees the peer again.
+	pendingUnpair map[string]Entry
 	// invites maps one-time QR pairing nonces to their expiry.
 	invites   map[string]time.Time
 	inviteTTL time.Duration
@@ -186,7 +190,8 @@ func New(cfg *config.Store, selfFP string, onChange func()) *Store {
 	}
 	return &Store{cfg: cfg, selfFP: selfFP, onChange: onChange,
 		paired: map[string]*Entry{}, sessions: map[string]*Session{},
-		invites: map[string]time.Time{}, inviteTTL: PairInviteTTL}
+		pendingUnpair: map[string]Entry{},
+		invites:       map[string]time.Time{}, inviteTTL: PairInviteTTL}
 }
 
 // SetPairInviteTTL changes how long a pairing invite lives (tests).
@@ -420,6 +425,56 @@ func (s *Store) Unpair(fp string) bool {
 	return ok
 }
 
+// AddPendingUnpair records a device we unpaired locally but could not yet tell
+// to drop us, so the notification is retried when the device is next seen. The
+// entry's address is the last-known one and may be empty; discovery can still
+// supply a live address on the retry.
+func (s *Store) AddPendingUnpair(e Entry) {
+	if e.Fingerprint == "" {
+		return
+	}
+	s.mu.Lock()
+	s.pendingUnpair[e.Fingerprint] = e
+	s.mu.Unlock()
+}
+
+// ClearPendingUnpair forgets a pending unpair notification. It reports whether
+// one was present.
+func (s *Store) ClearPendingUnpair(fp string) bool {
+	s.mu.Lock()
+	_, ok := s.pendingUnpair[fp]
+	delete(s.pendingUnpair, fp)
+	s.mu.Unlock()
+	return ok
+}
+
+// PendingUnpair returns the pending-unpair record for a fingerprint.
+func (s *Store) PendingUnpair(fp string) (Entry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	e, ok := s.pendingUnpair[fp]
+	return e, ok
+}
+
+// HasPendingUnpair reports whether fp still needs its unpair delivered.
+func (s *Store) HasPendingUnpair(fp string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.pendingUnpair[fp]
+	return ok
+}
+
+// PendingUnpairs lists the devices still waiting to be told to drop us.
+func (s *Store) PendingUnpairs() []Entry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]Entry, 0, len(s.pendingUnpair))
+	for _, e := range s.pendingUnpair {
+		out = append(out, e)
+	}
+	return out
+}
+
 // UpdatePermissions changes what a paired peer may do without re-pairing. It
 // takes effect on the next request (and for live sessions on their next call).
 func (s *Store) UpdatePermissions(fp string, perms Permissions) bool {
@@ -510,6 +565,18 @@ func (s *Store) CreateIncoming(mode, peerFP, peerName, peerDevice, peerNonce str
 		err := errors.New("too many sessions")
 		s.pairLog(xferlog.LevelWarn, "refuse", peerFP, "", "session limit reached", 0, err)
 		return nil, err
+	}
+	// A fresh pair request replaces a leftover pending pairing from the same
+	// device (for example a re-pair after a stale or abandoned handshake).
+	// Refusing would trap the person: the old prompt may be long gone from their
+	// screen while the session lingers. Connect requests keep the flood cap.
+	if mode == ModePair {
+		for id, sess := range s.sessions {
+			if sess.PeerFP == peerFP && sess.Status == StatusPending && sess.Mode == ModePair {
+				delete(s.sessions, id)
+				s.pairLog(xferlog.LevelInfo, "supersede", peerFP, id, "replaced by a newer pair request", now.Sub(sess.CreatedAt), nil)
+			}
+		}
 	}
 	pending := 0
 	var pendingID string

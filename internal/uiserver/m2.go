@@ -119,7 +119,8 @@ func (s *Server) handleRemoteShares(w http.ResponseWriter, r *http.Request) {
 	}
 	list, err := s.d.Client.ListShares(r.Context(), host, port, p.DeviceID)
 	if err != nil {
-		http.Error(w, peerUIMessage(err), http.StatusBadGateway)
+		s.peerRefusedPairing(p.DeviceID, err)
+		http.Error(w, peerUIMessage(err), peerStatus(err))
 		return
 	}
 	if list == nil {
@@ -146,7 +147,8 @@ func (s *Server) handleRemoteTree(w http.ResponseWriter, r *http.Request) {
 	}
 	entries, err := s.d.Client.Tree(r.Context(), host, port, p.DeviceID, q.Get("share"), q.Get("path"))
 	if err != nil {
-		http.Error(w, peerUIMessage(err), http.StatusBadGateway)
+		s.peerRefusedPairing(p.DeviceID, err)
+		http.Error(w, peerUIMessage(err), peerStatus(err))
 		return
 	}
 	if entries == nil {
@@ -199,7 +201,8 @@ func (s *Server) handleTransferCreate(w http.ResponseWriter, r *http.Request) {
 		Paths: req.Paths, Dest: strings.TrimSpace(req.Dest),
 	})
 	if err != nil {
-		http.Error(w, peerUIMessage(err), http.StatusBadGateway)
+		s.peerRefusedPairing(p.DeviceID, err)
+		http.Error(w, peerUIMessage(err), peerStatus(err))
 		return
 	}
 	writeJSON(w, view)
@@ -315,7 +318,8 @@ func (s *Server) handlePush(w http.ResponseWriter, r *http.Request) {
 		PeerID: p.DeviceID, PeerName: p.Name, Host: host, Port: port, Paths: req.Paths,
 	})
 	if err != nil {
-		http.Error(w, peerUIMessage(err), http.StatusBadGateway)
+		s.peerRefusedPairing(p.DeviceID, err)
+		http.Error(w, peerUIMessage(err), peerStatus(err))
 		return
 	}
 	writeJSON(w, view)

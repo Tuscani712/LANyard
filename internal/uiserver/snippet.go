@@ -69,7 +69,8 @@ func (s *Server) handleSendSnippet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.d.Client.SendSnippet(r.Context(), host, port, p.DeviceID, req.Text); err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		s.peerRefusedPairing(p.DeviceID, err)
+		http.Error(w, peerUIMessage(err), peerStatus(err))
 		return
 	}
 	writeJSON(w, map[string]bool{"sent": true})

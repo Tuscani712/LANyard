@@ -96,25 +96,42 @@ func (s *Server) HandleRemoteRevoke(fp string, wasPaired bool) {
 		}
 		return
 	}
+	// The peer has already dropped us, so there is nothing to retry: this is a
+	// courtesy notification, not one we owe a retry for.
+	if s.d.Trust != nil {
+		s.d.Trust.ClearPendingUnpair(fp)
+	}
 	// peerapi calls this before removing the entry, so the last-known address
 	// is still in the trust store for the fallback below.
 	var lastKnown trust.Entry
 	if s.d.Trust != nil {
 		lastKnown, _ = s.d.Trust.Entry(fp)
 	}
-	s.revokeRemote(fp, lastKnown)
+	s.notifyUnpair(fp, lastKnown, false)
 }
 
 // revokeRemote tells the paired device to drop us too, so an unpair on one side
 // is reflected on the other. Best effort: the peer may be offline, and the local
-// unpair already succeeded. It prefers the live discovery address and falls back
-// to the last address the trust store remembered (captured before the entry was
-// removed); if neither is known, or the peer cannot be reached, it logs why.
+// unpair already succeeded. A failed attempt is remembered as a pending unpair
+// so it is retried when the peer is next seen.
 func (s *Server) revokeRemote(fp string, lastKnown trust.Entry) {
+	s.notifyUnpair(fp, lastKnown, true)
+}
+
+// notifyUnpair delivers the unpair notification. It prefers the live discovery
+// address and falls back to the last address the trust store remembered
+// (captured before the entry was removed); if neither is known, or the peer
+// cannot be reached, it logs why. When remember is set, a failure records a
+// pending-unpair entry so RetryPendingUnpair can try again once the peer is
+// seen (discovery, liveness or a paired-probe); a success clears any pending
+// record. remember is false for a revoke the peer itself initiated, which needs
+// no retry.
+func (s *Server) notifyUnpair(fp string, lastKnown trust.Entry, remember bool) {
 	if s.d.Client == nil {
 		if s.d.Log != nil {
 			s.d.Log.Info("unpair: peer client unavailable; cannot notify the peer", "fp", fp)
 		}
+		s.rememberPendingUnpair(fp, lastKnown, remember)
 		return
 	}
 	var host string
@@ -140,6 +157,7 @@ func (s *Server) revokeRemote(fp string, lastKnown trust.Entry) {
 		if s.d.Log != nil {
 			s.d.Log.Info("unpair: peer has no known address; skipping notification", "fp", fp)
 		}
+		s.rememberPendingUnpair(fp, lastKnown, remember)
 		return
 	}
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
@@ -149,10 +167,52 @@ func (s *Server) revokeRemote(fp string, lastKnown trust.Entry) {
 		if s.d.Log != nil {
 			s.d.Log.Warn("unpair: could not notify the peer", "fp", fp, "addr", addr, "via", source, "err", err)
 		}
+		s.rememberPendingUnpair(fp, lastKnown, remember)
 		return
+	}
+	if s.d.Trust != nil {
+		s.d.Trust.ClearPendingUnpair(fp)
 	}
 	if s.d.Log != nil {
 		s.d.Log.Info("unpair: notified the peer", "fp", fp, "addr", addr, "via", source)
+	}
+}
+
+// rememberPendingUnpair keeps an unpair notification for a later retry, unless
+// remember is false or there is nothing to key it on.
+func (s *Server) rememberPendingUnpair(fp string, lastKnown trust.Entry, remember bool) {
+	if !remember || s.d.Trust == nil || fp == "" {
+		return
+	}
+	alreadyPending := s.d.Trust.HasPendingUnpair(fp)
+	e := lastKnown
+	e.Fingerprint = fp
+	s.d.Trust.AddPendingUnpair(e)
+	if !alreadyPending && s.d.Log != nil {
+		s.d.Log.Info("unpair: will retry notifying the peer when it is next seen", "fp", fp)
+	}
+}
+
+// RetryPendingUnpair re-attempts the unpair notification for a single device
+// that has just been seen. It is a no-op when no notification is pending. On
+// success the pending record is cleared; on failure it stays for the next sighting.
+func (s *Server) RetryPendingUnpair(fp string) {
+	if s.d.Trust == nil || fp == "" || !s.d.Trust.HasPendingUnpair(fp) {
+		return
+	}
+	e, _ := s.d.Trust.PendingUnpair(fp)
+	s.notifyUnpair(fp, e, true)
+}
+
+// RetryPendingUnpairs re-attempts every outstanding unpair notification. It is
+// useful at startup or after a network change; RetryPendingUnpair is the
+// per-device form used when discovery sees a particular device return.
+func (s *Server) RetryPendingUnpairs() {
+	if s.d.Trust == nil {
+		return
+	}
+	for _, e := range s.d.Trust.PendingUnpairs() {
+		s.notifyUnpair(e.Fingerprint, e, true)
 	}
 }
 
@@ -367,12 +427,13 @@ func (s *Server) handleSessionConfirm(w http.ResponseWriter, r *http.Request) {
 	}
 	if sess.RemoteID != "" {
 		if err := s.d.Client.ConfirmSession(r.Context(), host, port, sess.PeerFP, sess.RemoteID); err != nil {
+			s.peerRefusedPairing(sess.PeerFP, err)
 			var se *peerapi.StatusError
 			if errors.As(err, &se) {
-				http.Error(w, se.Msg, se.Code)
+				http.Error(w, peerUIMessage(err), se.Code)
 				return
 			}
-			http.Error(w, err.Error(), http.StatusBadGateway)
+			http.Error(w, peerErrorMessage(err), peerStatus(err))
 			return
 		}
 	}

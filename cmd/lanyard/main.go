@@ -434,6 +434,11 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 				// Remember the last address of a paired device so discovery
 				// can probe it directly when mDNS goes quiet.
 				trustStore.SetPeerAddr(p.DeviceID, p.Addrs, p.Port)
+				// A device we unpaired while it was offline still needs to be
+				// told to drop us; now that it is visible, retry the notification.
+				if ui != nil && trustStore.HasPendingUnpair(p.DeviceID) {
+					go ui.RetryPendingUnpair(p.DeviceID)
+				}
 				addr := fmt.Sprintf("%s:%d", p.Addrs[0], p.Port)
 				if known[p.DeviceID] != addr {
 					known[p.DeviceID] = addr
@@ -553,6 +558,22 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	// A peer that unpairs us over the peer API gets the same cleanup as an
 	// unpair from our own UI: drop its mount and, best effort, notify it back.
 	peerSrv.SetOnRevoke(ui.HandleRemoteRevoke)
+	// A device unpaired while it was offline may already be visible; retry now,
+	// when discovery next reports it, and on a slow tick so a quick return that
+	// does not raise a discovery event is still caught.
+	go ui.RetryPendingUnpairs()
+	go func() {
+		t := time.NewTicker(30 * time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				ui.RetryPendingUnpairs()
+			}
+		}
+	}()
 	uiWant := st.UIPort
 	if uiPortFlag != 0 {
 		uiWant = uiPortFlag

@@ -24,6 +24,11 @@ type StatusError struct {
 	Code   int
 	Status string
 	Msg    string
+	// Pinned is true when the response arrived over a connection whose server
+	// certificate was verified against the expected fingerprint (mTLS pinning).
+	// Destructive decisions (IsNotPaired) require it so a bare self-signed
+	// answer cannot cause data loss.
+	Pinned bool
 }
 
 func (e *StatusError) Error() string { return fmt.Sprintf("%s: %s", e.Status, e.Msg) }
@@ -69,7 +74,7 @@ func (c *Client) doJSON(ctx context.Context, method, u string, body io.Reader, e
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(http.MaxBytesReader(nil, resp.Body, 4096))
-		return &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg))}
+		return &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg)), Pinned: expectedFP != ""}
 	}
 	if out == nil {
 		return nil
@@ -137,7 +142,7 @@ func (c *Client) OpenFile(ctx context.Context, host string, port int, expectedFP
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		msg, _ := io.ReadAll(http.MaxBytesReader(nil, resp.Body, 4096))
 		resp.Body.Close()
-		return nil, &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg))}
+		return nil, &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg)), Pinned: expectedFP != ""}
 	}
 	return resp, nil
 }
@@ -315,7 +320,7 @@ func (c *Client) PushFile(ctx context.Context, host string, port int, expectedFP
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(http.MaxBytesReader(nil, resp.Body, 4096))
-		return 0, &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg))}
+		return 0, &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg)), Pinned: expectedFP != ""}
 	}
 	var out struct {
 		Written int64 `json:"written"`
@@ -351,7 +356,7 @@ func (c *Client) PushFileSHA(ctx context.Context, host string, port int, expecte
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(http.MaxBytesReader(nil, resp.Body, 4096))
-		return &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg))}
+		return &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg)), Pinned: expectedFP != ""}
 	}
 	return nil
 }

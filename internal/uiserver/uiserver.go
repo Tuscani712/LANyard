@@ -376,6 +376,44 @@ func peerUIMessage(err error) string {
 	return err.Error()
 }
 
+// peerStatus is the HTTP status the local UI should receive for a failed peer
+// request. A 403 refusal from the peer stays a 403 so the web UI takes the
+// "not paired" branch instead of prefixing the message with "Could not reach";
+// anything else is a gateway failure.
+func peerStatus(err error) int {
+	var se *peerapi.StatusError
+	if errors.As(err, &se) && se.Code == http.StatusForbidden {
+		return http.StatusForbidden
+	}
+	return http.StatusBadGateway
+}
+
+// peerRefusedPairing reacts to a peer we believe we are paired with answering a
+// request with the exact 403 "not paired" over a certificate-pinned connection:
+// the peer has unpaired us, so the stale local pairing is removed and the
+// person is told. It reports whether a local pairing was dropped. A specific 403
+// (a permission denial) is left alone: it means the pairing is intact but the
+// action is not allowed. The removal only runs when peerapi.IsNotPaired holds,
+// which requires the peer's certificate to have been verified against its
+// pinned fingerprint; an unpinned answer can never drop a pairing.
+func (s *Server) peerRefusedPairing(fp string, err error) bool {
+	if s.d.Trust == nil || fp == "" || !peerapi.IsNotPaired(err) {
+		return false
+	}
+	e, ok := s.d.Trust.Entry(fp)
+	if !ok {
+		return false
+	}
+	s.d.Trust.Unpair(fp)
+	s.d.Trust.ClearPendingUnpair(fp)
+	s.dropMountsOf(fp)
+	if s.d.Log != nil {
+		s.d.Log.Info("peer refused a request as not paired; removed the local pairing", "fp", fp, "name", e.Name)
+	}
+	s.NotifyUser(Notice{Kind: "peer-unpaired", Peer: firstNonEmpty(e.Name, fp)})
+	return true
+}
+
 func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Address     string `json:"address"`
@@ -397,9 +435,11 @@ func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	p, err := s.d.AddPeer(ctx, host, port, strings.TrimSpace(req.Fingerprint))
+	fp := strings.TrimSpace(req.Fingerprint)
+	p, err := s.d.AddPeer(ctx, host, port, fp)
 	if err != nil {
-		http.Error(w, peerErrorMessage(err), http.StatusBadGateway)
+		s.peerRefusedPairing(fp, err)
+		http.Error(w, peerErrorMessage(err), peerStatus(err))
 		return
 	}
 	writeJSON(w, p)
