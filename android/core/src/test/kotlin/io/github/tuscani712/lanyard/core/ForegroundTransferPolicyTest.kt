@@ -183,4 +183,31 @@ class ForegroundTransferPolicyTest {
         val failed = row("f", "send", state = TransferState.Failed, message = "checksum mismatch")
         assertFalse(policy.resumeDecision(failed, peerReachable = true).resume)
     }
+
+    @Test
+    fun aPreparingRowKeepsTheServiceAndSaysPreparing() {
+        val state = policy.decide(listOf(row("p", "send", state = TransferState.Preparing, total = 0)))
+        assertTrue(state.serviceRunning, "the service must stay up while files are being prepared")
+        assertEquals(setOf(TransferLock.WAKE, TransferLock.WIFI), state.locks)
+        assertTrue(state.text.startsWith("Preparing"), "the notification names the prepare window: ${state.text}")
+    }
+
+    @Test
+    fun backgroundingNeverCancelsASend() {
+        val decision = policy.lifecycle(TransferLifecycleEvent.BACKGROUNDED, listOf(row("s", "send")))
+        assertFalse(decision.cancelTransfers, "backgrounding (the file picker opening) must never cancel a send")
+        assertTrue(decision.keepService, "the send keeps its foreground service across backgrounding")
+    }
+
+    @Test
+    fun listenerTeardownNeverInterruptsAnOutgoingSend() {
+        // Task C(b): the peer listener stopping (background / picker) may only
+        // fail a receive; an outgoing send is interrupted only by a real
+        // connection failure. No lifecycle event may interrupt either.
+        assertFalse(policy.interruptsOnListenerTeardown("send"), "a teardown must not interrupt an outgoing send")
+        assertTrue(policy.interruptsOnListenerTeardown("receive"), "a receive cannot continue without the listener")
+        for (direction in listOf("send", "receive")) {
+            assertFalse(policy.interruptsOnLifecycle(direction), "no lifecycle event may interrupt a $direction")
+        }
+    }
 }

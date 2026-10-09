@@ -47,6 +47,11 @@ class PushSession(
     private val throttle: Throttle = NoThrottle,
     private val maxOfferBytes: Long = 0,
     private val maxOfferFiles: Int = 0,
+    // One redacted line per outgoing step, so the phone's diagnostics report
+    // tells the same story as the receiver's: `[push] offer`, `[push] file n of
+    // m`, `[push] complete`, `[push] failed reason=…`. Never a file name, only a
+    // path class, and never a full fingerprint.
+    private val diag: (String) -> Unit = {},
 ) {
 
     fun push(
@@ -72,20 +77,26 @@ class PushSession(
         var overall = 0L
         var sentFiles = 0
         return try {
-            for (batch in batches) {
+            batches.forEachIndexed { batchNo, batch ->
                 if (isCancelled()) throw PushCancelledException()
+                val batchBytes = batch.sumOf { requests[it].size }
                 val offer = try {
                     client.pushOffer(batch.map { requests[it] })
                 } catch (e: PeerStatusException) {
-                    return statusResult(e)
+                    return failed(statusResult(e))
                 } catch (e: Exception) {
-                    return PushResult.Failed(e.message ?: "the offer failed")
+                    return failed(PushResult.Failed(e.message ?: "the offer failed"))
                 }
-                if (!offer.accepted) return PushResult.Refused
+                if (!offer.accepted) return failed(PushResult.Refused)
+                diag("[push] offer files=${batch.size} bytes=$batchBytes batch=${batchNo + 1}/${batches.size}")
 
                 for (index in batch) {
                     if (isCancelled()) throw PushCancelledException()
                     val source = sources[index]
+                    diag(
+                        "[push] file ${sentFiles + 1} of ${sources.size} " +
+                            "cls=${Display.pathClass(source.relPath)} bytes=${source.size}",
+                    )
                     val offset = offer.offsets[source.relPath] ?: 0L
                     val result = client.pushFileStream(
                         pushId = offer.pushId,
@@ -111,14 +122,29 @@ class PushSession(
                 }
                 client.pushCompleteAll(offer.pushId)
             }
+            diag("[push] complete files=$sentFiles bytes=$overall")
             PushResult.Sent(sentFiles, overall)
         } catch (_: PushCancelledException) {
+            diag("[push] failed reason=cancelled")
             PushResult.Cancelled
         } catch (e: PeerStatusException) {
-            statusResult(e)
+            failed(statusResult(e))
         } catch (e: Exception) {
-            PushResult.Failed(e.message ?: "the push failed")
+            failed(PushResult.Failed(e.message ?: "the push failed"))
         }
+    }
+
+    /** Logs a redacted failure line once, then returns the same result. */
+    private fun failed(result: PushResult): PushResult {
+        val reason = when (result) {
+            is PushResult.Failed -> result.message
+            PushResult.Refused -> "the other device is not accepting files"
+            PushResult.CancelledByReceiver -> "the other device cancelled"
+            PushResult.Cancelled -> "cancelled"
+            is PushResult.Sent -> "sent"
+        }
+        diag("[push] failed reason=${reason.take(80)}")
+        return result
     }
 
     private fun statusResult(e: PeerStatusException): PushResult = when (e.code) {

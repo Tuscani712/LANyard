@@ -290,7 +290,7 @@ object PeerService {
             store = pendingUnpairs,
             identity = { IdentityHolder.identity },
             trust = trustStore,
-            diag = { diagnostics.record(it) },
+            diag = { msg, level -> diagnostics.record(msg, level) },
         )
         // Any pinned client that sees a generic 403 means that peer dropped us,
         // so the stale local pairing is removed and the person is told.

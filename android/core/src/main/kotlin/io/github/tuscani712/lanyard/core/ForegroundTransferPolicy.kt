@@ -74,8 +74,7 @@ data class ResumeDecision(
 class ForegroundTransferPolicy {
 
     /** True while [record] is still active work the service must protect. */
-    private fun TransferRecord.live(): Boolean =
-        state == TransferState.Running || state == TransferState.Queued
+    private fun TransferRecord.live(): Boolean = state.isLive
 
     /**
      * The service/notification state for [records]. Only live rows count; a
@@ -101,13 +100,17 @@ class ForegroundTransferPolicy {
         val text = when {
             active.size == 1 -> {
                 val a = active[0]
-                if (a.finishing) {
-                    val size = formatBytes(a.finishingBytes ?: a.total)
-                    "Finishing… " + a.label + " · " + size
-                } else {
-                    val rate = formatRateAndEta(a.speed, a.etaSeconds, unit)
-                    val suffix = if (rate.isNotEmpty()) " · $rate" else ""
-                    (if (sending) "Sending " else "Receiving ") + a.label + suffix
+                when {
+                    a.state == TransferState.Preparing -> "Preparing " + a.label
+                    a.finishing -> {
+                        val size = formatBytes(a.finishingBytes ?: a.total)
+                        "Finishing… " + a.label + " · " + size
+                    }
+                    else -> {
+                        val rate = formatRateAndEta(a.speed, a.etaSeconds, unit)
+                        val suffix = if (rate.isNotEmpty()) " · $rate" else ""
+                        (if (sending) "Sending " else "Receiving ") + a.label + suffix
+                    }
                 }
             }
             else -> {
@@ -129,6 +132,24 @@ class ForegroundTransferPolicy {
             total = total,
         )
     }
+
+    /**
+     * Whether tearing down the phone's peer listener (the app was backgrounded
+     * with no live transfer, or the last transfer drained) may interrupt a row
+     * in [direction]. It may only ever interrupt a push this phone is
+     * *receiving*: that receive cannot continue without the listener. An outgoing
+     * send is driven by its own foreground service and is interrupted only by a
+     * real connection failure, never by the lifecycle — backgrounding or the
+     * system file picker opening must not cancel it.
+     */
+    fun interruptsOnListenerTeardown(direction: String): Boolean = direction == "receive"
+
+    /**
+     * Whether a lifecycle transition (background, a swipe-away, Back) may
+     * interrupt a row in [direction]. It never may: no navigation silently ends
+     * a transfer.
+     */
+    fun interruptsOnLifecycle(direction: String): Boolean = false
 
     /**
      * The transfer effect of a lifecycle event. Back and a swipe-away never

@@ -143,6 +143,33 @@ class PushProgressTest {
     }
 
     @Test
+    @Timeout(60)
+    fun outgoingPushStepsAreLoggedRedacted() {
+        // Task C(a): every outgoing step joins the diagnostics sink, redacted:
+        // offer, per-file, complete. Never a file name, only a path class.
+        Phone(PushDestination { rel, _, _ -> rel.substringAfterLast('/') }).use { phone ->
+            val client = Identity.generate("Desktop")
+            phone.pair(client.deviceId)
+            val lines = mutableListOf<String>()
+            val bytes = bytesOf(64 * 1024)
+
+            val result = PushSession(clientFor(phone, client), diag = { lines.add(it) }).push(
+                listOf(PushSource("dir/photo.jpg", bytes.size.toLong(), 0) { ByteArrayInputStream(bytes) }),
+            )
+
+            assertTrue(result is PushResult.Sent, "expected Sent, got $result")
+            assertTrue(lines.any { it.startsWith("[push] offer") }, "the offer step must be logged: $lines")
+            assertTrue(lines.any { it.startsWith("[push] file 1 of 1") }, "the per-file step must be logged: $lines")
+            assertTrue(lines.any { it.startsWith("[push] complete") }, "the complete step must be logged: $lines")
+            assertTrue(lines.any { it.contains("cls=*.jpg") }, "the path class must be logged: $lines")
+            assertTrue(
+                lines.none { it.contains("photo.jpg") },
+                "the outgoing log must never carry a file name: $lines",
+            )
+        }
+    }
+
+    @Test
     fun unsentBytesAreReportedAsTheTrueFraction() {
         assertEquals(50L, SendProgress.whileSending(50, 100))
         assertEquals(0L, SendProgress.whileSending(0, 100))

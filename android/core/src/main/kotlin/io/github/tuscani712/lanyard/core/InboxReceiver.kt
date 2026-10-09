@@ -320,11 +320,28 @@ class InboxReceiver(
         return s
     }
 
+    /**
+     * Claims a file body for [s] under the same monitor as [offer], so a session
+     * that was superseded between [session] and the first byte can never open a
+     * second writer on the shared `.lanpart`. Once this returns, the file is
+     * marked in flight, so a concurrent offer refuses with 409 rather than
+     * superseding it.
+     */
+    @Synchronized
+    private fun beginBody(s: Session, rel: String) {
+        if (sessions[s.id] !== s) throw PeerHttpException(404, "no such push")
+        s.bodyStarted(rel)
+    }
+
     /** Appends bytes at [offset] to a file's spool part. Streams; returns bytes written. */
     fun writeChunk(id: String, peerFp: String, rel: String, offset: Long, input: InputStream): Long {
         val s = session(id, peerFp)
         val st = s.files[rel] ?: throw PeerHttpException(404, "no such file in push")
         if (st.placed) throw PeerHttpException(409, "file already complete")
+        // Claim the body atomically with offer(): once this returns, a concurrent
+        // offer sees the file in flight and refuses (409) instead of superseding,
+        // so two live pushes can never write the same `.lanpart`.
+        beginBody(s, rel)
         diag("[push] peer=${Display.shortFp(peerFp)} file id=$id cls=${Display.pathClass(rel)} offset=$offset size=${st.size} resume=${offset > 0}")
         return try {
             writeStream(s, st, offset, input, null)
@@ -346,6 +363,7 @@ class InboxReceiver(
                 return st.size
             }
             if (st.done != 0L) throw PeerHttpException(409, "file already partly received")
+            beginBody(s, rel)
             diag("[push] peer=${Display.shortFp(peerFp)} file id=$id cls=${Display.pathClass(rel)} offset=0 size=${st.size} whole=true")
             return try {
                 writeStream(s, st, 0, input, sha256)
@@ -520,8 +538,9 @@ class InboxReceiver(
         // Mark this body in flight so the reaper judges it by the short stall
         // timeout, and touch the deadline on every byte so a slow (but live)
         // transfer is never reaped. Tracking is per file: a push with several
-        // concurrent bodies stays in flight until the last one finishes.
-        s.bodyStarted(st.relPath)
+        // concurrent bodies stays in flight until the last one finishes. The
+        // claim itself is taken by [beginBody], under the same monitor as
+        // [offer], so a supersede can never race a body start.
         s.lastProgress = clock()
         try {
             val buf = ByteArray(256 * 1024)

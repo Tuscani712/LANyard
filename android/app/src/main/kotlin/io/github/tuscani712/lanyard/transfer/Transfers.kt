@@ -18,6 +18,8 @@ import io.github.tuscani712.lanyard.core.MeteredNetwork
 import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PeerClient
 import io.github.tuscani712.lanyard.core.PeerErrors
+import io.github.tuscani712.lanyard.core.PrepareStart
+import io.github.tuscani712.lanyard.core.PushPrepareGate
 import io.github.tuscani712.lanyard.core.PushResult
 import io.github.tuscani712.lanyard.core.PushSession
 import io.github.tuscani712.lanyard.core.PushSource
@@ -32,6 +34,7 @@ import io.github.tuscani712.lanyard.core.TransferPolicy
 import io.github.tuscani712.lanyard.core.TransferRecord
 import io.github.tuscani712.lanyard.core.TransferState
 import io.github.tuscani712.lanyard.core.TransferTuning
+import io.github.tuscani712.lanyard.core.isLive
 import io.github.tuscani712.lanyard.SettingsHolder
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -45,6 +48,22 @@ import kotlinx.coroutines.launch
 import java.io.File
 import java.security.SecureRandom
 import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * The outcome of asking to prepare a push before its files are spooled:
+ * a cancellable row was added, the same selection is already preparing, or a
+ * different selection is already preparing for the same peer.
+ */
+sealed interface PrepareResult {
+    /** A Preparing row is live under [id]; it is cancellable and replaceable. */
+    data class Started(val id: String) : PrepareResult
+
+    /** The same URI set to the same peer is already preparing: ignore the repeat. */
+    data object Duplicate : PrepareResult
+
+    /** A different send to the same peer is already preparing: refuse with [reason]. */
+    data class Busy(val reason: String) : PrepareResult
+}
 
 /**
  * The single owner of transfers. Both the send and receive paths run here on
@@ -79,6 +98,17 @@ object TransferManager {
     private var history: TransferHistoryStore? = null
 
     private val board = TransferBoard(historyCap = HISTORY_CAP, stalledAfterMillis = STALLED_AFTER_MS)
+
+    /**
+     * The prepare window (spooling picked files) per peer, so a repeated
+     * selection is de-duplicated and a differing concurrent send is refused.
+     * The pure rules live in [PushPrepareGate]; this object owns the row that
+     * makes the window visible.
+     */
+    private val prepareGate = PushPrepareGate()
+
+    /** Preparing row id -> gate key, so the row can close the window it opened. */
+    private val prepareKeys = java.util.concurrent.ConcurrentHashMap<String, String>()
 
     private val _state = MutableStateFlow<List<TransferRecord>>(emptyList())
     val state: StateFlow<List<TransferRecord>> = _state.asStateFlow()
@@ -342,12 +372,15 @@ object TransferManager {
     /**
      * Marks a live row interrupted: it is `Failed` for the UI but carries the
      * "will resume" text and keeps its `.part`/`.lanpart`, and its descriptor is
-     * persisted for the automatic resume.
+     * persisted for the automatic resume. [trigger] is the real cause, logged so
+     * every interruption is explained.
      */
-    private fun markInterrupted(id: String) {
+    private fun markInterrupted(id: String, trigger: String) {
         val row = board.end(id, TransferState.Failed, ForegroundTransferPolicy.INTERRUPTED_MESSAGE) ?: return
         freeFor(row)
-        rememberInterrupted(board.firstOrNull(id) ?: row)
+        val stored = board.firstOrNull(id) ?: row
+        rememberInterrupted(stored)
+        logInterrupt(stored, trigger)
         publish()
         persist()
     }
@@ -373,19 +406,146 @@ object TransferManager {
         SettingsHolder.update { it.copy(downloadFolder = null) }
     }
 
+    // --- prepare (spool) window ---
+
+    /**
+     * Opens the visible prepare window for a push: a cancellable [TransferState.Preparing]
+     * row is added and the foreground service starts, so the screen shows
+     * "Preparing N file(s)…" immediately - before any file is copied. [uris] are
+     * the picked URIs (order-insensitive); a second identical selection is a
+     * [PrepareResult.Duplicate] and a different selection for the same peer is a
+     * [PrepareResult.Busy], so two transfers can never be queued from one window.
+     * [onCancel] is invoked if the person cancels the row: it must cancel the
+     * spool and delete whatever was copied.
+     */
+    fun beginPrepare(peer: PairedPeer, uris: List<String>, onCancel: () -> Unit): PrepareResult {
+        val start = prepareGate.begin(peer.fingerprint, uris)
+        return when (start) {
+            is PrepareStart.Started -> {
+                val id = newId()
+                prepareKeys[id] = start.key
+                // Cancelling the row ends the window and runs the caller's cleanup.
+                cleanups[id] = {
+                    prepareGate.end(start.key)
+                    prepareKeys.remove(id)
+                    onCancel()
+                }
+                add(
+                    TransferRecord(
+                        id, "send", peer.name, peer.fingerprint,
+                        "${uris.size} file(s)", 0, 0, TransferState.Preparing, null, 0.0, now(),
+                    ),
+                )
+                logPrepare("[push] preparing peer=${Display.shortFp(peer.fingerprint)} files=${uris.size} id=$id")
+                TransferService.start(app)
+                PrepareResult.Started(id)
+            }
+            is PrepareStart.Duplicate -> PrepareResult.Duplicate
+            is PrepareStart.Busy -> PrepareResult.Busy(start.reason)
+        }
+    }
+
+    /**
+     * Ends a prepare window whose spooling failed, before any transfer row
+     * exists: the Preparing row becomes Failed, the gate is released so the peer
+     * may try again, and it is no longer cancellable.
+     */
+    fun failPrepare(id: String, message: String) {
+        releasePrepare(id)
+        val ended = board.end(id, TransferState.Failed, message)
+        if (ended != null) {
+            logPrepare("[push] prepare-failed id=$id reason=${message.take(80)}")
+            publish()
+            persist()
+        }
+    }
+
+    /**
+     * Releases the gate window for a Preparing row without ending it as
+     * cancelled: used when the row is about to be replaced by the real transfer.
+     */
+    private fun releasePrepare(id: String) {
+        prepareKeys.remove(id)?.let { prepareGate.end(it) }
+        cleanups.remove(id)
+    }
+
+    private fun logPrepare(event: String) {
+        diagnostic?.invoke(event)
+    }
+
+    /** One redacted outgoing-push step line, tagged with the peer's short id. */
+    private fun logPush(peer: PairedPeer, line: String) {
+        logPrepare("$line peer=${Display.shortFp(peer.fingerprint)}")
+    }
+
+    /**
+     * Every state change that marks a row Interrupted goes through here, so the
+     * diagnostics report always says what actually interrupted it (the real
+     * connection failure, the peer being unreachable, or the peer listener being
+     * torn down) — never a silent, unexplained "Interrupted".
+     */
+    private fun logInterrupt(row: TransferRecord, trigger: String) {
+        logPrepare(
+            "[transfer] interrupted id=${row.id} direction=${row.direction} " +
+                "peer=${Display.shortFp(row.peerFingerprint)} done=${row.done} total=${row.total} trigger=$trigger",
+        )
+    }
+
     // --- enqueue ---
 
-    fun enqueuePush(peer: PairedPeer, sources: List<PushSource>, label: String, onFinished: (() -> Unit)? = null): String {
-        val id = newId()
+    /**
+     * Queues a send. When [replaceId] names a live Preparing row, that row is
+     * turned into the real transfer in place (same id), so the UI shows one row
+     * that changes from "Preparing…" to "Waiting"/"Sending" rather than a
+     * flicker of two. The prepare window [replaceId] opened is closed here.
+     */
+    fun enqueuePush(
+        peer: PairedPeer,
+        sources: List<PushSource>,
+        label: String,
+        replaceId: String? = null,
+        onFinished: (() -> Unit)? = null,
+    ): String {
+        val id = replaceId ?: newId()
         val blocked = refusal()
         if (blocked != null) {
-            add(TransferRecord(id, "send", peer.name, peer.fingerprint, label, sources.sumOf { it.size }, 0, TransferState.Failed, blocked, 0.0, now()))
+            if (replaceId != null) {
+                releasePrepare(replaceId)
+                if (board.end(replaceId, TransferState.Failed, blocked) != null) {
+                    logPrepare("[push] prepare-failed id=$replaceId reason=refused")
+                    publish()
+                    persist()
+                }
+            } else {
+                add(TransferRecord(id, "send", peer.name, peer.fingerprint, label, sources.sumOf { it.size }, 0, TransferState.Failed, blocked, 0.0, now()))
+            }
             onFinished?.invoke()
             return id
         }
+        // The window is over: release the gate before the transfer takes over, so
+        // a new send may be picked while this one runs (as before this change).
+        if (replaceId != null) {
+            // A row cancelled in the meantime must not be resurrected: drop the
+            // spools and leave it Cancelled.
+            if (board.firstOrNull(replaceId)?.state != TransferState.Preparing) {
+                releasePrepare(replaceId)
+                onFinished?.invoke()
+                return id
+            }
+            releasePrepare(replaceId)
+        }
         if (onFinished != null) cleanups[id] = onFinished
         resumables[id] = Resumable(peer, "send", sources = sources)
-        add(TransferRecord(id, "send", peer.name, peer.fingerprint, label, sources.sumOf { it.size }, 0, TransferState.Queued, null, 0.0, now()))
+        val total = sources.sumOf { it.size }
+        if (replaceId != null) {
+            board.update(id) {
+                it.copy(label = label, total = total, done = 0, state = TransferState.Queued, message = null, speed = 0.0, etaSeconds = null)
+            }
+            publish()
+            persist()
+        } else {
+            add(TransferRecord(id, "send", peer.name, peer.fingerprint, label, total, 0, TransferState.Queued, null, 0.0, now()))
+        }
         TransferService.start(app)
         val throttle = throttle()
         scope.launch { runPush(id, peer, sources, throttle) }
@@ -495,9 +655,21 @@ object TransferManager {
      */
     fun failPushReceives(reason: String) {
         for (id in pushReceives.toList()) {
+            val record = board.firstOrNull(id) ?: continue
+            // Defensive: a teardown of the peer listener may only interrupt a
+            // push this phone is *receiving*. An outgoing send ("send") is driven
+            // by its own foreground service and must never be cancelled by the
+            // lifecycle; it is only ever interrupted by a real connection failure.
+            if (!ForegroundTransferPolicy().interruptsOnListenerTeardown(record.direction)) {
+                pushReceives.remove(id)
+                continue
+            }
             if (board.isLive(id)) {
                 board.end(id, TransferState.Failed, ForegroundTransferPolicy.INTERRUPTED_MESSAGE)?.let { freeFor(it) }
-                board.firstOrNull(id)?.let { rememberInterrupted(it) }
+                board.firstOrNull(id)?.let {
+                    rememberInterrupted(it)
+                    logInterrupt(it, "server-teardown reason=$reason")
+                }
                 publish()
                 persist()
             }
@@ -510,6 +682,7 @@ object TransferManager {
         pushReceives.remove(id)
         resumables.remove(id)
         interrupted?.remove(id)
+        prepareKeys.remove(id)
         board.dismiss(id)
         publish()
         persist()
@@ -564,6 +737,9 @@ object TransferManager {
                     throttle,
                     maxOfferBytes = hello?.maxOfferBytes ?: 0,
                     maxOfferFiles = hello?.maxOfferFiles ?: 0,
+                    // Every outgoing push step joins the same diagnostics sink the
+                    // receiver uses, redacted and tagged with the peer's short id.
+                    diag = { line -> logPush(peer, line) },
                 ).push(
                     sources = sources,
                     onProgress = { index, bytes, _ ->
@@ -713,7 +889,11 @@ object TransferManager {
             PushResult.Cancelled -> end(id, TransferState.Cancelled, "Cancelled")
             PushResult.CancelledByReceiver -> end(id, TransferState.Failed, "The other device cancelled")
             PushResult.Refused -> end(id, TransferState.Failed, "The other device is not accepting files")
-            is PushResult.Failed -> if (isTransportFailure(result.message)) markInterrupted(id) else end(id, TransferState.Failed, result.message)
+            is PushResult.Failed -> if (isTransportFailure(result.message)) {
+                markInterrupted(id, "send-transport:${result.message.take(60)}")
+            } else {
+                end(id, TransferState.Failed, result.message)
+            }
         }
     }
 
@@ -722,10 +902,14 @@ object TransferManager {
             is DownloadResult.Done -> end(id, TransferState.Done, "Received ${result.files} file(s)", folder, folderUri)
             DownloadResult.Cancelled -> end(id, TransferState.Cancelled, "Cancelled")
             DownloadResult.ShareEnded -> end(id, TransferState.Failed, "The sender stopped this share")
-            DownloadResult.PeerUnreachable -> markInterrupted(id)
+            DownloadResult.PeerUnreachable -> markInterrupted(id, "download-unreachable")
             is DownloadResult.HashMismatch -> end(id, TransferState.Failed, "A file failed its checksum")
             DownloadResult.UnsafePath -> end(id, TransferState.Failed, "The share contained an unsafe path")
-            is DownloadResult.Failed -> if (isTransportFailure(result.message)) markInterrupted(id) else end(id, TransferState.Failed, result.message)
+            is DownloadResult.Failed -> if (isTransportFailure(result.message)) {
+                markInterrupted(id, "download-transport:${result.message.take(60)}")
+            } else {
+                end(id, TransferState.Failed, result.message)
+            }
         }
     }
 

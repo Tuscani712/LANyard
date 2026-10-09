@@ -152,7 +152,7 @@ object UnpairRetry {
         store: PendingUnpairStore,
         identity: Identity?,
         trust: TrustStore? = null,
-        diag: (String) -> Unit = {},
+        diag: (String, DiagLevel) -> Unit = { _, _ -> },
     ): List<String> {
         if (identity == null) return emptyList()
         val delivered = ArrayList<String>()
@@ -164,7 +164,7 @@ object UnpairRetry {
             val current = trust?.find(p.fingerprint)
             if (current != null && current.pairedAt > p.queuedAt) {
                 store.remove(p.fingerprint)
-                diag("[pairing] peer=$short unpair-retry result=stale-dropped")
+                diag("[pairing] peer=$short unpair-retry result=stale-dropped", DiagLevel.Info)
                 continue
             }
             if (p.host.isBlank() || p.port !in 1..65535) continue
@@ -172,9 +172,13 @@ object UnpairRetry {
             if (ok) {
                 store.remove(p.fingerprint)
                 delivered.add(p.fingerprint)
-                diag("[pairing] peer=$short unpair-retry result=ok")
+                diag("[pairing] peer=$short unpair-retry result=ok", DiagLevel.Info)
             } else {
-                diag("[pairing] peer=$short unpair-retry result=unreachable")
+                // A routine retry of an offline peer is healthy chatter, not a
+                // fault: it stays in the in-memory report but out of the durable
+                // log, so a burst of signals cannot fill the log (see the retry
+                // gate in [PendingUnpairRetry]).
+                diag("[pairing] peer=$short unpair-retry result=unreachable", DiagLevel.Debug)
             }
         }
         return delivered
@@ -195,11 +199,78 @@ object UnpairRetry {
 }
 
 /**
+ * A per-peer rate limit for pending-unpair retries. An unreachable peer used to
+ * be retried on every "peer reachable" signal, which arrives in bursts (an mDNS
+ * re-announcement, a probe, an inbound handshake): five to six attempts a
+ * second, and five to six log lines each. This allows at most one attempt per
+ * peer per interval, doubling the interval after each consecutive failure up to
+ * a bounded maximum, so a peer that stays down is retried less and less while
+ * one that returns is delivered at once. The clock is injected, so the policy
+ * is tested without real time.
+ */
+class UnpairRetryGate(
+    private val baseIntervalMs: Long = BASE_INTERVAL_MS,
+    private val maxIntervalMs: Long = MAX_INTERVAL_MS,
+) {
+    private class Entry(var lastAttemptAt: Long = Long.MIN_VALUE, var failures: Int = 0)
+
+    private val entries = HashMap<String, Entry>()
+
+    /** True when [fingerprint] may be attempted at [now]: never tried, or past its backoff. */
+    @Synchronized
+    fun allow(fingerprint: String, now: Long): Boolean {
+        val e = entries.getOrPut(fingerprint.lowercase()) { Entry() }
+        if (e.lastAttemptAt == Long.MIN_VALUE) return true
+        return now - e.lastAttemptAt >= intervalFor(e.failures)
+    }
+
+    /** Records that an attempt for [fingerprint] started at [now]. */
+    @Synchronized
+    fun recordAttempt(fingerprint: String, now: Long) {
+        val e = entries.getOrPut(fingerprint.lowercase()) { Entry() }
+        e.lastAttemptAt = now
+    }
+
+    /** Records the outcome: a delivery resets the backoff, a failure lengthens it. */
+    @Synchronized
+    fun recordResult(fingerprint: String, delivered: Boolean) {
+        val e = entries.getOrPut(fingerprint.lowercase()) { Entry() }
+        e.failures = if (delivered) 0 else (e.failures + 1).coerceAtMost(MAX_FAILURES)
+    }
+
+    /** The current interval for [fingerprint], for the diagnostics line and tests. */
+    @Synchronized
+    fun intervalFor(fingerprint: String): Long =
+        intervalFor(entries[fingerprint.lowercase()]?.failures ?: 0)
+
+    private fun intervalFor(failures: Int): Long {
+        var ms = baseIntervalMs
+        repeat(failures) {
+            if (ms >= maxIntervalMs) return maxIntervalMs
+            ms = (ms * 2).coerceAtMost(maxIntervalMs)
+        }
+        return ms
+    }
+
+    companion object {
+        /** One attempt per peer per this interval before any backoff. */
+        const val BASE_INTERVAL_MS = 3_000L
+
+        /** The backoff never grows past this. */
+        const val MAX_INTERVAL_MS = 60_000L
+
+        /** The failure count at which the backoff is capped. */
+        const val MAX_FAILURES = 6
+    }
+}
+
+/**
  * Decides when a pending-unpair notification is retried. Every "peer is
  * reachable" signal (a successful hello in either direction, an inbound
  * handshake, an mDNS sighting, the app coming to the foreground) triggers an
- * immediate attempt, and a [RETRY_INTERVAL_MS] timer retries while any record
- * is still pending, so a peer that returns on its own is not missed. The clock
+ * attempt, but at most one attempt per peer per [UnpairRetryGate] interval with
+ * a bounded backoff, so a burst of signals is not a burst of attempts. A
+ * [RETRY_INTERVAL_MS] timer retries while any record is still pending. The clock
  * is injected, so the timer policy is testable without real time.
  */
 class PendingUnpairRetry(
@@ -207,7 +278,9 @@ class PendingUnpairRetry(
     private val identity: () -> Identity?,
     private val trust: TrustStore? = null,
     private val clock: () -> Long = System::currentTimeMillis,
-    private val diag: (String) -> Unit = {},
+    private val diag: (String, DiagLevel) -> Unit = { _, _ -> },
+    // The per-peer burst limiter shared by every reachable signal.
+    private val gate: UnpairRetryGate = UnpairRetryGate(),
     // The delivery action, injectable so the trigger policy can be tested
     // without a live peer. Defaults to the real idempotent revoke.
     private val deliver: (PendingUnpairStore, Identity?, TrustStore?) -> List<String> =
@@ -226,19 +299,38 @@ class PendingUnpairRetry(
 
     /**
      * A peer became reachable. When [shortId]/[host]/[port] name it, a pending
-     * record for that peer gets the fresh address first. Delivers immediately,
-     * so a reconnection never waits for the timer.
+     * record for that peer gets the fresh address first, then it is delivered
+     * unless the per-peer gate says a recent attempt already ran (a burst of
+     * reachable signals for the same peer is one attempt, not many).
      */
     fun onPeerReachable(shortId: String? = null, host: String? = null, port: Int? = null): List<String> {
+        var fingerprint: String? = null
         if (shortId != null && host != null && port != null && port in 1..65535) {
             UnpairRetry.matchByShortId(store, shortId)?.let { match ->
                 // Re-arm the address only if no sibling delivered the record
                 // between the snapshot and now; otherwise this would resurrect a
                 // revoke that already succeeded.
                 store.upsertIfCurrent(match.entry.copy(host = host, port = port), match.generation)
+                fingerprint = match.entry.fingerprint
             }
         }
-        return attempt()
+        val now = clock()
+        if (fingerprint != null) {
+            if (!gate.allow(fingerprint, now)) {
+                diag(
+                    "[pairing] peer=${Display.shortFp(fingerprint)} unpair-retry skipped reason=backoff " +
+                        "retry_in=${gate.intervalFor(fingerprint)}ms",
+                    DiagLevel.Debug,
+                )
+                return emptyList()
+            }
+            gate.recordAttempt(fingerprint, now)
+        }
+        val delivered = attempt(now)
+        if (fingerprint != null) {
+            gate.recordResult(fingerprint, delivered.any { it.equals(fingerprint, ignoreCase = true) })
+        }
+        return delivered
     }
 
     /**

@@ -19,12 +19,14 @@ import io.github.tuscani712.lanyard.core.PeerProbeSet
 import io.github.tuscani712.lanyard.core.PeerStatusException
 import io.github.tuscani712.lanyard.core.ProbeClient
 import io.github.tuscani712.lanyard.core.SelfFilter
+import io.github.tuscani712.lanyard.core.TransferState
 import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.core.Unpair
 import io.github.tuscani712.lanyard.net.NearbyDevice
 import io.github.tuscani712.lanyard.net.NsdDiscovery
 import io.github.tuscani712.lanyard.share.SourceResult
 import io.github.tuscani712.lanyard.share.spoolShare
+import io.github.tuscani712.lanyard.transfer.PrepareResult
 import io.github.tuscani712.lanyard.transfer.TransferManager
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -55,6 +57,10 @@ data class PairedStatus(
     // Why the last probe failed (timeout vs refused vs other), for the row. Null
     // while online or before the first probe has finished.
     val offlineReason: String? = null,
+    // How many files are currently being prepared (spooled) for a push to this
+    // peer, or null when none. Lets the row say "Preparing N file(s)…" during the
+    // window between the picker and the transfer row.
+    val preparingFiles: Int? = null,
 )
 
 /** The pairing attempt's state, for the Add-device dialog. */
@@ -93,6 +99,8 @@ data class PeerDetail(
     val tree: List<TreeItem> = emptyList(),
     val treeLoading: Boolean = false,
     val notice: String? = null,
+    // How many files are being prepared for a push to this peer right now.
+    val preparing: Int = 0,
 )
 
 data class DevicesUiState(
@@ -182,12 +190,40 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             PeerService.reachable.collect { event -> markReachable(event.shortId) }
         }
+        // The prepare window for a push lives on the Transfers board; mirror the
+        // per-peer count here so the device row and detail show "Preparing N…"
+        // as soon as the picker returns, without waiting for the spool copy.
+        viewModelScope.launch {
+            TransferManager.state.collect { list ->
+                val counts = preparingCounts(list)
+                _state.update { current ->
+                    current.copy(
+                        paired = current.paired.map {
+                            it.copy(preparingFiles = counts[it.peer.fingerprint.lowercase()])
+                        },
+                        detail = current.detail?.let { d ->
+                            d.copy(preparing = counts[d.peer.fingerprint.lowercase()] ?: 0)
+                        },
+                    )
+                }
+            }
+        }
     }
+
+    /** Files being prepared per peer fingerprint, from the current board. */
+    private fun preparingCounts(rows: List<io.github.tuscani712.lanyard.core.TransferRecord>): Map<String, Int> =
+        rows.asSequence()
+            .filter { it.state == TransferState.Preparing }
+            .groupingBy { it.peerFingerprint.lowercase() }
+            .eachCount()
 
     fun refreshPaired() {
         viewModelScope.launch {
             _state.update { it.copy(refreshing = true) }
             val identity = IdentityHolder.identity
+            // Carry the live prepare counts across the rebuild, so a refresh
+            // during the spool window does not blank the "Preparing N…" row.
+            val preparing = preparingCounts(TransferManager.state.value)
             val paired = withContext(Dispatchers.IO) {
                 if (identity == null) return@withContext emptyList()
                 // A device unpaired while offline may be reachable now.
@@ -202,7 +238,12 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 val peers = probes.sync()
                 peers.map { peer ->
                     val online = isOnline(peer)
-                    PairedStatus(peer, online, if (online) null else offlineReasonFor(peer.fingerprint))
+                    PairedStatus(
+                        peer,
+                        online,
+                        if (online) null else offlineReasonFor(peer.fingerprint),
+                        preparing[peer.fingerprint.lowercase()],
+                    )
                 }
             }
             _state.update { it.copy(paired = paired, refreshing = false) }
@@ -503,24 +544,98 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         setNotice("Text sending. See Transfers.")
     }
 
-    /** Spools the picked documents and pushes them to the peer's Inbox (see Transfers). */
+    /**
+     * Spools the picked documents and pushes them to the peer's Inbox (see
+     * Transfers). A visible Preparing row and the device's "Preparing N…" status
+     * appear as soon as this returns to the UI, before any byte is copied; when
+     * the spool finishes the same row becomes the real transfer. A repeated
+     * identical selection is ignored and a differing concurrent send is refused.
+     */
     fun sendFiles(peer: PairedPeer, uris: List<Uri>) {
         if (uris.isEmpty()) return
+        val blocked = TransferManager.refusal()
+        if (blocked != null) {
+            setNotice(blocked)
+            return
+        }
         val app = getApplication<Application>()
-        viewModelScope.launch {
-            val results = withContext(Dispatchers.IO) {
-                val used = HashSet<String>()
-                uris.map { spoolShare(app, it, used) }
+        val spooled = java.util.Collections.synchronizedList(mutableListOf<java.io.File>())
+        // Set by the Cancel on the Preparing row: the spool coroutine stops and
+        // every already-copied file is deleted.
+        val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        var spoolJob: Job? = null
+
+        val outcome = TransferManager.beginPrepare(peer, uris.map { it.toString() }) {
+            cancelled.set(true)
+            spoolJob?.cancel()
+            synchronized(spooled) { spooled.forEach { it.delete() } }
+        }
+        when (outcome) {
+            is PrepareResult.Duplicate -> {
+                setNotice("Those files are already being prepared.")
+                return
             }
-            val sources = results.mapNotNull { (it as? SourceResult.Ok)?.source }
-            val spools = results.mapNotNull { (it as? SourceResult.Ok)?.spool }
-            if (sources.isEmpty()) {
-                setNotice("Those files could not be opened.")
-                return@launch
+            is PrepareResult.Busy -> {
+                setNotice(outcome.reason)
+                return
             }
-            val label = sources.first().relPath + if (sources.size > 1) " +${sources.size - 1}" else ""
-            TransferManager.enqueuePush(peer, sources, label) { spools.forEach { it.delete() } }
-            setNotice("Sending ${sources.size} file(s). See Transfers.")
+            is PrepareResult.Started -> Unit
+        }
+        val prepareId = (outcome as PrepareResult.Started).id
+
+        spoolJob = viewModelScope.launch {
+            // Set once the prepared source list has been handed to the real
+            // transfer: from then on the transfer owns the spools.
+            var handedOff = false
+            try {
+                val results = withContext(Dispatchers.IO) {
+                    val used = HashSet<String>()
+                    uris.map { uri ->
+                        val result = spoolShare(app, uri, used)
+                        (result as? SourceResult.Ok)?.spool?.let { spooled.add(it) }
+                        result
+                    }
+                }
+                // The row may have been cancelled mid-copy (the spool copy itself
+                // is not interruptible): the finally below finishes the cleanup.
+                if (cancelled.get()) return@launch
+                val sources = results.mapNotNull { (it as? SourceResult.Ok)?.source }
+                val spools = results.mapNotNull { (it as? SourceResult.Ok)?.spool }
+                if (sources.isEmpty()) {
+                    TransferManager.failPrepare(prepareId, "Those files could not be opened.")
+                    setNotice("Those files could not be opened.")
+                    return@launch
+                }
+                val label = sources.first().relPath + if (sources.size > 1) " +${sources.size - 1}" else ""
+                val id = TransferManager.enqueuePush(
+                    peer,
+                    sources,
+                    label,
+                    onFinished = { spools.forEach { it.delete() } },
+                    replaceId = prepareId,
+                )
+                handedOff = true
+                PeerService.diagnostics.record(
+                    "[push] prepared peer=${peer.fingerprint.take(8)} files=${sources.size} id=$id",
+                )
+                setNotice("Sending ${sources.size} file(s). See Transfers.")
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (_: Throwable) {
+                // A spool that throws (a revoked URI grant, a storage error) must
+                // never leave a stuck Preparing row: fail it, which clears the
+                // row, releases the gate and stops the service.
+                if (!handedOff && !cancelled.get()) {
+                    TransferManager.failPrepare(prepareId, "Those files could not be opened.")
+                    setNotice("Those files could not be opened.")
+                }
+            } finally {
+                // Cancelled or never handed off: delete every spool, including one
+                // the uninterruptible copy finished after Cancel ran.
+                if (cancelled.get() || !handedOff) {
+                    synchronized(spooled) { spooled.forEach { it.delete() } }
+                }
+            }
         }
     }
 

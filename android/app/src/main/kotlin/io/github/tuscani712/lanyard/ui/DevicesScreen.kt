@@ -295,9 +295,24 @@ private fun PairedRow(status: PairedStatus, onClick: () -> Unit) {
                         )
                     }
                 }
+                // A push's files are being spooled right now: say so here, so the
+                // person sees the send is under way while the Transfers row is
+                // still only "Preparing…".
+                status.preparingFiles?.let { count ->
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        "Preparing $count file(s)…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
             }
             Text(
-                if (status.online) "Online" else "Offline",
+                when {
+                    status.preparingFiles != null -> "Preparing"
+                    status.online -> "Online"
+                    else -> "Offline"
+                },
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )

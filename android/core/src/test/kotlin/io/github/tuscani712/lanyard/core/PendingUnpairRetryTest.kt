@@ -67,6 +67,28 @@ class PendingUnpairRetryTest {
     }
 
     @Test
+    fun aBurstOfReachableSignalsForOnePeerIsOneAttempt() {
+        // The same peer is announced over and over (mDNS re-announcements, probes,
+        // handshakes). Unreachable, it must be retried once — not once per signal.
+        val store = MemoryStore()
+        val fp = "0123abcd" + "ff".repeat(28)
+        store.upsert(PendingUnpair(fp, "Desk", "10.0.0.9", 5555, queuedAt = 1))
+        var attempts = 0
+        var now = 0L
+        val retry = PendingUnpairRetry(
+            store = store,
+            identity = { identity },
+            clock = { now },
+            deliver = { _, _, _ -> attempts++; emptyList() },
+        )
+        repeat(50) {
+            now += 20
+            retry.onPeerReachable(SelfFilter.ownShortId(fp), "10.0.0.9", 5555)
+        }
+        assertEquals(1, attempts, "a burst of signals for one peer must collapse to one attempt")
+    }
+
+    @Test
     fun timerStaysQuietWithNothingPending() {
         val store = MemoryStore()
         var attempts = 0

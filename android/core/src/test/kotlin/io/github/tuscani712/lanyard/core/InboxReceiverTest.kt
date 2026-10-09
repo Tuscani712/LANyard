@@ -299,6 +299,81 @@ class InboxReceiverTest {
     }
 
     @Test
+    fun aSupersededSessionCanNoLongerWriteTheSharedPart() {
+        // Two overlapping offers name the same file. The first is idle, so the
+        // second supersedes it (resume, not 409). The superseded session must be
+        // dead: it can never open a second writer on the shared `.lanpart`.
+        val r = receiver()
+        val first = r.offer("peerA", "A", listOf(req("photo.jpg", 10)), 0, 0)
+        val second = r.offer("peerA", "A", listOf(req("photo.jpg", 10)), 0, 0)
+        assertTrue(second.pushId != first.pushId, "the idle first offer must be replaced")
+        assertEquals(1, r.count(), "only one live session may own the spool")
+
+        val refusedWrite = assertThrows(PeerHttpException::class.java) {
+            r.writeChunk(first.pushId, "peerA", "photo.jpg", 0, byteArrayOf(1).inputStream())
+        }
+        assertEquals(404, refusedWrite.code, "a superseded session must not write the shared part")
+        assertThrows(PeerHttpException::class.java) {
+            r.complete(first.pushId, "peerA", "photo.jpg", "00".repeat(32))
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun aBodyStartingUnderAConcurrentOfferNeverSharesTheSpool() {
+        // Two overlapping offers name the same file. The first has a body whose
+        // start must be atomic with the offer decision: once the body is claimed,
+        // a concurrent offer is refused (409) rather than superseding it. Without
+        // the atomic claim, the second offer would remove the first while its
+        // writer is still starting and two live pushes would share one `.lanpart`.
+        //
+        // The receiver's per-file diagnostic is emitted only *after* the claim,
+        // so waiting for it proves the first body is claimed. A small body then
+        // blocks on its input, keeping the claim alive while the offer races it.
+        val ownSpool = Files.createTempDirectory("lanyard-spool-writers").toFile()
+        val claimed = java.util.concurrent.CountDownLatch(1)
+        val r = InboxReceiver(
+            spoolRoot = ownSpool,
+            destination = PushDestination { rel, _, _ -> rel },
+            freeBytes = { 1L shl 40 },
+            diag = { line -> if (line.contains(" file id=")) claimed.countDown() },
+        )
+        // A large resume prefix makes the pre-claim window wide: without the
+        // atomic claim the body is not marked in flight until after hashing it.
+        val resumeBytes = 256L * 1024 * 1024
+        val peerDir = java.io.File(ownSpool, "peerA".take(16).lowercase()).apply { mkdirs() }
+        java.io.RandomAccessFile(java.io.File(peerDir, "photo.jpg.lanpart"), "rw").use { it.setLength(resumeBytes) }
+        val first = r.offer("peerA", "A", listOf(req("photo.jpg", resumeBytes + 10)), 0, 0)
+
+        val release = java.util.concurrent.CountDownLatch(1)
+        val writer = Thread {
+            runCatching { r.writeChunk(first.pushId, "peerA", "photo.jpg", resumeBytes, BlockingInput(3, release)) }
+        }.apply { isDaemon = true; start() }
+
+        try {
+            assertTrue(claimed.await(5, java.util.concurrent.TimeUnit.SECONDS), "test setup: the body must claim the part")
+            var superseded = false
+            val deadline = System.currentTimeMillis() + 3_000
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    val again = r.offer("peerA", "A", listOf(req("photo.jpg", resumeBytes + 10)), 0, 0)
+                    if (again.pushId != first.pushId) { superseded = true; break }
+                } catch (e: PeerHttpException) {
+                    assertEquals(409, e.code, "a claimed body must refuse a concurrent offer, not supersede it")
+                }
+            }
+            assertFalse(
+                superseded,
+                "a body being started must block a supersede: two live pushes must never share one .lanpart",
+            )
+            assertEquals(1, r.count(), "two live pushes must never share one .lanpart")
+        } finally {
+            release.countDown()
+            writer.join(5_000)
+        }
+    }
+
+    @Test
     fun staleInFlightReceiveIsReapedAfterTheStallTimeoutAndKeepsItsSpool() {
         val failures = mutableListOf<Pair<String, String>>()
         val r = InboxReceiver(

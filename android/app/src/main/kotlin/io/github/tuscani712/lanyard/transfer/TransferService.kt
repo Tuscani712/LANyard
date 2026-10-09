@@ -19,8 +19,8 @@ import io.github.tuscani712.lanyard.SettingsHolder
 import io.github.tuscani712.lanyard.core.ForegroundTransferPolicy
 import io.github.tuscani712.lanyard.core.ForegroundTransferState
 import io.github.tuscani712.lanyard.core.TransferLock
-import io.github.tuscani712.lanyard.core.TransferState
 import io.github.tuscani712.lanyard.core.TransferTuning
+import io.github.tuscani712.lanyard.core.isLive
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -79,7 +79,7 @@ class TransferService : Service() {
                     stopSelf()
                 } else {
                     applyLocks(state)
-                    val active = list.filter { it.state == TransferState.Running || it.state == TransferState.Queued }
+                    val active = list.filter { it.state.isLive }
                     val now = System.currentTimeMillis()
                     val structure = active.joinToString("|") { "${it.id}:${it.state}" }
                     if (structure == lastStructure && now - lastNotifyAt < TransferTuning.DISPLAY_REFRESH_MS) return@collect

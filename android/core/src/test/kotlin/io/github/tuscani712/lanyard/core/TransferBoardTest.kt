@@ -1,6 +1,7 @@
 package io.github.tuscani712.lanyard.core
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -212,5 +213,56 @@ class TransferBoardTest {
         b.failInterrupted()
         assertEquals("Interrupted – will resume", b.firstOrNull("r")?.message)
         assertEquals("Interrupted – will resume", b.firstOrNull("s")?.message)
+    }
+
+    @Test
+    fun aPreparingRowIsLiveAndCancellable() {
+        val b = board()
+        b.add(row("t_prep", "send", TransferState.Preparing))
+        assertTrue(b.isLive("t_prep"), "a Preparing row is active work")
+        assertEquals(listOf("t_prep"), b.running().map { it.id })
+
+        val ended = b.cancel("t_prep")
+        assertNotNull(ended, "Cancel must end a Preparing row")
+        assertEquals(TransferState.Cancelled, b.firstOrNull("t_prep")?.state)
+        assertTrue(b.running().isEmpty(), "a cancelled Preparing row is no longer active")
+    }
+
+    @Test
+    fun aFailedPrepareClearsThePreparingRow() {
+        val b = board()
+        b.add(row("t_prep", "send", TransferState.Preparing))
+
+        val ended = b.end("t_prep", TransferState.Failed, "Those files could not be opened.")
+
+        assertNotNull(ended, "a failed prepare must end the Preparing row")
+        assertEquals(TransferState.Failed, b.firstOrNull("t_prep")?.state)
+        assertFalse(b.isLive("t_prep"), "a failed prepare must leave no live row")
+        assertTrue(b.running().isEmpty(), "no stuck Preparing row after a prepare failure")
+    }
+
+    @Test
+    fun preparingRowBecomesTheRealTransferInPlace() {
+        val b = board()
+        b.add(row("t_prep", "send", TransferState.Preparing))
+
+        // Spooling finished: the same row (same id) is the queued transfer, so
+        // there is exactly one row - no leftover Preparing row.
+        b.update("t_prep") { it.copy(state = TransferState.Queued, label = "photo.jpg", total = 500) }
+
+        assertEquals(1, b.snapshot().size)
+        val row = b.firstOrNull("t_prep")
+        assertEquals(TransferState.Queued, row?.state)
+        assertEquals("photo.jpg", row?.label)
+        assertEquals(500L, row?.total)
+    }
+
+    @Test
+    fun clearFinishedKeepsPreparingRows() {
+        val b = board()
+        b.add(row("t_prep", "send", TransferState.Preparing))
+        b.add(row("t_done", "send", TransferState.Done))
+        b.clearFinished()
+        assertEquals(listOf("t_prep"), b.snapshot().map { it.id })
     }
 }

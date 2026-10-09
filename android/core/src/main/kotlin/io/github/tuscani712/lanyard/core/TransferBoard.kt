@@ -1,7 +1,18 @@
 package io.github.tuscani712.lanyard.core
 
-/** The state of one transfer row. */
-enum class TransferState { Queued, Running, Done, Failed, Cancelled }
+/**
+ * The state of one transfer row. [Preparing] is the short window before a send
+ * is queued, while its picked files are still being copied into the spool.
+ */
+enum class TransferState { Preparing, Queued, Running, Done, Failed, Cancelled }
+
+/**
+ * True while a row still represents active work the foreground service must
+ * protect and that Cancel may end: preparing (spooling), waiting, or running.
+ * A finished row (Done/Failed/Cancelled) is never live.
+ */
+val TransferState.isLive: Boolean
+    get() = this == TransferState.Preparing || this == TransferState.Running || this == TransferState.Queued
 
 /**
  * One row on the Transfers screen. Pure data: no Android types, so the row
@@ -74,13 +85,13 @@ class TransferBoard(
 
     fun firstOrNull(id: String): TransferRecord? = records.firstOrNull { it.id == id }
 
-    /** True while a row is still live (Running or Queued). */
+    /** True while a row is still live (Preparing, Running or Queued). */
     fun isLive(id: String): Boolean =
-        records.firstOrNull { it.id == id }?.let { it.state == TransferState.Running || it.state == TransferState.Queued } ?: false
+        records.firstOrNull { it.id == id }?.state?.isLive ?: false
 
     /** Rows that still count as active for the foreground service. */
     fun running(): List<TransferRecord> =
-        records.filter { it.state == TransferState.Running || it.state == TransferState.Queued }
+        records.filter { it.state.isLive }
 
     /**
      * Records progress and resets the no-progress deadline, so a slow but live
@@ -120,7 +131,7 @@ class TransferBoard(
      */
     fun cancel(id: String): TransferRecord? {
         val row = records.firstOrNull { it.id == id } ?: return null
-        if (row.state != TransferState.Running && row.state != TransferState.Queued) return null
+        if (!row.state.isLive) return null
         update(id) {
             it.copy(state = TransferState.Cancelled, message = "Cancelled", speed = 0.0, etaSeconds = null, finishingBytes = null)
         }
@@ -140,7 +151,7 @@ class TransferBoard(
         destinationUri: String? = null,
     ): TransferRecord? {
         val row = records.firstOrNull { it.id == id } ?: return null
-        if (row.state != TransferState.Running && row.state != TransferState.Queued) return null
+        if (!row.state.isLive) return null
         val finishedAt = clock()
         update(id) {
             it.copy(
@@ -172,7 +183,7 @@ class TransferBoard(
 
     /** Keeps only the live rows (the screen's "Clear finished"). */
     fun clearFinished() {
-        records = records.filter { it.state == TransferState.Running || it.state == TransferState.Queued }
+        records = records.filter { it.state.isLive }
     }
 
     fun dismiss(id: String) {
@@ -206,10 +217,10 @@ class TransferBoard(
      * for the automatic resume.
      */
     fun failInterrupted(message: String = ForegroundTransferPolicy.INTERRUPTED_MESSAGE): List<TransferRecord> {
-        val interrupted = records.filter { it.state == TransferState.Running || it.state == TransferState.Queued }
+        val interrupted = records.filter { it.state.isLive }
         if (interrupted.isEmpty()) return emptyList()
         records = records.map {
-            if (it.state == TransferState.Running || it.state == TransferState.Queued) {
+            if (it.state.isLive) {
                 it.copy(state = TransferState.Failed, message = message, speed = 0.0, etaSeconds = null, finishingBytes = null)
             } else {
                 it

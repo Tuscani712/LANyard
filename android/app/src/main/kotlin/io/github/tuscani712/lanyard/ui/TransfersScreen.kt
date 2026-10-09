@@ -19,6 +19,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Upload
 import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
@@ -46,6 +47,7 @@ import io.github.tuscani712.lanyard.core.TransferState
 import io.github.tuscani712.lanyard.core.formatBytes
 import io.github.tuscani712.lanyard.core.formatRateAndEta
 import io.github.tuscani712.lanyard.core.formatSpeed
+import io.github.tuscani712.lanyard.core.isLive
 import io.github.tuscani712.lanyard.transfer.OpenFolderIntents
 import io.github.tuscani712.lanyard.transfer.TransferManager
 
@@ -59,7 +61,7 @@ fun TransfersScreen(padding: PaddingValues) {
     // Back never cancels a transfer: while anything is running, Back leaves the
     // transfers alone (the foreground service keeps them going). Nothing here
     // calls TransferManager.cancel on a navigation event.
-    val active = records.any { it.state == TransferState.Running || it.state == TransferState.Queued }
+    val active = records.any { it.state.isLive }
     BackHandler(enabled = active) { /* keep transfers running; do not cancel */ }
 
     if (records.isEmpty() && receivedText.isEmpty()) {
@@ -73,7 +75,7 @@ fun TransfersScreen(padding: PaddingValues) {
         return
     }
 
-    val finished = records.count { it.state != TransferState.Running && it.state != TransferState.Queued }
+    val finished = records.count { !it.state.isLive }
 
     Column(modifier = Modifier.fillMaxSize().padding(padding)) {
         if (finished > 0) {
@@ -182,6 +184,20 @@ private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: 
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            if (record.state == TransferState.Preparing) {
+                // Spooling picked files: no byte counts yet, just a spinner so the
+                // window between the picker and the transfer row is never blank.
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Preparing…",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
             if (record.total > 0) {
                 Spacer(Modifier.height(8.dp))
                 LinearProgressIndicator(
@@ -230,7 +246,7 @@ private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: 
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            if (record.state == TransferState.Running || record.state == TransferState.Queued) {
+            if (record.state.isLive) {
                 Spacer(Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                     OutlinedButton(onClick = onCancel) { Text("Cancel") }
@@ -260,6 +276,7 @@ private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: 
 }
 
 private fun stateLabel(record: TransferRecord): String = when (record.state) {
+    TransferState.Preparing -> "Preparing…"
     TransferState.Queued -> "Waiting"
     TransferState.Running -> when {
         record.finishing -> "Finishing…"

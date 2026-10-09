@@ -190,9 +190,18 @@ private fun PeerActions(detail: PeerDetail, vm: DevicesViewModel) {
                 ensureNotifications()
                 picker.launch(arrayOf("*/*"))
             },
+            enabled = detail.preparing == 0,
             modifier = Modifier.fillMaxWidth(),
         ) {
-            Text("Send files")
+            Text(if (detail.preparing > 0) "Preparing ${detail.preparing} file(s)…" else "Send files")
+        }
+        if (detail.preparing > 0) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Wait for the current send to finish preparing, then pick again.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
         }
         Spacer(Modifier.height(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
