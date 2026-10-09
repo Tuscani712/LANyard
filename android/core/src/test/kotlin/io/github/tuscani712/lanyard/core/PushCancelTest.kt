@@ -32,7 +32,7 @@ class PushCancelTest {
         val senderCancels = CopyOnWriteArrayList<Pair<String, String>>()
         private val diagnostics = ServerDiagnostics()
 
-        private val receiver = InboxReceiver(
+        val receiver = InboxReceiver(
             spoolRoot = spool,
             destination = PushDestination { rel, _, _ -> rel.substringAfterLast('/') },
             freeBytes = { 1L shl 40 },
@@ -217,6 +217,160 @@ class PushCancelTest {
             val client = Identity.generate("Desktop")
             val pc = PeerClient("127.0.0.1", legacy.port, client, legacy.identity.deviceId)
             assertFalse(pc.pushCancel("p_whatever"), "a 404 from an older peer must be ignored, not thrown")
+        }
+    }
+
+    /**
+     * F1 (receiver cancel): once the phone's receiving person cancels the push,
+     * the next file `PUT` is answered HTTP 410 with the "cancelled by the
+     * receiver" body, so the sender ends Cancelled rather than Failed.
+     */
+    @Test
+    @Timeout(60)
+    fun receiverCancelAnswersTheNextFilePutWith410() {
+        Phone().use { phone ->
+            val client = Identity.generate("Desktop")
+            phone.pair(client.deviceId)
+            val id = offer(phone, client, rel = "a.bin", size = 0)
+            phone.receiver.cancelLocal(id)
+
+            val ex = assertThrows(PeerStatusException::class.java) {
+                clientFor(phone, client).pushFileWithSha(id, "a.bin", ByteArray(0), sha256Hex(ByteArray(0)))
+            }
+            assertEquals(410, ex.code, "a cancelled push must answer 410 Gone")
+            assertTrue(
+                ex.body.contains("cancelled by the receiver"),
+                "the 410 body must name the receiver cancel: ${ex.body}",
+            )
+        }
+    }
+
+    /**
+     * F1 (receiver cancel): the receiver's own contract for an in-flight body is
+     * a 410, not a generic error, so the server can map it to the wire 410.
+     */
+    @Test
+    @Timeout(60)
+    fun receiverCancelMidBodyIsA410NotAnError() {
+        Phone().use { phone ->
+            val client = Identity.generate("Desktop")
+            phone.pair(client.deviceId)
+            val id = offer(phone, client, rel = "a.bin", size = 1_000_000)
+            phone.receiver.cancelLocal(id)
+
+            val ex = assertThrows(PeerHttpException::class.java) {
+                phone.receiver.writeChunk(id, client.deviceId, "a.bin", 0, java.io.ByteArrayInputStream(ByteArray(10)))
+            }
+            assertEquals(410, ex.code)
+            assertTrue(ex.message!!.contains("cancelled by the receiver"), ex.message)
+        }
+    }
+
+    /**
+     * F1 (sender side): a phone pushing to a peer that answers 410 for the file
+     * body maps the response to [PushResult.CancelledByReceiver], never a generic
+     * failure.
+     */
+    @Test
+    @Timeout(60)
+    fun phoneSenderMapsAReceiver410ToCancelledByReceiver() {
+        GonePeer().use { peer ->
+            val client = Identity.generate("Phone")
+            val pc = PeerClient("127.0.0.1", peer.port, client, peer.identity.deviceId)
+            val result = PushSession(pc).push(
+                listOf(PushSource("a.bin", 4, 0) { java.io.ByteArrayInputStream(ByteArray(4)) }),
+            )
+            assertEquals(PushResult.CancelledByReceiver, result)
+        }
+    }
+
+    /**
+     * F1 (sender side, complete step): a peer that answers 410 Gone for the
+     * final `/complete` (after a good file body) must also map to
+     * CancelledByReceiver, not a generic failure.
+     */
+    @Test
+    @Timeout(60)
+    fun phoneSenderMapsACompleteStep410ToCancelledByReceiver() {
+        GonePeer(goneAtComplete = true).use { peer ->
+            val client = Identity.generate("Phone")
+            val pc = PeerClient("127.0.0.1", peer.port, client, peer.identity.deviceId)
+            val result = PushSession(pc).push(
+                listOf(PushSource("a.bin", 4, 0) { java.io.ByteArrayInputStream(ByteArray(4)) }),
+            )
+            assertEquals(PushResult.CancelledByReceiver, result)
+        }
+    }
+
+    /** A peer that accepts the offer but answers 410 Gone at [goneAtComplete]. */
+    private class GonePeer(private val goneAtComplete: Boolean = false) : AutoCloseable {
+        val identity: Identity = Identity.generate("Gone")
+        private val server: SSLServerSocket
+        val port: Int
+        private val thread: Thread
+
+        init {
+            val ctx = Tls.serverContext(identity)
+            server = ctx.serverSocketFactory.createServerSocket(0) as SSLServerSocket
+            server.needClientAuth = true
+            server.enabledProtocols = arrayOf("TLSv1.3")
+            port = server.localPort
+            thread = Thread {
+                while (!server.isClosed) {
+                    runCatching {
+                        val s = server.accept() as SSLSocket
+                        s.use { socket ->
+                            socket.startHandshake()
+                            val input = BufferedInputStream(socket.getInputStream())
+                            val out = BufferedOutputStream(socket.getOutputStream())
+                            val head = StringBuilder()
+                            var a = 0; var b = 0; var c = 0; var d = 0
+                            while (true) {
+                                val r = input.read()
+                                if (r < 0) return@use
+                                head.append(r.toChar())
+                                a = b; b = c; c = d; d = r
+                                if (a == 13 && b == 10 && c == 13 && d == 10) break
+                            }
+                            val requestLine = head.lineSequence().first()
+                            val path = requestLine.split(" ").getOrElse(1) { "" }
+                            val cl = Regex("(?i)content-length:\\s*(\\d+)")
+                                .find(head)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                            val body = ByteArray(cl)
+                            var off = 0
+                            while (off < cl) {
+                                val n = input.read(body, off, cl - off)
+                                if (n < 0) break
+                                off += n
+                            }
+                            val (code, resp) = when {
+                                path.endsWith("/offer") ->
+                                    200 to """{"push_id":"p_gone","accepted":true,"max_bytes":0,"files":[{"rel_path":"a.bin","offset":0}]}"""
+                                path.contains("/file") && !goneAtComplete ->
+                                    410 to """{"error":"cancelled by the receiver"}"""
+                                path.contains("/file") ->
+                                    200 to """{"written":4,"offset":4,"done":true}"""
+                                path.endsWith("/complete") && goneAtComplete ->
+                                    410 to """{"error":"cancelled by the receiver"}"""
+                                path.endsWith("/complete") -> 200 to """{"done":true}"""
+                                else -> 404 to """{"error":"not found"}"""
+                            }
+                            val bytes = resp.toByteArray()
+                            out.write(
+                                ("HTTP/1.1 $code Status\r\nContent-Type: application/json\r\n" +
+                                    "Content-Length: ${bytes.size}\r\nConnection: close\r\n\r\n").toByteArray(),
+                            )
+                            out.write(bytes)
+                            out.flush()
+                        }
+                    }
+                }
+            }.apply { isDaemon = true; start() }
+        }
+
+        override fun close() {
+            runCatching { server.close() }
+            thread.interrupt()
         }
     }
 

@@ -7,9 +7,11 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class ShareModelTest {
+    // shareTargets gates the *sender* picker on "they allow me to push", i.e.
+    // allowPush, not the local grant. Keep the two in step for these tests.
     private fun peer(fp: String, push: Boolean = true) = PairedPeer(
         fingerprint = fp, name = "peer", host = "10.0.0.2", port = 47800,
-        browse = true, push = push, pairedAt = 0L,
+        browse = true, push = push, pairedAt = 0L, allowPush = push, allowBrowse = true,
     )
 
     @Test

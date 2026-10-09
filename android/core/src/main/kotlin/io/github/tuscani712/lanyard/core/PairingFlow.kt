@@ -113,8 +113,9 @@ object PairingFlow {
                 name = selfName,
                 deviceId = identity.deviceId,
                 nonce = randomNonce(),
-                requested = requested,
+                requested = requested.withModes(outcome.triState),
                 invite = payload.nonce,
+                tristate = outcome.triState,
             )
         } catch (_: PeerStatusException) {
             diag("[pairing] peer=$short session refused")
@@ -195,9 +196,10 @@ object PairingFlow {
                 name = selfName,
                 deviceId = identity.deviceId,
                 nonce = selfNonce,
-                requested = Permissions(browse = true, push = true),
+                requested = Permissions(browse = true, push = true).withModes(hello.supportsTriState),
                 // No invite: this is the SAS path, confirmed by the person.
                 invite = "",
+                tristate = hello.supportsTriState,
             )
         } catch (_: PeerStatusException) {
             diag("[pairing] peer=$short nearby session refused")
@@ -313,15 +315,21 @@ object PairingFlow {
         } catch (_: Exception) {
             payload.name
         }
-        val (browse, push) = grantedFrom(status)
+        val allow = grantedFrom(status)
         val peer = PairedPeer(
             fingerprint = payload.fingerprint.lowercase(),
             name = name.ifEmpty { payload.name },
             host = match.host,
             port = match.port,
-            browse = browse,
-            push = push,
+            // Our own grant to the peer was never chosen here (the responder
+            // only granted us), so it starts at the new Ask default.
+            browse = Permission.ASK,
+            push = Permission.ASK,
+            text = Permission.ASK,
             pairedAt = System.currentTimeMillis(),
+            allowBrowse = allow.browse,
+            allowPush = allow.push,
+            allowText = allow.text,
         )
         store.save(peer)
         diag("[pairing] peer=${Display.shortFp(peer.fingerprint)} confirmed id=$sessionId stored=true")
@@ -354,7 +362,7 @@ object PairingFlow {
             runCatching { client.closeSession(sessionId) }
             return PairResult.Unreachable
         }
-        val (browse, push) = grantedFrom(status)
+        val allow = grantedFrom(status)
         val peer = PairedPeer(
             // The full certificate fingerprint from the probe, normalized — the
             // only fingerprint we ever trust for a device found over mDNS.
@@ -362,25 +370,61 @@ object PairingFlow {
             name = peerName,
             host = host,
             port = port,
-            browse = browse,
-            push = push,
+            browse = Permission.ASK,
+            push = Permission.ASK,
+            text = Permission.ASK,
             pairedAt = System.currentTimeMillis(),
+            allowBrowse = allow.browse,
+            allowPush = allow.push,
+            allowText = allow.text,
         )
         store.save(peer)
         diag("[pairing] peer=$short confirmed id=$sessionId stored=true")
         return PairResult.Paired(peer)
     }
 
-    /** The responder's granted permissions from an accepted status poll. */
-    private fun grantedFrom(status: JsonObject): Pair<Boolean, Boolean> {
+    /** What the responder allows this device to do, from an accepted status poll. */
+    private data class RemoteGrant(val browse: Boolean, val push: Boolean, val text: Boolean)
+
+    /**
+     * The responder's grant to us from an accepted status poll. A responder that
+     * negotiated tri-state sends `*_mode`; anything it allows (Allow or Ask) is
+     * an allowance from our side. A peer that did not sends only booleans, where
+     * `true` is an allowance and `false` is a denial.
+     */
+    private fun grantedFrom(status: JsonObject): RemoteGrant {
         val granted = status.get("granted")?.takeIf { !it.isJsonNull }?.asJsonObject
-        return (granted?.get("browse")?.takeIf { !it.isJsonNull }?.asBoolean ?: true) to
-            (granted?.get("push")?.takeIf { !it.isJsonNull }?.asBoolean ?: false)
+        fun mode(key: String): Permission? =
+            Permission.fromString(granted?.get(key)?.takeIf { !it.isJsonNull }?.asString)
+        fun bool(key: String, default: Boolean): Boolean =
+            granted?.get(key)?.takeIf { !it.isJsonNull }?.asBoolean ?: default
+        fun allowed(key: String, boolKey: String, default: Boolean): Boolean {
+            val m = mode(key)
+            return if (m != null) m.permits else bool(boolKey, default)
+        }
+        return RemoteGrant(
+            browse = allowed("browse_mode", "browse", true),
+            push = allowed("push_mode", "push", false),
+            // Text had no wire field before G1; fall back to the push allowance.
+            text = allowed("text_mode", "text", bool("push", false)),
+        )
     }
 
     private data class HostPort(val host: String, val port: Int)
 
-    private data class ProbeOutcome(val match: HostPort?, val mismatch: Boolean)
+    private data class ProbeOutcome(val match: HostPort?, val mismatch: Boolean, val triState: Boolean = false)
+
+    /**
+     * Adds the tri-state mode fields to [this] request when [tristate]. The
+     * booleans stay present as the fallback; only a peer that advertised the
+     * capability gets the extra keys.
+     */
+    private fun Permissions.withModes(tristate: Boolean): Permissions =
+        if (!tristate) this else copy(
+            browseMode = Permission.ALLOW,
+            pushMode = Permission.ALLOW,
+            textMode = Permission.ALLOW,
+        )
 
     private fun probeAddresses(
         addrs: List<String>,
@@ -403,11 +447,11 @@ object PairingFlow {
             val attemptStart = clock()
             try {
                 val probe = ProbeClient(hp.host, hp.port, identity, perAttemptMs, perAttemptMs)
-                probe.hello()
+                val hello = probe.hello()
                 val elapsed = clock() - attemptStart
                 if (probe.observedFingerprint().equals(expected, ignoreCase = true)) {
                     diag("[pairing] peer=$short probe ok addr=${hp.host}:${hp.port} elapsed=${elapsed}ms")
-                    return ProbeOutcome(hp, mismatch)
+                    return ProbeOutcome(hp, mismatch, triState = hello.supportsTriState)
                 }
                 diag("[pairing] peer=$short probe mismatch addr=${hp.host}:${hp.port} elapsed=${elapsed}ms")
                 mismatch = true

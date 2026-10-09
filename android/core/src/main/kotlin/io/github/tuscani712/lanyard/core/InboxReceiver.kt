@@ -33,6 +33,16 @@ fun interface PushDestination {
 /** The reason a row shows when the sender cancels an outgoing push. */
 const val SENDER_CANCELLED_REASON = "Cancelled by the sender"
 
+/**
+ * The reason a sender's row ends when the receiver cancels the push. The wire
+ * body for this case is the lowercase [RECEIVER_CANCELLED_BODY] carried by the
+ * HTTP 410 the receiver answers an in-flight file `PUT` with.
+ */
+const val RECEIVER_CANCELLED_REASON = "Cancelled by the receiver"
+
+/** The exact lowercase body the receiver answers a cancelled `PUT` with. */
+const val RECEIVER_CANCELLED_BODY = "cancelled by the receiver"
+
 /** One file in an accepted push. */
 data class PushFileState(
     val relPath: String,
@@ -351,7 +361,7 @@ class InboxReceiver(
 
     @Synchronized
     private fun session(id: String, peerFp: String): Session {
-        if (cancelled.contains(id)) throw PeerHttpException(410, "cancelled by the receiver")
+        if (cancelled.contains(id)) throw PeerHttpException(410, RECEIVER_CANCELLED_BODY)
         val s = sessions[id] ?: throw PeerHttpException(404, "no such push")
         if (!s.peerFp.equals(peerFp, ignoreCase = true)) throw PeerHttpException(403, "not your push")
         return s
@@ -457,9 +467,16 @@ class InboxReceiver(
         return st
     }
 
-    /** Finishes a push (the job-level "all done"). */
+    /**
+     * Finishes a push (the job-level "all done"). A push the receiver cancelled
+     * answers 410 Gone with [RECEIVER_CANCELLED_BODY] — the same signal the
+     * in-flight file `PUT` gives — so a sender whose final `complete` step lands
+     * after the cancel ends its row as Cancelled "Cancelled by the receiver"
+     * (F1), not a silent success.
+     */
     @Synchronized
     fun finish(id: String, peerFp: String): Boolean {
+        if (cancelled.contains(id)) throw PeerHttpException(410, RECEIVER_CANCELLED_BODY)
         val s = sessions[id] ?: return false
         if (!s.peerFp.equals(peerFp, ignoreCase = true)) return false
         sessions.remove(id)

@@ -5,6 +5,7 @@ import android.net.Uri
 import androidx.documentfile.provider.DocumentFile
 import io.github.tuscani712.lanyard.IdentityHolder
 import io.github.tuscani712.lanyard.core.Display
+import io.github.tuscani712.lanyard.core.DeviceNames
 import io.github.tuscani712.lanyard.core.DownloadResult
 import io.github.tuscani712.lanyard.core.DownloadSession
 import io.github.tuscani712.lanyard.core.DownloadTarget
@@ -23,6 +24,7 @@ import io.github.tuscani712.lanyard.core.PushPrepareGate
 import io.github.tuscani712.lanyard.core.PushResult
 import io.github.tuscani712.lanyard.core.PushSession
 import io.github.tuscani712.lanyard.core.PushSource
+import io.github.tuscani712.lanyard.core.RECEIVER_CANCELLED_REASON
 import io.github.tuscani712.lanyard.core.RateEtaDisplay
 import io.github.tuscani712.lanyard.core.RateThrottle
 import io.github.tuscani712.lanyard.core.ShareValidation
@@ -432,12 +434,12 @@ object TransferManager {
                 }
                 add(
                     TransferRecord(
-                        id, "send", peer.name, peer.fingerprint,
+                        id, "send", DeviceNames.display(peer), peer.fingerprint,
                         "${uris.size} file(s)", 0, 0, TransferState.Preparing, null, 0.0, now(),
                         fileCount = uris.size,
                     ),
                 )
-                logPrepare("[push] preparing peer=${Display.shortFp(peer.fingerprint)} files=${uris.size} id=$id")
+                logPrepare("[push] preparing peer=${DeviceNames.logLabel(peer)} files=${uris.size} id=$id")
                 TransferService.start(app)
                 PrepareResult.Started(id)
             }
@@ -474,9 +476,9 @@ object TransferManager {
         diagnostic?.invoke(event)
     }
 
-    /** One redacted outgoing-push step line, tagged with the peer's short id. */
+    /** One redacted outgoing-push step line, tagged with the peer's display name and short id. */
     private fun logPush(peer: PairedPeer, line: String) {
-        logPrepare("$line peer=${Display.shortFp(peer.fingerprint)}")
+        logPrepare("$line peer=${DeviceNames.logLabel(peer)}")
     }
 
     /**
@@ -518,7 +520,7 @@ object TransferManager {
                     persist()
                 }
             } else {
-                add(TransferRecord(id, "send", peer.name, peer.fingerprint, label, sources.sumOf { it.size }, 0, TransferState.Failed, blocked, 0.0, now()))
+                add(TransferRecord(id, "send", DeviceNames.display(peer), peer.fingerprint, label, sources.sumOf { it.size }, 0, TransferState.Failed, blocked, 0.0, now()))
             }
             onFinished?.invoke()
             return id
@@ -547,7 +549,7 @@ object TransferManager {
         } else {
             add(
                 TransferRecord(
-                    id, "send", peer.name, peer.fingerprint, label, total, 0, TransferState.Queued, null, 0.0, now(),
+                    id, "send", DeviceNames.display(peer), peer.fingerprint, label, total, 0, TransferState.Queued, null, 0.0, now(),
                     fileCount = sources.size,
                 ),
             )
@@ -562,11 +564,11 @@ object TransferManager {
         val id = newId()
         val blocked = refusal()
         if (blocked != null) {
-            add(TransferRecord(id, "receive", peer.name, peer.fingerprint, label, 0, 0, TransferState.Failed, blocked, 0.0, now()))
+            add(TransferRecord(id, "receive", DeviceNames.display(peer), peer.fingerprint, label, 0, 0, TransferState.Failed, blocked, 0.0, now()))
             return id
         }
         resumables[id] = Resumable(peer, "download", shareId = shareId, path = path, tree = tree)
-        add(TransferRecord(id, "receive", peer.name, peer.fingerprint, label, 0, 0, TransferState.Queued, null, 0.0, now()))
+        add(TransferRecord(id, "receive", DeviceNames.display(peer), peer.fingerprint, label, 0, 0, TransferState.Queued, null, 0.0, now()))
         TransferService.start(app)
         val throttle = throttle()
         scope.launch { runDownload(id, peer, shareId, path, tree, throttle) }
@@ -582,10 +584,10 @@ object TransferManager {
         val size = text.toByteArray(Charsets.UTF_8).size.toLong()
         val blocked = refusal()
         if (blocked != null) {
-            add(TransferRecord(id, "send", peer.name, peer.fingerprint, "Text", size, 0, TransferState.Failed, blocked, 0.0, now()))
+            add(TransferRecord(id, "send", DeviceNames.display(peer), peer.fingerprint, "Text", size, 0, TransferState.Failed, blocked, 0.0, now()))
             return id
         }
-        add(TransferRecord(id, "send", peer.name, peer.fingerprint, "Text", size, 0, TransferState.Queued, null, 0.0, now()))
+        add(TransferRecord(id, "send", DeviceNames.display(peer), peer.fingerprint, "Text", size, 0, TransferState.Queued, null, 0.0, now()))
         scope.launch { runSnippet(id, peer, text) }
         return id
     }
@@ -909,7 +911,7 @@ object TransferManager {
         when (result) {
             is PushResult.Sent -> end(id, TransferState.Done, "Sent ${result.files} file(s)")
             PushResult.Cancelled -> end(id, TransferState.Cancelled, "Cancelled")
-            PushResult.CancelledByReceiver -> end(id, TransferState.Failed, "The other device cancelled")
+            PushResult.CancelledByReceiver -> end(id, TransferState.Cancelled, RECEIVER_CANCELLED_REASON)
             PushResult.Refused -> end(id, TransferState.Failed, "The other device is not accepting files")
             is PushResult.Failed -> if (isTransportFailure(result.message)) {
                 markInterrupted(id, "send-transport:${result.message.take(60)}")

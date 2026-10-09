@@ -71,7 +71,7 @@ object ShareValidation {
         val online = onlineFingerprints.mapTo(HashSet()) { it.lowercase() }
         return peers.map { peer ->
             when {
-                !peer.push -> ShareTarget(peer, enabled = false, reason = "Has not allowed files from you")
+                !peer.allowPush -> ShareTarget(peer, enabled = false, reason = "Has not allowed files from you")
                 peer.fingerprint.lowercase() !in online -> ShareTarget(peer, enabled = false, reason = "Offline")
                 else -> ShareTarget(peer, enabled = true)
             }

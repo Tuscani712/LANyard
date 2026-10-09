@@ -34,12 +34,14 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import io.github.tuscani712.lanyard.BrowseApprovalRequest
 import io.github.tuscani712.lanyard.DevicesViewModel
 import io.github.tuscani712.lanyard.PeerService
 import io.github.tuscani712.lanyard.PushApprovalRequest
 import io.github.tuscani712.lanyard.core.Display
 import io.github.tuscani712.lanyard.core.IncomingRequest
 import io.github.tuscani712.lanyard.core.PairingSessions
+import io.github.tuscani712.lanyard.core.Permission
 import io.github.tuscani712.lanyard.core.Permissions
 
 private data class Tab(val label: String, val icon: ImageVector)
@@ -56,6 +58,7 @@ fun LanyardApp(viewModel: DevicesViewModel = viewModel()) {
     var selected by rememberSaveable { mutableIntStateOf(0) }
     val pending by PeerService.pending.collectAsStateWithLifecycle()
     val approval by PeerService.approval.collectAsStateWithLifecycle()
+    val browseApproval by PeerService.browseApproval.collectAsStateWithLifecycle()
     val interrupted by PeerService.interrupted.collectAsStateWithLifecycle()
     val showingPairing = pending.isNotEmpty()
 
@@ -77,7 +80,16 @@ fun LanyardApp(viewModel: DevicesViewModel = viewModel()) {
             )
         }
     }
-    if (!showingPairing && approval == null && interrupted) {
+    if (!showingPairing && approval == null) {
+        browseApproval?.let { req ->
+            BrowseApprovalDialog(
+                request = req,
+                onAccept = { PeerService.answerBrowseApproval(true) },
+                onDecline = { PeerService.answerBrowseApproval(false) },
+            )
+        }
+    }
+    if (!showingPairing && approval == null && browseApproval == null && interrupted) {
         AlertDialog(
             onDismissRequest = { PeerService.dismissInterrupted() },
             title = { Text("Transfer interrupted") },
@@ -134,6 +146,30 @@ private fun PushApprovalDialog(request: PushApprovalRequest, onAccept: () -> Uni
     )
 }
 
+/** The allow/deny prompt for a peer that wants to browse this phone's shares. */
+@Composable
+private fun BrowseApprovalDialog(request: BrowseApprovalRequest, onAccept: () -> Unit, onDecline: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = {},
+        title = { Text("Browse your shares?") },
+        text = {
+            Column {
+                Text(
+                    "${request.peerName.ifEmpty { "A paired device" }} wants to browse the shares on this phone.",
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Unanswered, this is denied.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        },
+        confirmButton = { TextButton(onClick = onAccept) { Text("Allow") } },
+        dismissButton = { TextButton(onClick = onDecline) { Text("Deny") } },
+    )
+}
+
 /** The accept/decline prompt for an incoming Connect/Pair request, on any screen. */
 @Composable
 private fun IncomingPairDialog(
@@ -142,8 +178,9 @@ private fun IncomingPairDialog(
     onDecline: () -> Unit,
 ) {
     val pairing = request.mode == PairingSessions.MODE_PAIR
-    // Browse follows the request; push is off unless the person turns it on.
-    var browse by remember(request.id) { mutableStateOf(request.requested.browse) }
+    // G1: a checked box is "Allow"; an unchecked box is the new "Ask" default.
+    // Never is only reachable from the device page or Settings.
+    var browse by remember(request.id) { mutableStateOf(false) }
     var push by remember(request.id) { mutableStateOf(false) }
     val anyPermission = request.requested.browse || request.requested.push
     AlertDialog(
@@ -170,13 +207,31 @@ private fun IncomingPairDialog(
                 if (anyPermission) {
                     Spacer(Modifier.height(12.dp))
                     Text("Allow this device to:", style = MaterialTheme.typography.bodyMedium)
-                    PermissionToggle("Browse shared files", browse && request.requested.browse, request.requested.browse) { browse = it }
-                    PermissionToggle("Send files to this device", push && request.requested.push, request.requested.push) { push = it }
+                    PermissionToggle("Browse shared files", browse, request.requested.browse) { browse = it }
+                    PermissionToggle("Send files to this device", push, request.requested.push) { push = it }
+                    Text(
+                        "Unchecked means you will be asked each time.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
         },
         confirmButton = {
-            TextButton(onClick = { onAccept(Permissions(browse = browse, push = push)) }) { Text("Accept") }
+            TextButton(
+                onClick = {
+                    onAccept(
+                        Permissions(
+                            browse = browse,
+                            push = push,
+                            text = push,
+                            browseMode = if (browse) Permission.ALLOW else Permission.ASK,
+                            pushMode = if (push) Permission.ALLOW else Permission.ASK,
+                            textMode = if (push) Permission.ALLOW else Permission.ASK,
+                        ),
+                    )
+                },
+            ) { Text("Accept") }
         },
         dismissButton = { TextButton(onClick = onDecline) { Text("Decline") } },
     )

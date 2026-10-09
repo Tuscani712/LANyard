@@ -52,6 +52,7 @@ class ProbeClient(
             port = json.int("port"),
             maxOfferBytes = json.long("max_offer_bytes"),
             maxOfferFiles = json.int("max_offer_files"),
+            caps = json.getAsJsonArray("caps")?.mapNotNull { e -> e.takeIf { it.isJsonPrimitive }?.asString } ?: emptyList(),
         )
     }
 

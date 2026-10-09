@@ -818,8 +818,9 @@ class TwoPhonePairingTest {
                 assertEquals(bSas.get(), prompt.get().sas, "both phones must show the same SAS")
                 assertNotNull(a.trust.find(b.identity.deviceId), "A must save B")
                 assertNotNull(b.trust.find(a.identity.deviceId), "B must save A")
-                assertFalse(a.trust.find(b.identity.deviceId)!!.push, "the responder's default is push off")
-                assertFalse(b.trust.find(a.identity.deviceId)!!.push, "the responder's default is push off")
+                // An unchecked push is the new Ask default, not off.
+                assertEquals(Permission.ASK, a.trust.find(b.identity.deviceId)!!.push)
+                assertEquals(Permission.ASK, b.trust.find(a.identity.deviceId)!!.push)
             }
         }
     }

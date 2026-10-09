@@ -11,12 +11,15 @@ import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PairingFlow
 import io.github.tuscani712.lanyard.core.PeerAddresses
 import io.github.tuscani712.lanyard.core.DiagLevel
+import io.github.tuscani712.lanyard.core.DeviceNames
 import io.github.tuscani712.lanyard.core.DiscoveredAddr
 import io.github.tuscani712.lanyard.core.PeerClient
 import io.github.tuscani712.lanyard.core.PeerErrors
 import io.github.tuscani712.lanyard.core.PeerProbeMonitor
 import io.github.tuscani712.lanyard.core.PeerProbeSet
 import io.github.tuscani712.lanyard.core.PeerStatusException
+import io.github.tuscani712.lanyard.core.Permission
+import io.github.tuscani712.lanyard.core.PermissionAction
 import io.github.tuscani712.lanyard.core.ProbeClient
 import io.github.tuscani712.lanyard.core.SelfFilter
 import io.github.tuscani712.lanyard.core.TransferState
@@ -26,6 +29,7 @@ import io.github.tuscani712.lanyard.net.NearbyDevice
 import io.github.tuscani712.lanyard.net.NsdDiscovery
 import io.github.tuscani712.lanyard.share.SourceResult
 import io.github.tuscani712.lanyard.share.spoolShare
+import io.github.tuscani712.lanyard.share.spoolTree
 import io.github.tuscani712.lanyard.transfer.PrepareResult
 import io.github.tuscani712.lanyard.transfer.TransferManager
 import kotlinx.coroutines.CompletableDeferred
@@ -61,6 +65,9 @@ data class PairedStatus(
     // peer, or null when none. Lets the row say "Preparing N file(s)…" during the
     // window between the picker and the transfer row.
     val preparingFiles: Int? = null,
+    // When this peer was last known reachable, or 0 if never, for the status
+    // block's "last seen" phrase.
+    val lastSeenMillis: Long = 0L,
 )
 
 /** The pairing attempt's state, for the Add-device dialog. */
@@ -101,6 +108,13 @@ data class PeerDetail(
     val notice: String? = null,
     // How many files are being prepared for a push to this peer right now.
     val preparing: Int = 0,
+    // Reachability and when the peer was last seen, for the device page's
+    // connection/status block.
+    val online: Boolean = false,
+    val lastSeenMillis: Long = 0L,
+    // Why the last reachability probe failed, for the header's Online/Offline
+    // line. Null while online or before the first probe finished.
+    val offlineReason: String? = null,
 )
 
 data class DevicesUiState(
@@ -133,6 +147,17 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     private data class ProbeResult(val at: Long, val online: Boolean, val reason: String?)
 
     private val onlineCache = HashMap<String, ProbeResult>()
+
+    // When a peer was last known reachable, keyed by lowercase fingerprint. Kept
+    // for the device page's "last seen" phrase; 0/absent means never seen.
+    private val lastSeen = HashMap<String, Long>()
+
+    private fun noteSeen(fingerprint: String) {
+        synchronized(lastSeen) { lastSeen[fingerprint.lowercase()] = System.currentTimeMillis() }
+    }
+
+    private fun lastSeenFor(fingerprint: String): Long =
+        synchronized(lastSeen) { lastSeen[fingerprint.lowercase()] ?: 0L }
 
     // Schedules probes for the current paired set. A peer that becomes known
     // (including a desktop that paired *to* the phone) is probed at once, and a
@@ -240,6 +265,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                         online,
                         if (online) null else offlineReasonFor(peer.fingerprint),
                         preparing[peer.fingerprint.lowercase()],
+                        lastSeenFor(peer.fingerprint),
                     )
                 }
             }
@@ -470,14 +496,82 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val identity = IdentityHolder.identity ?: return@launch
             val detail = withContext(Dispatchers.IO) {
+                val online = isOnline(peer)
                 try {
                     val client = PeerClient(peer.host, peer.port, identity, peer.fingerprint)
-                    PeerDetail(peer = peer, loading = false, shares = client.listShares().map { it.toShareItem() })
+                    PeerDetail(
+                        peer = peer,
+                        loading = false,
+                        shares = client.listShares().map { it.toShareItem() },
+                        online = online,
+                        lastSeenMillis = lastSeenFor(peer.fingerprint),
+                        offlineReason = if (online) null else offlineReasonFor(peer.fingerprint),
+                    )
                 } catch (e: Exception) {
-                    PeerDetail(peer = peer, loading = false, error = friendly(e))
+                    PeerDetail(
+                        peer = peer,
+                        loading = false,
+                        error = friendly(e),
+                        online = online,
+                        lastSeenMillis = lastSeenFor(peer.fingerprint),
+                        offlineReason = if (online) null else offlineReasonFor(peer.fingerprint),
+                    )
                 }
             }
             _state.update { it.copy(detail = detail) }
+        }
+    }
+
+    /**
+     * Sets (or clears) the local alias for [peer] and persists it. The alias is
+     * stored only locally and never sent on the wire; an empty [alias] clears it
+     * and reverts the display to the broadcast name.
+     */
+    fun rename(peer: PairedPeer, alias: String) {
+        val normalized = DeviceNames.normalizeAlias(alias)
+        val updated = peer.copy(alias = normalized)
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { store.save(updated) }
+            PeerService.diagnostics.record(
+                "[pairing] peer=${DeviceNames.logLabel(updated)} rename alias=${if (normalized.isBlank()) "cleared" else "set"}",
+            )
+            _state.update { current ->
+                current.copy(
+                    detail = current.detail?.let { d ->
+                        if (d.peer.fingerprint.equals(peer.fingerprint, ignoreCase = true)) d.copy(peer = updated) else d
+                    },
+                )
+            }
+            refreshPaired()
+        }
+    }
+
+    /**
+     * Edits one tri-state permission in the device page's "They can" block (G1).
+     * The value is the same store the Settings trust editor writes, so a change
+     * here is what the receiving server enforces on the next request.
+     */
+    fun setPermission(peer: PairedPeer, action: PermissionAction, value: Permission) {
+        val updated = when (action) {
+            PermissionAction.BROWSE -> peer.copy(browse = value)
+            PermissionAction.PUSH -> peer.copy(push = value)
+            PermissionAction.TEXT -> peer.copy(text = value)
+        }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { store.save(updated) }
+            PeerService.diagnostics.record(
+                "[pairing] peer=${DeviceNames.logLabel(updated)} perm ${action.name.lowercase()}=${value.wire}",
+            )
+            _state.update { current ->
+                current.copy(
+                    paired = current.paired.map {
+                        if (it.peer.fingerprint.equals(peer.fingerprint, ignoreCase = true)) it.copy(peer = updated) else it
+                    },
+                    detail = current.detail?.let { d ->
+                        if (d.peer.fingerprint.equals(peer.fingerprint, ignoreCase = true)) d.copy(peer = updated) else d
+                    },
+                )
+            }
         }
     }
 
@@ -550,19 +644,52 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun sendFiles(peer: PairedPeer, uris: List<Uri>) {
         if (uris.isEmpty()) return
+        val app = getApplication<Application>()
+        // The same code path as a folder send: spool first, then push. The device
+        // page and the share sheet both funnel through [startSend].
+        startSend(peer, uris.map { it.toString() }, "files") {
+            withContext(Dispatchers.IO) {
+                val used = HashSet<String>()
+                uris.map { spoolShare(app, it, used) }
+            }
+        }
+    }
+
+    /**
+     * Sends a folder chosen with `OpenDocumentTree`: every file under the tree is
+     * spooled, preserving its relative path, and pushed through the exact same
+     * [startSend] path a file selection uses.
+     */
+    fun sendFolder(peer: PairedPeer, tree: Uri) {
+        val app = getApplication<Application>()
+        startSend(peer, listOf(tree.toString()), "folder") {
+            withContext(Dispatchers.IO) { spoolTree(app, tree) }
+        }
+    }
+
+    /**
+     * The one send path: opens the cancellable Preparing row, runs [spool] on IO,
+     * then hands the resulting sources to [TransferManager.enqueuePush]. [noun]
+     * is only used in the notices ("Those files…").
+     */
+    private fun startSend(
+        peer: PairedPeer,
+        gateUris: List<String>,
+        noun: String,
+        spool: suspend () -> List<SourceResult>,
+    ) {
         val blocked = TransferManager.refusal()
         if (blocked != null) {
             setNotice(blocked)
             return
         }
-        val app = getApplication<Application>()
         val spooled = java.util.Collections.synchronizedList(mutableListOf<java.io.File>())
         // Set by the Cancel on the Preparing row: the spool coroutine stops and
         // every already-copied file is deleted.
         val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
         var spoolJob: Job? = null
 
-        val outcome = TransferManager.beginPrepare(peer, uris.map { it.toString() }) {
+        val outcome = TransferManager.beginPrepare(peer, gateUris) {
             cancelled.set(true)
             spoolJob?.cancel()
             synchronized(spooled) { spooled.forEach { it.delete() } }
@@ -585,22 +712,18 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
             // transfer: from then on the transfer owns the spools.
             var handedOff = false
             try {
-                val results = withContext(Dispatchers.IO) {
-                    val used = HashSet<String>()
-                    uris.map { uri ->
-                        val result = spoolShare(app, uri, used)
-                        (result as? SourceResult.Ok)?.spool?.let { spooled.add(it) }
-                        result
-                    }
-                }
+                val results = spool()
                 // The row may have been cancelled mid-copy (the spool copy itself
                 // is not interruptible): the finally below finishes the cleanup.
                 if (cancelled.get()) return@launch
+                synchronized(spooled) {
+                    results.forEach { (it as? SourceResult.Ok)?.spool?.let { f -> spooled.add(f) } }
+                }
                 val sources = results.mapNotNull { (it as? SourceResult.Ok)?.source }
                 val spools = results.mapNotNull { (it as? SourceResult.Ok)?.spool }
                 if (sources.isEmpty()) {
-                    TransferManager.failPrepare(prepareId, "Those files could not be opened.")
-                    setNotice("Those files could not be opened.")
+                    TransferManager.failPrepare(prepareId, "Those $noun could not be opened.")
+                    setNotice("Those $noun could not be opened.")
                     return@launch
                 }
                 val label = sources.first().relPath + if (sources.size > 1) " +${sources.size - 1}" else ""
@@ -613,7 +736,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 )
                 handedOff = true
                 PeerService.diagnostics.record(
-                    "[push] prepared peer=${peer.fingerprint.take(8)} files=${sources.size} id=$id",
+                    "[push] prepared peer=${DeviceNames.logLabel(peer)} files=${sources.size} id=$id",
                 )
                 setNotice("Sending ${sources.size} file(s). See Transfers.")
             } catch (e: kotlinx.coroutines.CancellationException) {
@@ -623,8 +746,8 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 // never leave a stuck Preparing row: fail it, which clears the
                 // row, releases the gate and stops the service.
                 if (!handedOff && !cancelled.get()) {
-                    TransferManager.failPrepare(prepareId, "Those files could not be opened.")
-                    setNotice("Those files could not be opened.")
+                    TransferManager.failPrepare(prepareId, "Those $noun could not be opened.")
+                    setNotice("Those $noun could not be opened.")
                 }
             } finally {
                 // Cancelled or never handed off: delete every spool, including one
@@ -654,6 +777,9 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
             .any { it.uri == uri && it.isReadPermission && it.isWritePermission }
         return if (held) uri else null
     }
+
+    /** Shows a transient notice on the open device page. */
+    fun showNotice(text: String) = setNotice(text)
 
     private fun setNotice(text: String) = _state.update { current ->
         val detail = current.detail ?: return@update current
@@ -718,6 +844,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         val fp = _state.value.paired.map { it.peer }.firstOrNull {
             SelfFilter.ownShortId(it.fingerprint).equals(shortId, ignoreCase = true)
         }?.fingerprint ?: return
+        noteSeen(fp)
         synchronized(onlineCache) { onlineCache[fp] = ProbeResult(System.currentTimeMillis(), true, null) }
         _state.update { current ->
             current.copy(paired = current.paired.map {
@@ -747,6 +874,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
             probe.hello()
             val match = probe.observedFingerprint().equals(peer.fingerprint, ignoreCase = true)
             if (match) {
+                noteSeen(peer.fingerprint)
                 // A successful outbound hello means the peer is reachable right
                 // now: let a pending unpair be delivered without waiting.
                 PeerService.onPeerReachable(peer.fingerprint.take(16), peer.host, peer.port)

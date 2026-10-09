@@ -31,6 +31,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
+import io.github.tuscani712.lanyard.core.DeviceNames
 import io.github.tuscani712.lanyard.core.ShareTarget
 import io.github.tuscani712.lanyard.ui.shortFingerprint
 
@@ -126,7 +127,7 @@ private fun TargetRow(target: ShareTarget, onSend: (ShareTarget) -> Unit) {
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    peer.name.ifEmpty { "Unnamed device" },
+                    DeviceNames.display(peer),
                     style = MaterialTheme.typography.titleSmall,
                     color = if (target.enabled) MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurfaceVariant,
                 )

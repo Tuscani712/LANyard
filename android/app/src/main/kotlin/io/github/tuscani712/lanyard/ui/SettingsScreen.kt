@@ -68,9 +68,14 @@ import io.github.tuscani712.lanyard.PeerService
 import io.github.tuscani712.lanyard.SettingsHolder
 import io.github.tuscani712.lanyard.core.AppSettings
 import io.github.tuscani712.lanyard.core.Bandwidth
+import io.github.tuscani712.lanyard.core.DevicePage
 import io.github.tuscani712.lanyard.core.Diagnostics
 import io.github.tuscani712.lanyard.core.InboxPaths
 import io.github.tuscani712.lanyard.core.PairedPeer
+import io.github.tuscani712.lanyard.core.PeerPort
+import io.github.tuscani712.lanyard.core.PeerPortStatus
+import io.github.tuscani712.lanyard.core.Permission
+import io.github.tuscani712.lanyard.core.PermissionAction
 import io.github.tuscani712.lanyard.core.SettingsCategory
 import io.github.tuscani712.lanyard.core.SpeedUnit
 import io.github.tuscani712.lanyard.core.ThemeMode
@@ -185,6 +190,7 @@ fun SettingsScreen(padding: PaddingValues, vm: DevicesViewModel) {
             SettingsCategory.PAIRING_SECURITY -> PairingSecurityTab(
                 paired = state.paired,
                 onUnpair = { unpairTarget = it },
+                onPermission = { peer, action, value -> vm.setPermission(peer, action, value) },
             )
 
             SettingsCategory.LOGS_DIAGNOSTICS -> LogsDiagnosticsTab(
@@ -350,6 +356,8 @@ private fun NetworkDiscoveryTab(
     settings: AppSettings,
     onSettings: SettingsUpdate,
 ) {
+    val context = LocalContext.current
+    val portStatus by PeerService.portStatus.collectAsStateWithLifecycle()
     SectionLabel("Network")
     SwitchRow(
         title = "Wi-Fi only",
@@ -358,7 +366,14 @@ private fun NetworkDiscoveryTab(
         onCheckedChange = { on -> onSettings { it.copy(wifiOnly = on) } },
     )
     Spacer(Modifier.height(12.dp))
-    PortRow(settings.preferredPort) { onSettings { it.copy(preferredPort = 0) } }
+    PeerPortRow(
+        configured = settings.preferredPort,
+        status = portStatus,
+        onApply = { port ->
+            onSettings { it.copy(preferredPort = port) }
+            PeerService.applyPreferredPort(context)
+        },
+    )
 
     SectionLabel("Discovery")
     Text(
@@ -369,22 +384,59 @@ private fun NetworkDiscoveryTab(
     )
 }
 
+/**
+ * The user-owned peer port. The field is validated ([PeerPort.MIN]..[PeerPort.MAX],
+ * with a clear error); Apply persists the value and restarts the listener, which
+ * re-announces over mDNS. A blank field means automatic. When a configured port
+ * was busy, [status] explains the temporary fallback.
+ */
 @Composable
-private fun PortRow(port: Int, onReset: () -> Unit) {
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text("Listener port", style = MaterialTheme.typography.bodyLarge)
-            Text(
-                if (port == 0) "Automatic" else "Preferred: $port",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+private fun PeerPortRow(
+    configured: Int,
+    status: PeerPortStatus?,
+    onApply: (Int) -> Unit,
+) {
+    var text by remember(configured) { mutableStateOf(if (configured == 0) "" else configured.toString()) }
+    val error = PeerPort.error(text)
+    val parsed = PeerPort.parse(text)
+    val changed = parsed != null && parsed != configured
+
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+        Text("Peer port", style = MaterialTheme.typography.bodyLarge)
+        Text(
+            if (configured == 0) "Automatic — leave blank to let the app choose."
+            else "Preferred: $configured",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it.take(6) },
+                singleLine = true,
+                isError = error != null,
+                placeholder = { Text("Automatic") },
+                supportingText = error?.let { { Text(it) } },
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Number,
+                    imeAction = ImeAction.Done,
+                ),
+                modifier = Modifier.weight(1f),
             )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = { parsed?.let(onApply) },
+                enabled = changed && error == null,
+            ) { Text("Apply") }
         }
-        if (port != 0) {
-            TextButton(onClick = onReset) { Text("Reset") }
+        status?.message()?.let { message ->
+            Spacer(Modifier.height(4.dp))
+            Text(
+                message,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
         }
     }
 }
@@ -414,6 +466,7 @@ private fun NotificationsTab(
 private fun PairingSecurityTab(
     paired: List<PairedStatus>,
     onUnpair: (PairedPeer) -> Unit,
+    onPermission: (PairedPeer, PermissionAction, Permission) -> Unit,
 ) {
     SectionLabel("Paired devices")
     if (paired.isEmpty()) {
@@ -424,7 +477,11 @@ private fun PairingSecurityTab(
         )
     } else {
         paired.forEach { status ->
-            PairedSettingRow(status, onUnpair = { onUnpair(status.peer) })
+            PairedSettingRow(
+                status,
+                onUnpair = { onUnpair(status.peer) },
+                onPermission = onPermission,
+            )
             HorizontalDivider()
         }
     }
@@ -690,31 +747,64 @@ private fun BatteryOptimizationRow() {
 }
 
 @Composable
-private fun PairedSettingRow(status: PairedStatus, onUnpair: () -> Unit) {
+private fun PairedSettingRow(
+    status: PairedStatus,
+    onUnpair: () -> Unit,
+    onPermission: (PairedPeer, PermissionAction, Permission) -> Unit,
+) {
     val peer = status.peer
-    Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(Icons.Filled.Devices, contentDescription = null, modifier = Modifier.size(24.dp))
-        Spacer(Modifier.width(12.dp))
-        Column(modifier = Modifier.weight(1f)) {
-            Text(peer.name.ifEmpty { "Unnamed device" }, style = MaterialTheme.typography.titleSmall)
-            Text(
-                shortFingerprint(peer.fingerprint),
-                style = MaterialTheme.typography.bodySmall,
-                fontFamily = FontFamily.Monospace,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
-            val seen = if (status.online) "Online now" else status.offlineReason ?: "Offline"
-            Text(
-                "$seen · ${permissionsLabel(peer)}",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.Devices, contentDescription = null, modifier = Modifier.size(24.dp))
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    io.github.tuscani712.lanyard.core.DeviceNames.display(peer),
+                    style = MaterialTheme.typography.titleSmall,
+                )
+                Text(
+                    shortFingerprint(peer.fingerprint),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                val seen = if (status.online) "Online now" else status.offlineReason ?: "Offline"
+                Text(
+                    "$seen · ${permissionsLabel(peer)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            TextButton(onClick = onUnpair) { Text("Unpair") }
         }
-        TextButton(onClick = onUnpair) { Text("Unpair") }
+        // The editable tri-state trust editor (G1): the same store the device
+        // page's Permissions section writes.
+        Spacer(Modifier.height(4.dp))
+        io.github.tuscani712.lanyard.core.DevicePage.theyCan(peer).forEach { row ->
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(start = 36.dp, top = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(row.label, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                PermissionChip(DevicePage.permissionWord(Permission.ALLOW), row.value == Permission.ALLOW) {
+                    onPermission(peer, row.action, Permission.ALLOW)
+                }
+                Spacer(Modifier.width(4.dp))
+                PermissionChip(DevicePage.permissionWord(Permission.ASK), row.value == Permission.ASK) {
+                    onPermission(peer, row.action, Permission.ASK)
+                }
+                Spacer(Modifier.width(4.dp))
+                PermissionChip(DevicePage.permissionWord(Permission.NEVER), row.value == Permission.NEVER) {
+                    onPermission(peer, row.action, Permission.NEVER)
+                }
+            }
+        }
     }
+}
+
+@Composable
+private fun PermissionChip(label: String, selected: Boolean, onClick: () -> Unit) {
+    FilterChip(selected = selected, onClick = onClick, label = { Text(label, style = MaterialTheme.typography.bodySmall) })
 }
 
 @Composable
@@ -735,11 +825,12 @@ internal fun ConfirmDialog(
 }
 
 private fun permissionsLabel(peer: PairedPeer): String {
-    val granted = buildList {
-        if (peer.browse) add("browse")
-        if (peer.push) add("push")
+    val granted = DevicePage.theyCan(peer).filter { it.value.permits }
+    return if (granted.isEmpty()) {
+        "no permissions"
+    } else {
+        granted.joinToString(", ") { "${it.label}: ${DevicePage.permissionWord(it.value)}" }
     }
-    return if (granted.isEmpty()) "no permissions" else granted.joinToString(", ")
 }
 
 private fun notificationsGranted(context: Context): Boolean =

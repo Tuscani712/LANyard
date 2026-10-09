@@ -44,7 +44,14 @@ data class PeerHello(
     // conservative limits (see [PushBatching]).
     val maxOfferBytes: Long = 0,
     val maxOfferFiles: Int = 0,
-)
+    // The peer's advertised capabilities (G1). A peer that lists
+    // [Permission.CAPABILITY] understands tri-state `*_mode` fields; one that
+    // does not is sent booleans only.
+    val caps: List<String> = emptyList(),
+) {
+    /** Whether this peer negotiated the tri-state permission encoding. */
+    val supportsTriState: Boolean get() = caps.contains(Permission.CAPABILITY)
+}
 
 /**
  * A client for the LANyard peer API (`/api/v1/...`) over pinned mTLS.
@@ -107,6 +114,7 @@ class PeerClient(
             port = json.int("port"),
             maxOfferBytes = json.long("max_offer_bytes"),
             maxOfferFiles = json.int("max_offer_files"),
+            caps = json.getAsJsonArray("caps")?.mapNotNull { it.takeIf { e -> e.isJsonPrimitive }?.asString } ?: emptyList(),
         )
     }
 
@@ -117,13 +125,16 @@ class PeerClient(
         nonce: String,
         requested: Permissions,
         invite: String = "",
+        // Whether the peer advertised the tri-state capability (from its hello);
+        // only then is a `*_mode` field ever sent.
+        tristate: Boolean = false,
     ): JsonObject {
         val body = JsonObject().apply {
             addProperty("mode", mode)
             addProperty("name", name)
             addProperty("device_id", deviceId)
             addProperty("nonce", nonce)
-            add("requested_permissions", requested.toJson())
+            add("requested_permissions", requested.toJson(tristate))
             if (invite.isNotEmpty()) addProperty("invite", invite)
         }
         return requestJson("POST", "/session/request", body.toString())
@@ -419,18 +430,43 @@ class PeerClient(
     private fun JsonObject.long(key: String): Long = get(key)?.takeIf { !it.isJsonNull }?.asLong ?: 0L
 }
 
-/** Permissions one side allows the other; mirrors `trust.Permissions`. */
+/**
+ * Permissions one side allows the other; mirrors `trust.Permissions` and adds
+ * the G1 tri-state modes. The `browse`/`push` booleans are always present (an
+ * old peer reads only them); the `*_mode` strings are present only when
+ * [toJson] is asked for the tri-state form, i.e. the peer advertised
+ * [Permission.CAPABILITY]. A null mode means "not negotiated — fall back to the
+ * boolean".
+ */
 data class Permissions(
     val browse: Boolean = false,
     val push: Boolean = false,
     val pushMaxBytes: Long = 0,
     val askOver: Long = 0,
+    // Text (snippets) is its own action in G1; an old peer only ever had the
+    // push permission, so [text] defaults to `false` and is carried separately.
+    val text: Boolean = false,
+    // Tri-state view of the same fields (G1). Null until negotiated.
+    val browseMode: Permission? = null,
+    val pushMode: Permission? = null,
+    val textMode: Permission? = null,
 ) {
-    fun toJson(): JsonObject = JsonObject().apply {
+    /**
+     * The wire object. [tristate] gates the `*_mode` keys so an old peer never
+     * receives a key it cannot parse; the booleans are always included as the
+     * fallback ("allow else deny").
+     */
+    fun toJson(tristate: Boolean = false): JsonObject = JsonObject().apply {
         addProperty("browse", browse)
         addProperty("push", push)
+        addProperty("text", text)
         if (pushMaxBytes > 0) addProperty("push_max_bytes", pushMaxBytes)
         if (askOver > 0) addProperty("ask_over", askOver)
+        if (tristate) {
+            browseMode?.let { addProperty("browse_mode", it.wire) }
+            pushMode?.let { addProperty("push_mode", it.wire) }
+            textMode?.let { addProperty("text_mode", it.wire) }
+        }
     }
 }
 

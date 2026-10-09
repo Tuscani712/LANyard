@@ -45,7 +45,7 @@ class PairingFlowTest {
             assertEquals(fp.lowercase(), record!!.fingerprint)
             assertEquals("127.0.0.1", record.host)
             assertEquals(peer.peerPort, record.port)
-            assertTrue(record.browse, "browse permission must be granted")
+            assertTrue(record.allowBrowse, "the peer must have allowed browsing")
         }
     }
 

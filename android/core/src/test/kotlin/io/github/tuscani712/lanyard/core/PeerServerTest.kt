@@ -28,6 +28,9 @@ class PeerServerTest {
         selfFpOverride: (() -> String)? = null,
         val diagnostics: ServerDiagnostics? = null,
         val snippets: ReceivedSnippets? = null,
+        private val approval: PushApproval? = null,
+        private val browseApproval: BrowseApproval? = null,
+        shares: ShareServer? = null,
     ) : AutoCloseable {
         val identity: Identity = Identity.generate("Phone")
         private val trustFile = File.createTempFile("lanyard-trust", ".json").also { it.delete() }
@@ -48,6 +51,9 @@ class PeerServerTest {
             maxBodyBytes = maxBody,
             maxOfferBodyBytes = maxOfferBody,
             snippets = snippets,
+            approval = approval,
+            browseApproval = browseApproval,
+            shares = shares,
             diagnostics = diagnostics,
         )
         val port: Int = server.start(identity) { p ->
@@ -394,13 +400,21 @@ class PeerServerTest {
 
     @Test
     @Timeout(60)
-    fun snippetWithoutPushPermissionIsRefused() {
+    fun snippetWithoutTextPermissionIsRefusedAsTextNotPermitted() {
         val store = ReceivedSnippets()
         Harness(snippets = store).use { h ->
-            h.trust.save(PairedPeer(h.identity.deviceId, "Self", "127.0.0.1", 1, browse = true, push = false, pairedAt = 0))
+            // Text is its own permission now; a peer with text Never is refused
+            // with the precise "text not permitted" body, not the push wording.
+            h.trust.save(
+                PairedPeer(
+                    h.identity.deviceId, "Self", "127.0.0.1", 1,
+                    browse = Permission.ALLOW, push = Permission.NEVER, text = Permission.NEVER, pairedAt = 0,
+                ),
+            )
             val resp = h.request(h.identity, post("/api/v1/snippet", """{"text":"hello"}"""))
             assertEquals(403, status(resp), resp)
-            assertTrue(body(resp).contains("not permitted"), body(resp))
+            assertTrue(body(resp).contains("text not permitted"), body(resp))
+            assertFalse(body(resp).contains("push not permitted"), body(resp))
             assertTrue(store.list().isEmpty())
         }
     }
@@ -550,6 +564,102 @@ class PeerServerTest {
             assertFalse(joined.contains("SECRETTOKEN"), "a query value must never be logged: $joined")
             // The report-level redaction is the second line of defence.
             assertFalse(Diagnostics.copyReport(emptyList(), diag.snapshot()).contains("SECRETTOKEN"))
+        }
+    }
+
+    private fun browseSource(): ShareSource = object : ShareSource {
+        override fun list(): List<ShareInfo> = listOf(ShareInfo("s1", "Docs", "Docs", "dir", 0))
+        override fun children(shareId: String, rel: String): List<ShareChild>? = emptyList()
+        override fun resolve(shareId: String, rel: String): ResolvedFile? = null
+        override fun ended(shareId: String): String? = null
+    }
+
+    private fun askPeer(h: Harness, browse: Permission = Permission.ASK) = PairedPeer(
+        h.identity.deviceId, "Self", "127.0.0.1", 1,
+        browse = browse, push = Permission.NEVER, text = Permission.NEVER, pairedAt = 0,
+    )
+
+    private fun getShares(h: Harness): String =
+        h.request(h.identity, "GET /api/v1/shares HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+
+    @Test
+    @Timeout(60)
+    fun browseAskPromptsOnceAndRemembersTheSession() {
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        Harness(
+            browseApproval = BrowseApproval { _, _ -> calls.incrementAndGet(); ApprovalOutcome.ACCEPTED },
+            shares = ShareServer(browseSource()),
+        ).use { h ->
+            h.trust.save(askPeer(h))
+            assertEquals(200, status(getShares(h)), "an accepted browse must serve the list")
+            assertEquals(200, status(getShares(h)), "a second request in the session must serve too")
+            assertEquals(1, calls.get(), "one browse session must prompt the person only once")
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun browseAskDeniedIsPullNotPermitted() {
+        Harness(
+            browseApproval = BrowseApproval { _, _ -> ApprovalOutcome.DECLINED },
+            shares = ShareServer(browseSource()),
+        ).use { h ->
+            h.trust.save(askPeer(h))
+            val resp = getShares(h)
+            assertEquals(403, status(resp), resp)
+            // A person's decline has its own wording, distinct from Never.
+            assertTrue(body(resp).contains("denied by the user"), body(resp))
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun browseAskUnansweredTimesOutToDenial() {
+
+        // The app answers an unanswered prompt with DECLINED (timeout = deny).
+        Harness(
+            browseApproval = BrowseApproval { _, _ -> ApprovalOutcome.DECLINED },
+            shares = ShareServer(browseSource()),
+        ).use { h ->
+            h.trust.save(askPeer(h))
+            assertEquals(403, status(getShares(h)), "a timeout must deny, never hang")
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun browseNeverNeedsNoPrompt() {
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        Harness(
+            browseApproval = BrowseApproval { _, _ -> calls.incrementAndGet(); ApprovalOutcome.ACCEPTED },
+            shares = ShareServer(browseSource()),
+        ).use { h ->
+            h.trust.save(askPeer(h, browse = Permission.NEVER))
+            val resp = getShares(h)
+            assertEquals(403, status(resp), resp)
+            assertEquals(0, calls.get(), "Never must never prompt")
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun textAskReusesThePushApprovalAndStoresTheSnippet() {
+        val store = ReceivedSnippets()
+        val asked = java.util.concurrent.atomic.AtomicInteger()
+        Harness(
+            snippets = store,
+            approval = PushApproval { _, _, _, _, _ -> asked.incrementAndGet(); ApprovalOutcome.ACCEPTED },
+        ).use { h ->
+            h.trust.save(
+                PairedPeer(
+                    h.identity.deviceId, "Self", "127.0.0.1", 1,
+                    browse = Permission.NEVER, push = Permission.NEVER, text = Permission.ASK, pairedAt = 0,
+                ),
+            )
+            val resp = h.request(h.identity, post("/api/v1/snippet", """{"text":"hello"}"""))
+            assertEquals(200, status(resp), resp)
+            assertEquals(1, asked.get(), "text Ask must reuse the push-approval prompt")
+            assertEquals(1, store.list().size)
         }
     }
 

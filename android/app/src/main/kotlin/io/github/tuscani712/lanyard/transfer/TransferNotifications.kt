@@ -70,6 +70,12 @@ object TransferNotifications {
         val text = buildString {
             append(if (record.direction == "send") "Sent " else "Received ")
             append(record.label.ifEmpty { "file" })
+            // Name the device (its local alias when set, else the broadcast name),
+            // so a completion is unambiguous when several peers are paired.
+            record.peerName.takeIf { it.isNotBlank() && it != "A device" }?.let {
+                append(if (record.direction == "send") " to " else " from ")
+                append(it)
+            }
             if (ok && record.averageSpeed > 0) {
                 append(" · ")
                 append(formatSpeed(record.averageSpeed, SettingsHolder.settings.value.speedUnit))

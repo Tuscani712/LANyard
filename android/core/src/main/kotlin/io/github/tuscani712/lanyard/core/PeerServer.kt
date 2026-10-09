@@ -35,6 +35,17 @@ fun interface PushApproval {
 }
 
 /**
+ * Asks the phone's person, once per browse session, whether a peer may browse
+ * the shared folders (G2). The app reuses the push-approval prompt. Must answer
+ * quickly; [ApprovalOutcome.UNAVAILABLE]/[ApprovalOutcome.BUSY] refuse at once,
+ * and the app's own wait timeout answers [ApprovalOutcome.DECLINED], so a
+ * browse that is never answered is denied rather than left hanging.
+ */
+fun interface BrowseApproval {
+    fun ask(peerFp: String, peerName: String): ApprovalOutcome
+}
+
+/**
  * The phone-side peer API over mutual TLS 1.3: discovery, pairing (C1) and
  * receiving pushes (C2a).
  *
@@ -59,6 +70,12 @@ class PeerServer(
     private val metered: () -> Boolean = { false },
     private val wifiOnly: () -> Boolean = { true },
     private val approval: PushApproval? = null,
+    // The browse-session approval (G2). Null (core tests) means an Ask browses
+    // cannot be confirmed, so it is refused.
+    private val browseApproval: BrowseApproval? = null,
+    // How long one accepted browse approval is remembered for subsequent share
+    // requests from the same peer — one "browse session".
+    private val browseSessionTtlMillis: Long = BROWSE_SESSION_TTL_MS,
     private val onUnpair: (String) -> Unit = {},
     // A verified peer finished the TLS handshake with us: it is reachable right
     // now. The app uses this to retry a pending-unpair notification promptly.
@@ -84,6 +101,9 @@ class PeerServer(
     private val onSnippetsChanged: () -> Unit = {},
     private val clock: () -> Long = System::currentTimeMillis,
     private val diagnostics: ServerDiagnostics? = null,
+    // Best-effort name of the process holding the configured port, for the
+    // "held by …" part of the temporary-port banner. Null when undeterminable.
+    private val portHolder: (Int) -> String? = PortHolder::find,
 ) {
     private fun diag(event: String) = diagnostics?.record(event)
 
@@ -91,6 +111,8 @@ class PeerServer(
     private var pool: ThreadPoolExecutor? = null
     private val live: MutableSet<Socket> = ConcurrentHashMap.newKeySet()
     private val requestTimes = ArrayDeque<Long>()
+    // fingerprint -> epoch millis until which a browse approval is remembered.
+    private val browseGrants = ConcurrentHashMap<String, Long>()
     private var hello: ((Int) -> JsonObject)? = null
     private val unpairedActive = AtomicInteger()
     private val pairedActive = AtomicInteger()
@@ -104,16 +126,35 @@ class PeerServer(
     var port: Int = 0
         private set
 
+    /**
+     * True when a configured port was tried and could not be bound, so this run
+     * fell back to an ephemeral one. Never persisted (see [PeerPort.toPersist]).
+     */
+    @Volatile
+    var temporaryPort: Boolean = false
+        private set
+
+    /** Why this run is on a temporary port, or null when it is not. */
+    @Volatile
+    var portConflict: PortConflict? = null
+        private set
+
     fun activeConnections(): Int = pool?.activeCount ?: 0
 
     /** Unpaired connections currently parked waiting for their next request. */
     fun idleUnpairedConnections(): Int = idleUnpaired.get()
 
-    fun start(identity: Identity, preferredPort: Int = 0, hello: (Int) -> JsonObject): Int {
+    fun start(
+        identity: Identity,
+        preferredPort: Int = 0,
+        bindRetryMillis: Long = DEFAULT_BIND_RETRY_MS,
+        hello: (Int) -> JsonObject,
+    ): Int {
         stop()
         this.hello = hello
         val ctx = Tls.serverContext(identity)
-        val ss = bindServerSocket(ctx, preferredPort)
+        val bound = bindServerSocket(ctx, preferredPort, bindRetryMillis)
+        val ss = bound.socket
         ss.needClientAuth = true
         ss.enabledProtocols = arrayOf("TLSv1.3")
 
@@ -128,26 +169,57 @@ class PeerServer(
         server = ss
         pool = executor
         port = ss.localPort
+        temporaryPort = bound.temporary
+        portConflict = bound.conflict
         Thread({ acceptLoop(ss, executor) }, "lanyard-peer-accept").apply { isDaemon = true }.start()
         return port
     }
+
+    private class Bound(
+        val socket: SSLServerSocket,
+        val temporary: Boolean,
+        val conflict: PortConflict?,
+    )
 
     /**
      * Binds [preferredPort] when it is a usable port and still free, else an
      * ephemeral one. A stable port means a desktop's stored address stays valid
      * across phone launches; an ephemeral fallback keeps the app starting when
      * the port is taken.
+     *
+     * A busy configured port is retried for up to [retryMillis] (~5 s in
+     * production) in case whoever held it just released it, then it falls back
+     * to an ephemeral port for this run only, and reports the conflict.
      */
-    private fun bindServerSocket(ctx: javax.net.ssl.SSLContext, preferredPort: Int): SSLServerSocket {
+    private fun bindServerSocket(
+        ctx: javax.net.ssl.SSLContext,
+        preferredPort: Int,
+        retryMillis: Long,
+    ): Bound {
         val factory = ctx.serverSocketFactory
         if (preferredPort in 1..65535) {
-            try {
-                return factory.createServerSocket(preferredPort) as SSLServerSocket
-            } catch (_: Exception) {
-                // The preferred port is taken; fall back to an ephemeral one.
+            val deadline = System.currentTimeMillis() + retryMillis.coerceAtLeast(0)
+            while (true) {
+                try {
+                    return Bound(factory.createServerSocket(preferredPort) as SSLServerSocket, false, null)
+                } catch (_: Exception) {
+                    if (System.currentTimeMillis() >= deadline) break
+                    try {
+                        Thread.sleep(BIND_RETRY_INTERVAL_MS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        break
+                    }
+                }
             }
+            val holder = runCatching { portHolder(preferredPort) }.getOrNull()
+            return Bound(
+                factory.createServerSocket(0) as SSLServerSocket,
+                temporary = true,
+                conflict = PortConflict(preferredPort, holder),
+            )
         }
-        return factory.createServerSocket(0) as SSLServerSocket
+        return Bound(factory.createServerSocket(0) as SSLServerSocket, false, null)
     }
 
     fun stop() {
@@ -162,6 +234,8 @@ class PeerServer(
         live.clear()
         synchronized(requestTimes) { requestTimes.clear() }
         port = 0
+        temporaryPort = false
+        portConflict = null
     }
 
     private fun acceptLoop(ss: SSLServerSocket, executor: ThreadPoolExecutor) {
@@ -527,23 +601,56 @@ class PeerServer(
         else -> maxBodyBytes
     }
 
-    /** A push endpoint needs a paired fingerprint with the push permission. */
+    /**
+     * A push endpoint needs a paired fingerprint whose push permission is not
+     * Never. Ask is allowed through here: it is enforced with a prompt at the
+     * offer (see [handlePushOffer]); the later file/complete steps belong to a
+     * push that was already accepted.
+     */
     private fun requirePush(fp: String, peer: PairedPeer?): PairedPeer {
         val p = peer ?: throw PeerHttpException(403, "not paired")
-        if (!p.push) throw PeerHttpException(403, "push not permitted")
+        if (p.push == Permission.NEVER) throw PeerHttpException(403, "push not permitted")
         return p
     }
 
     /**
-     * The text snippet gate, mirroring the desktop's `pushAccess`: a paired peer
-     * with the push permission only. The desktop refuses an unpaired caller with
-     * `not permitted` and a paired caller without the permission with
-     * `push not permitted`; both contain "not permitted", which is what
-     * [PeerErrors] surfaces.
+     * Whether [peer] may browse (pull) the shares right now (G2). Allow passes;
+     * Never is refused; Ask prompts the phone's person once and remembers the
+     * answer for a browse session ([browseSessionTtlMillis]). A prompt that is
+     * never answered (the app times out) comes back as a refusal, so a browse
+     * that is not confirmed is denied — never left running.
+     */
+    private fun browseDenial(peer: PairedPeer): String? {
+        when (peer.browse) {
+            Permission.ALLOW -> return null
+            Permission.NEVER -> return "pull not permitted"
+            Permission.ASK -> {}
+        }
+        val now = clock()
+        browseGrants[peer.fingerprint]?.let { if (now < it) return null }
+        val outcome = browseApproval?.ask(peer.fingerprint, peer.name) ?: ApprovalOutcome.UNAVAILABLE
+        return when (outcome) {
+            ApprovalOutcome.ACCEPTED -> {
+                browseGrants[peer.fingerprint] = now + browseSessionTtlMillis
+                null
+            }
+            // A person's decline (or the app's timeout, which is a decline) has
+            // its own wording, distinct from a Never permission.
+            ApprovalOutcome.DECLINED -> "denied by the user"
+            else -> "pull not permitted"
+        }
+    }
+
+    /**
+     * The text snippet gate (G1): a paired peer whose text permission is not
+     * Never. An Ask is allowed through here and enforced with the push-approval
+     * prompt below. The desktop refuses an unpaired caller with `not permitted`
+     * and a paired caller without the permission with `text not permitted`;
+     * both contain "not permitted", which is what [PeerErrors] surfaces.
      */
     private fun requireSnippet(peer: PairedPeer?): PairedPeer {
         val p = peer ?: throw PeerHttpException(403, "not permitted")
-        if (!p.push) throw PeerHttpException(403, "push not permitted")
+        if (p.text == Permission.NEVER) throw PeerHttpException(403, "text not permitted")
         return p
     }
 
@@ -553,6 +660,17 @@ class PeerServer(
         val json = parseObject(body)
         val text = json.str("text")
         SnippetProtocol.validate(text)?.let { throw PeerHttpException(400, it) }
+        // G2: text reuses the existing push-approval prompt/notification.
+        if (p.text == Permission.ASK) {
+            val bytes = text.toByteArray(Charsets.UTF_8).size.toLong()
+            val outcome = approval?.ask(p.fingerprint, p.name, 1, bytes, emptyList())
+                ?: ApprovalOutcome.UNAVAILABLE
+            when (outcome) {
+                ApprovalOutcome.ACCEPTED -> {}
+                ApprovalOutcome.BUSY -> throw PeerHttpException(429, "another request is waiting")
+                else -> throw PeerHttpException(403, "the message was declined")
+            }
+        }
         val snippet = store.add(p.fingerprint, text)
         runCatching { onSnippetsChanged() }
         diag("[push] snippet received peer=${fp.take(8)} bytes=${text.toByteArray(Charsets.UTF_8).size}")
@@ -574,9 +692,9 @@ class PeerServer(
         // Validate here (caps, names, free space) before asking, so a refusal is
         // for a real reason and no spool is created for a rejected offer.
         val probe = receiver.offer(p.fingerprint, p.name, reqs, total, p.pushMaxBytes)
-        // ask_over: a person must accept.
+        // Ask permission (G1) or ask_over (size threshold): a person must accept.
         val realTotal = if (total > 0) total else reqs.sumOf { it.size }
-        if (p.askOver > 0 && realTotal > p.askOver) {
+        if (p.push == Permission.ASK || (p.askOver > 0 && realTotal > p.askOver)) {
             val names = reqs.take(5).map { Display.safeName(it.relPath) }
             val outcome = approval?.ask(p.fingerprint, p.name, reqs.size, realTotal, names) ?: ApprovalOutcome.ACCEPTED
             when (outcome) {
@@ -674,6 +792,11 @@ class PeerServer(
             w
         } catch (e: Exception) {
             receiver.fail(id, bodyFailureReason(e))
+            // A body that aborts because the receiving person cancelled the push
+            // must answer 410 Gone ("cancelled by the receiver"), not a 500: the
+            // sender ends its row as Cancelled with that reason. The connection
+            // is closed either way, so the rest of the push is torn down.
+            if (receiver.wasCancelled(id)) throw PeerHttpException(410, RECEIVER_CANCELLED_BODY)
             throw e
         }
         if (whole) {
@@ -905,7 +1028,11 @@ class PeerServer(
         val fp = peer?.fingerprint ?: ""
         if (shares == null) { respond(out, 404, errorJson("not found")); logResp(404, head, fp, started, "shares unavailable"); return false }
         if (peer == null) { respond(out, 403, errorJson("not paired")); logResp(403, head, fp, started, "not paired"); return false }
-        if (!peer.browse) { respond(out, 403, errorJson("pull not permitted")); logResp(403, head, fp, started, "pull not permitted"); return false }
+        browseDenial(peer)?.let { reason ->
+            respond(out, 403, errorJson(reason))
+            logResp(403, head, fp, started, reason)
+            return false
+        }
         val isFileGet = (head.method == "GET" || head.method == "HEAD") && head.path.endsWith("/file")
         val guard = if (isFileGet) StallGuard(ssl, stallTimeoutMillis.toLong(), stallScheduler) else null
         // ShareServer writes its response directly, so watch the status line to
@@ -994,7 +1121,7 @@ class PeerServer(
         append(""","mode":""").append(jsonStr(v.mode))
         append(""","nonce":""").append(jsonStr(v.nonce))
         append(""","sas":""").append(jsonStr(v.sas))
-        append(""","granted":""").append(permissionsJson(v.granted))
+        append(""","granted":""").append(permissionsJson(v.granted, v.triAware))
         append('}')
     }
 
@@ -1009,11 +1136,19 @@ class PeerServer(
         append("]}")
     }
 
-    private fun permissionsJson(p: Permissions): String = buildString {
+    private fun permissionsJson(p: Permissions, tristate: Boolean = true): String = buildString {
         append("""{"browse":""").append(p.browse)
         append(""","push":""").append(p.push)
+        append(""","text":""").append(p.text)
         if (p.pushMaxBytes > 0) append(""","push_max_bytes":""").append(p.pushMaxBytes)
         if (p.askOver > 0) append(""","ask_over":""").append(p.askOver)
+        // The `*_mode` keys are emitted only when the peer negotiated tri-state
+        // (G1), so an old peer sees the same body it always did.
+        if (tristate) {
+            p.browseMode?.let { append(""","browse_mode":""").append(it.wire).append('"') }
+            p.pushMode?.let { append(""","push_mode":""").append(it.wire).append('"') }
+            p.textMode?.let { append(""","text_mode":""").append(it.wire).append('"') }
+        }
         append('}')
     }
 
@@ -1021,7 +1156,17 @@ class PeerServer(
         val o = get(key)?.takeIf { it.isJsonObject }?.asJsonObject ?: return Permissions()
         fun b(k: String) = o.get(k)?.takeIf { !it.isJsonNull }?.asBoolean ?: false
         fun l(k: String) = o.get(k)?.takeIf { !it.isJsonNull }?.asLong ?: 0L
-        return Permissions(browse = b("browse"), push = b("push"), pushMaxBytes = l("push_max_bytes"), askOver = l("ask_over"))
+        fun m(k: String) = Permission.fromString(o.get(k)?.takeIf { !it.isJsonNull }?.asString)
+        return Permissions(
+            browse = b("browse"),
+            push = b("push"),
+            pushMaxBytes = l("push_max_bytes"),
+            askOver = l("ask_over"),
+            text = b("text"),
+            browseMode = m("browse_mode"),
+            pushMode = m("push_mode"),
+            textMode = m("text_mode"),
+        )
     }
 
     private fun JsonObject.str(key: String): String = get(key)?.takeIf { !it.isJsonNull }?.asString ?: ""
@@ -1120,5 +1265,22 @@ class PeerServer(
          * worker pool and starve a paired peer.
          */
         const val MAX_IDLE_UNPAIRED_CONNECTIONS = 16
+
+        /**
+         * How long one accepted browse approval is remembered, i.e. the length
+         * of a "browse session" (G2). Five minutes covers a person browsing a
+         * folder and pulling several files without a second prompt.
+         */
+        const val BROWSE_SESSION_TTL_MS = 5 * 60 * 1000L
+
+        /**
+         * How long a configured (user-owned) port is retried before falling back
+         * to a temporary ephemeral port: about 5 s, in case whoever held it just
+         * released it.
+         */
+        const val DEFAULT_BIND_RETRY_MS = 5_000L
+
+        /** The pause between retries of a busy configured port. */
+        const val BIND_RETRY_INTERVAL_MS = 100L
     }
 }

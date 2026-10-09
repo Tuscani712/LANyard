@@ -16,6 +16,24 @@ object PeerErrors {
     /** Shown when a peer refuses an action with a generic 403. */
     const val NOT_PAIRED = "Not paired with this device."
 
+    /** A 403 whose reason is exactly `push not permitted` (G3). */
+    const val PUSH_NOT_PERMITTED = "The other device has not allowed you to send files."
+
+    /** A 403 whose reason is exactly `pull not permitted` (G3). */
+    const val PULL_NOT_PERMITTED = "The other device has not allowed you to browse its shares."
+
+    /** A 403 whose reason is exactly `text not permitted` (G3). */
+    const val TEXT_NOT_PERMITTED = "The other device has not allowed you to send text."
+
+    /** A 403 whose reason is exactly `not permitted` (G3). */
+    const val NOT_PERMITTED = "The other device has not allowed that."
+
+    /**
+     * A 403 whose reason is a user decline — `denied by the user`, or the
+     * phone's `the transfer was declined` / `the message was declined` (G3).
+     */
+    const val DENIED_BY_USER = "Declined on the other device."
+
     /** An offline probe that timed out: a firewall may be dropping the packets. */
     const val OFFLINE_TIMEOUT = "Timed out — may be blocked by a firewall."
 
@@ -37,17 +55,21 @@ object PeerErrors {
     private const val NOT_PAIRED_REASON = "not paired"
 
     /**
-     * Display-only: 403 reasons that are generic refusals, so a person gets
-     * [NOT_PAIRED] rather than a bare "forbidden". The permission refusals are
-     * deliberately in this list — a peer that denies pull/push has not unpaired
-     * us — but this set is **never** consulted by [isNotPaired].
+     * The exact 403 reason bodies mapped to their own wording (G3). A permission
+     * refusal is never shown as "Not paired"; each of these has its own line.
+     * Matching is exact on the trimmed, lowercased reason (the peer's `error`
+     * field), so a longer sentence that merely contains one of these words is
+     * kept verbatim.
      */
-    private val genericForbidden = setOf(
-        "not permitted",
-        "push not permitted",
-        "pull not permitted",
-        "forbidden",
-        "not paired",
+    private val reasonMessages: Map<String, String> = mapOf(
+        "push not permitted" to PUSH_NOT_PERMITTED,
+        "pull not permitted" to PULL_NOT_PERMITTED,
+        "text not permitted" to TEXT_NOT_PERMITTED,
+        "not permitted" to NOT_PERMITTED,
+        "denied by the user" to DENIED_BY_USER,
+        "the transfer was declined" to DENIED_BY_USER,
+        "the message was declined" to DENIED_BY_USER,
+        "not paired" to NOT_PAIRED,
     )
 
     /**
@@ -68,9 +90,13 @@ object PeerErrors {
     }
 
     /**
-     * Maps a peer-client failure to the line the UI shows. A 403 keeps the
-     * peer's specific reason when it has one, and otherwise reads
-     * [NOT_PAIRED]; a transport failure is passed through unchanged.
+     * Maps a peer-client failure to the line the UI shows.
+     *
+     * A 403 whose reason is one of the known bodies gets its own wording (G3);
+     * every permission refusal has its own line, so none of them ever reads
+     * "Not paired". An unknown 403 keeps the peer's own text when it has some,
+     * else reads [NOT_PAIRED]. A transport failure is passed through unchanged.
+     * This is display-only and never consulted by [isNotPaired].
      */
     fun userMessage(t: Throwable?): String {
         if (t == null) return ""
@@ -78,7 +104,8 @@ object PeerErrors {
         val msg = reason(t.body)
         if (t.code == 413) return TOO_LARGE
         if (t.code == 403) {
-            return if (msg.isNotEmpty() && !genericForbidden.contains(msg.lowercase())) msg else NOT_PAIRED
+            reasonMessages[msg.lowercase()]?.let { return it }
+            return if (msg.isNotEmpty()) msg else NOT_PAIRED
         }
         return msg.ifEmpty { "The other device answered with an error (HTTP ${t.code})." }
     }

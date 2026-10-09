@@ -158,7 +158,7 @@ class PushSession(
         val reason = when (result) {
             is PushResult.Failed -> result.message
             PushResult.Refused -> "the other device is not accepting files"
-            PushResult.CancelledByReceiver -> "the other device cancelled"
+            PushResult.CancelledByReceiver -> RECEIVER_CANCELLED_REASON
             PushResult.Cancelled -> "cancelled"
             is PushResult.Sent -> "sent"
         }

@@ -58,6 +58,7 @@ import com.google.zxing.qrcode.QRCodeWriter
 import io.github.tuscani712.lanyard.DevicesViewModel
 import io.github.tuscani712.lanyard.PairedStatus
 import io.github.tuscani712.lanyard.PairingStatus
+import io.github.tuscani712.lanyard.core.DeviceNames
 import io.github.tuscani712.lanyard.net.NearbyDevice
 import io.github.tuscani712.lanyard.scan.QrScanActivity
 
@@ -274,7 +275,7 @@ private fun PairedRow(status: PairedStatus, onClick: () -> Unit) {
             StatusDot(status.online)
             Spacer(Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
-                Text(status.peer.name.ifEmpty { "Unnamed device" }, style = MaterialTheme.typography.titleSmall)
+                Text(DeviceNames.display(status.peer), style = MaterialTheme.typography.titleSmall)
                 Spacer(Modifier.height(2.dp))
                 Text(
                     shortFingerprint(status.peer.fingerprint),

@@ -12,7 +12,7 @@ import java.nio.file.Files
 class ShareServerTest {
     private val root = Files.createTempDirectory("lanyard-share").toFile()
     private val peer = PairedPeer("aa".repeat(32), "Desk", "h", 1, browse = true, push = false, pairedAt = 0)
-    private val noBrowse = peer.copy(browse = false)
+    private val noBrowse = peer.copy(browse = Permission.NEVER)
 
     private fun source() = DirShareSource("s1", root)
 

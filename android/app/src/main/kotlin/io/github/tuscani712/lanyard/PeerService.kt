@@ -6,7 +6,9 @@ import androidx.documentfile.provider.DocumentFile
 import com.google.gson.JsonObject
 import io.github.tuscani712.lanyard.core.ApprovalOutcome
 import io.github.tuscani712.lanyard.core.BackgroundListenerPolicy
+import io.github.tuscani712.lanyard.core.BrowseApproval
 import io.github.tuscani712.lanyard.core.DiagLevel
+import io.github.tuscani712.lanyard.core.DeviceNames
 import io.github.tuscani712.lanyard.core.Display
 import io.github.tuscani712.lanyard.core.Identity
 import io.github.tuscani712.lanyard.core.InboxReceiver
@@ -17,11 +19,14 @@ import io.github.tuscani712.lanyard.core.PairLink
 import io.github.tuscani712.lanyard.core.PairingSessions
 import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PeerClient
+import io.github.tuscani712.lanyard.core.PeerPort
+import io.github.tuscani712.lanyard.core.PeerPortStatus
 import io.github.tuscani712.lanyard.core.PeerServer
 import io.github.tuscani712.lanyard.core.PendingUnpair
 import io.github.tuscani712.lanyard.core.PendingUnpairRetry
 import io.github.tuscani712.lanyard.core.PendingUnpairStore
 import io.github.tuscani712.lanyard.core.JsonFilePendingUnpairStore
+import io.github.tuscani712.lanyard.core.Permission
 import io.github.tuscani712.lanyard.core.Permissions
 import io.github.tuscani712.lanyard.core.PushApproval
 import io.github.tuscani712.lanyard.core.PushDestination
@@ -67,6 +72,18 @@ data class PushApprovalRequest(
 )
 
 /**
+ * A peer that wants to browse this phone's shares (G2). Shown once per browse
+ * session; an unanswered prompt (the app's timeout) is a denial.
+ */
+data class BrowseApprovalRequest(
+    val id: String,
+    val peerName: String,
+)
+
+/** How long the browse prompt waits for a person before it denies (G2). */
+private const val BROWSE_APPROVAL_TIMEOUT_MS = 60_000L
+
+/**
  * A peer that just proved it is online (a successful hello either direction, an
  * inbound handshake, or an mDNS sighting). [host]/[port] are absent when the
  * signal came from an inbound handshake, which carries no address.
@@ -97,6 +114,12 @@ object PeerService {
     private var server: PeerServer? = null
     private var shareServer: ShareServer? = null
     private var advertiser: NsdAdvertiser? = null
+    // The listener is bound off the main thread: a configured port that is in
+    // use is retried for ~5 s, which must never block the UI. [startGeneration]
+    // is bumped by [stop] so a bind that finishes after a stop is discarded.
+    private val startLock = Any()
+    private var binding = false
+    private var startGeneration = 0
     private var appVersion: String = ""
     private var currentInvite: PairInvites.Invite? = null
     private var metered: AndroidMeteredNetwork? = null
@@ -117,8 +140,19 @@ object PeerService {
     private val _approval = MutableStateFlow<PushApprovalRequest?>(null)
     val approval: StateFlow<PushApprovalRequest?> = _approval.asStateFlow()
 
+    private val _browseApproval = MutableStateFlow<BrowseApprovalRequest?>(null)
+    val browseApproval: StateFlow<BrowseApprovalRequest?> = _browseApproval.asStateFlow()
+
     private val _interrupted = MutableStateFlow(false)
     val interrupted: StateFlow<Boolean> = _interrupted.asStateFlow()
+
+    /**
+     * The listener's current port and, when a configured port could not be bound,
+     * why it fell back to a temporary one. Settings shows the message so the
+     * person knows the desktop's stored address is stale for this run.
+     */
+    private val _portStatus = MutableStateFlow<PeerPortStatus?>(null)
+    val portStatus: StateFlow<PeerPortStatus?> = _portStatus.asStateFlow()
 
     private val _shares = MutableStateFlow<List<AppShare>>(emptyList())
     val shares: StateFlow<List<AppShare>> = _shares.asStateFlow()
@@ -159,6 +193,11 @@ object PeerService {
 
     private val approvalLock = Any()
     private var approvalWaiter: CompletableDeferred<Boolean>? = null
+
+    // The browse-session prompt (G2) reuses the same one-at-a-time gate as a
+    // push approval, so a person never sees two prompts at once.
+    private val browseLock = Any()
+    private var browseWaiter: CompletableDeferred<Boolean>? = null
 
     /**
      * Recent server events (connection, handshake, request, response, close),
@@ -327,9 +366,10 @@ object PeerService {
             freeBytes = { spoolDir.usableSpace },
             onChange = { publish() },
             onOffer = { pushId, fp, files, total ->
+                val paired = trustStore.find(fp)
                 TransferManager.noteReceiveStarted(
                     pushId,
-                    trustStore.find(fp)?.name?.takeIf { it.isNotBlank() } ?: "A device",
+                    paired?.let { DeviceNames.display(it) }?.takeIf { it.isNotBlank() } ?: "A device",
                     fp,
                     "Inbox",
                     total,
@@ -415,42 +455,90 @@ object PeerService {
         // The app coming forward is itself a "peer reachable" moment: a peer
         // unpaired while offline may be back now. Off the main thread.
         onAppForeground()
-        if (server != null) return
         val id = IdentityHolder.identity ?: return
         val app = context.applicationContext
-        sessionStore.clear()
-        receiver.sweepStale()
-        _interrupted.value = receiver.hasPartialSpool()
-        val srv = PeerServer(
-            sessions = sessionStore,
-            receiver = receiver,
-            invites = inviteStore,
-            isPaired = { trustStore.find(it) },
-            metered = { metered?.isMetered() ?: false },
-            wifiOnly = { SettingsHolder.settings.value.wifiOnly },
-            approval = pushApproval,
-            onUnpair = { trustStore.remove(it) },
-            // A peer that just handshook with us is reachable: retry its unpair.
-            onPeerReachable = { fp -> onPeerReachable(fp.take(16)) },
-            shares = ShareServer(shareSource, diag = { diagnostics.record(it) }).also { shareServer = it },
-            snippets = snippets,
-            onSnippetsChanged = { _receivedText.value = snippets.list() },
-            diagnostics = diagnostics,
-        )
-        val port = try {
-            srv.start(id, preferredPort = SettingsHolder.settings.value.preferredPort) { boundPort -> hello(id, boundPort) }
-        } catch (_: Exception) {
-            return
+        val generation: Int
+        synchronized(startLock) {
+            if (server != null || binding) return
+            binding = true
+            generation = ++startGeneration
         }
-        server = srv
-        // Remember the port actually bound (the preferred one when it was free),
-        // so the desktop's stored address stays valid across launches.
-        if (SettingsHolder.settings.value.preferredPort != port) {
-            SettingsHolder.update { it.copy(preferredPort = port) }
+        // Bind off the main thread: a busy configured port is retried for ~5 s
+        // before the ephemeral fallback, and that must never freeze the UI.
+        lifetimeScope.launch(Dispatchers.IO) {
+            sessionStore.clear()
+            receiver.sweepStale()
+            _interrupted.value = receiver.hasPartialSpool()
+            val srv = PeerServer(
+                sessions = sessionStore,
+                receiver = receiver,
+                invites = inviteStore,
+                isPaired = { trustStore.find(it) },
+                metered = { metered?.isMetered() ?: false },
+                wifiOnly = { SettingsHolder.settings.value.wifiOnly },
+                approval = pushApproval,
+                browseApproval = browseAsk,
+                onUnpair = { trustStore.remove(it) },
+                // A peer that just handshook with us is reachable: retry its unpair.
+                onPeerReachable = { fp -> onPeerReachable(fp.take(16)) },
+                shares = ShareServer(shareSource, diag = { diagnostics.record(it) }).also { shareServer = it },
+                snippets = snippets,
+                onSnippetsChanged = { _receivedText.value = snippets.list() },
+                diagnostics = diagnostics,
+            )
+            val port = try {
+                srv.start(id, preferredPort = SettingsHolder.settings.value.preferredPort) { boundPort -> hello(id, boundPort) }
+            } catch (_: Exception) {
+                synchronized(startLock) { if (startGeneration == generation) binding = false }
+                return@launch
+            }
+            // The listener is user-owned: install it only when this is still the
+            // current start (a stop, or Apply's restart, bumps the generation).
+            synchronized(startLock) {
+                if (startGeneration != generation) {
+                    srv.stop()
+                    return@launch
+                }
+                binding = false
+                server = srv
+                // The port is user-owned: a value the person set is never
+                // overwritten (not even with the port actually bound, and not
+                // with a temporary fallback). Only an unset value is filled, so a
+                // paired desktop's stored address stays valid. A temporary port
+                // is never persisted, so the next start tries the configured one.
+                val configured = SettingsHolder.settings.value.preferredPort
+                val persisted = PeerPort.toPersist(configured, port, srv.temporaryPort)
+                if (persisted != configured) {
+                    SettingsHolder.update { it.copy(preferredPort = persisted) }
+                }
+                _portStatus.value = PeerPortStatus(
+                    boundPort = port,
+                    configuredPort = configured,
+                    temporary = srv.temporaryPort,
+                    holder = srv.portConflict?.holder,
+                )
+                srv.portConflict?.let {
+                    diagnostics.record("[discovery] peer-server started port=$port temporary=true configured=${it.configuredPort}")
+                }
+                diagnostics.record("[discovery] peer-server started port=$port")
+                advertiser = NsdAdvertiser(app, diag = { msg, level -> diagnostics.record(msg, level) })
+                    .also { it.start(id.deviceId.take(16), txt(id, port), port, trigger = "lifecycle") }
+            }
         }
-        diagnostics.record("[discovery] peer-server started port=$port")
-        advertiser = NsdAdvertiser(app, diag = { msg, level -> diagnostics.record(msg, level) })
-            .also { it.start(id.deviceId.take(16), txt(id, port), port, trigger = "lifecycle") }
+    }
+
+    /**
+     * Re-binds the listener at the currently configured port and re-announces
+     * over mDNS and hello. Settings' Apply calls this after persisting the new
+     * value, so the change takes effect without a restart. Safe when the server
+     * is not running (the app is backgrounded): it stays stopped.
+     */
+    fun applyPreferredPort(context: Context) {
+        val running = synchronized(startLock) { server != null || binding }
+        if (!running) return
+        diagnostics.record("[discovery] peer-server re-binding after port change")
+        stop()
+        start(context)
     }
 
     /**
@@ -469,11 +557,18 @@ object PeerService {
     }
 
     fun stop() {
+        // Invalidate any in-flight bind so a slow (retrying) start cannot install
+        // a listener after this stop.
+        synchronized(startLock) {
+            startGeneration++
+            binding = false
+        }
         lifetimePolicy.foreground()
         server?.stop()
         server = null
         advertiser?.stop()
         advertiser = null
+        _portStatus.value = null
         // A push cannot continue without the server; fail any still-running
         // receive now rather than leave it Running until the next launch.
         TransferManager.failPushReceives("Interrupted")
@@ -495,6 +590,11 @@ object PeerService {
 
     fun answerApproval(accepted: Boolean) {
         val waiter = synchronized(approvalLock) { approvalWaiter }
+        waiter?.complete(accepted)
+    }
+
+    fun answerBrowseApproval(accepted: Boolean) {
+        val waiter = synchronized(browseLock) { browseWaiter }
         waiter?.complete(accepted)
     }
 
@@ -562,6 +662,30 @@ object PeerService {
         if (accepted) ApprovalOutcome.ACCEPTED else ApprovalOutcome.DECLINED
     }
 
+    /**
+     * Asks the person once per browse session before a paired peer may browse
+     * the shares (G2). An unanswered prompt times out after
+     * [BROWSE_APPROVAL_TIMEOUT_MS] and counts as a denial, so a browse is never
+     * left hanging. Shares the one-prompt-at-a-time gate with [pushApproval].
+     */
+    private val browseAsk = BrowseApproval { _, name ->
+        val waiter = CompletableDeferred<Boolean>()
+        synchronized(browseLock) {
+            if (browseWaiter != null || approvalWaiter != null || sessionStore.pending().isNotEmpty()) {
+                return@BrowseApproval ApprovalOutcome.BUSY
+            }
+            if (server == null) return@BrowseApproval ApprovalOutcome.UNAVAILABLE
+            browseWaiter = waiter
+            _browseApproval.value = BrowseApprovalRequest(UUID.randomUUID().toString(), Display.safeName(name))
+        }
+        val accepted = runBlocking { withTimeoutOrNull(BROWSE_APPROVAL_TIMEOUT_MS) { waiter.await() } } ?: false
+        synchronized(browseLock) {
+            browseWaiter = null
+            _browseApproval.value = null
+        }
+        if (accepted) ApprovalOutcome.ACCEPTED else ApprovalOutcome.DECLINED
+    }
+
     fun addFolderShare(label: String, uri: android.net.Uri) {
         shareSource.addFolder(label, uri)
         _shares.value = shareStore.list()
@@ -586,6 +710,9 @@ object PeerService {
         // offer instead of guessing (and tripping a 413). See PushProtocol.
         addProperty("max_offer_bytes", PushProtocol.MAX_OFFER_BODY_BYTES)
         addProperty("max_offer_files", PushProtocol.MAX_OFFER_FILES)
+        // G1: advertise tri-state permission support so a new peer sends
+        // `*_mode` fields; an older peer ignores this and stays on booleans.
+        add("caps", com.google.gson.JsonArray().apply { add(Permission.CAPABILITY) })
     }
 
     private fun txt(id: Identity, port: Int): Map<String, String> = mapOf(

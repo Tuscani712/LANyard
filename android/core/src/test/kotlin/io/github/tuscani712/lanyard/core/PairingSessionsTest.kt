@@ -32,7 +32,8 @@ class PairingSessionsTest {
         assertEquals(PairingSessions.STATUS_ACTIVE, active.status)
         val stored = trust.find(peer)
         assertNotNull(stored)
-        assertTrue(stored!!.browse && stored.push)
+        assertEquals(Permission.ALLOW, stored!!.browse)
+        assertEquals(Permission.ALLOW, stored.push)
     }
 
     @Test
@@ -47,8 +48,9 @@ class PairingSessionsTest {
         assertTrue(s.accept(v.id, Permissions(browse = true, push = false)))
         s.confirm(v.id, peer)
         val stored = trust.find(peer)!!
-        assertTrue(stored.browse, "browse must be granted")
-        assertFalse(stored.push, "push must stay off when the person did not choose it")
+        assertEquals(Permission.ALLOW, stored.browse, "browse must be granted")
+        // The person left push unchecked: the new default is Ask, not off.
+        assertEquals(Permission.ASK, stored.push, "an unchecked push becomes Ask")
         assertEquals(0L, stored.pushMaxBytes, "no push limit when push is not granted")
         assertEquals(0L, stored.askOver, "no ask-over when push is not granted")
     }
@@ -64,7 +66,8 @@ class PairingSessionsTest {
         assertTrue(s.accept(v.id, Permissions(browse = true, push = true)))
         s.confirm(v.id, peer)
         val stored = trust.find(peer)!!
-        assertTrue(stored.browse && stored.push)
+        assertEquals(Permission.ALLOW, stored.browse)
+        assertEquals(Permission.ALLOW, stored.push)
         assertEquals(8192L, stored.pushMaxBytes)
         assertEquals(2048L, stored.askOver)
     }
@@ -78,8 +81,8 @@ class PairingSessionsTest {
         s.accept(v.id, Permissions(browse = true, push = true))
         s.confirm(v.id, peer)
         val stored = trust.find(peer)!!
-        assertTrue(stored.browse)
-        assertFalse(stored.push, "push must not be granted beyond the request")
+        assertEquals(Permission.ALLOW, stored.browse)
+        assertEquals(Permission.NEVER, stored.push, "push must not be granted beyond the request")
     }
 
     @Test

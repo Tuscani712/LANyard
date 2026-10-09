@@ -27,15 +27,28 @@ class PeerErrorsTest {
     }
 
     @Test
-    fun permissionAndGeneric403sNeverAutoUnpairButReadAsNotPaired() {
-        // Permission refusals are the dangerous ones: the phone can deny pull or
-        // push without unparing, so none of these may trigger a local removal.
-        val displayOnly = listOf("not permitted", "push not permitted", "pull not permitted", "forbidden")
-        for (body in displayOnly) {
+    fun permissionAndGeneric403sNeverAutoUnpairAndHaveTheirOwnWording() {
+        // G3: each exact refusal maps to its own line and never to "Not paired".
+        // None may trigger a local removal (the phone can deny pull/push without
+        // unparing).
+        val expected = mapOf(
+            "push not permitted" to PeerErrors.PUSH_NOT_PERMITTED,
+            "pull not permitted" to PeerErrors.PULL_NOT_PERMITTED,
+            "text not permitted" to PeerErrors.TEXT_NOT_PERMITTED,
+            "not permitted" to PeerErrors.NOT_PERMITTED,
+            "denied by the user" to PeerErrors.DENIED_BY_USER,
+        )
+        for ((body, message) in expected) {
             val e = PeerStatusException(403, """{"error":"$body"}""")
             assertFalse(PeerErrors.isNotPaired(e), "body=$body must leave the pairing intact")
-            assertEquals(PeerErrors.NOT_PAIRED, PeerErrors.userMessage(e), "body=$body")
+            assertEquals(message, PeerErrors.userMessage(e), "body=$body")
+            assertFalse(PeerErrors.userMessage(e).contains("Not paired"), "body=$body must not read as Not paired")
         }
+        // An unknown 403 word ("forbidden") keeps its own text rather than
+        // masquerading as an unpair.
+        val forbidden = PeerStatusException(403, """{"error":"forbidden"}""")
+        assertFalse(PeerErrors.isNotPaired(forbidden))
+        assertEquals("forbidden", PeerErrors.userMessage(forbidden))
         // An empty body is a generic refusal, never an unpair.
         val empty = PeerStatusException(403, "")
         assertFalse(PeerErrors.isNotPaired(empty), "an empty 403 body must leave the pairing intact")
@@ -50,7 +63,28 @@ class PeerErrorsTest {
     fun plainTextPermission403IsNotAnUnpair() {
         val e = PeerStatusException(403, "pull not permitted")
         assertFalse(PeerErrors.isNotPaired(e), "a raw permission refusal must leave the pairing intact")
-        assertEquals(PeerErrors.NOT_PAIRED, PeerErrors.userMessage(e))
+        assertEquals(PeerErrors.PULL_NOT_PERMITTED, PeerErrors.userMessage(e))
+    }
+
+    @Test
+    fun textNotPermittedHasItsOwnWordingAndIsNotAnUnpair() {
+        val e = PeerStatusException(403, """{"error":"text not permitted"}""")
+        assertFalse(PeerErrors.isNotPaired(e), "a text refusal must leave the pairing intact")
+        assertEquals(PeerErrors.TEXT_NOT_PERMITTED, PeerErrors.userMessage(e))
+        assertFalse(PeerErrors.userMessage(e).contains("Not paired"))
+    }
+
+    @Test
+    fun everyPermissionRefusalNeverReadsAsNotPaired() {
+        // The strict auto-unpair predicate is exact: no permission refusal body
+        // (in any casing/whitespace) may ever fire it.
+        for (body in listOf(
+            "push not permitted", "pull not permitted", "text not permitted", "not permitted",
+            "denied by the user", "the transfer was declined", "the message was declined",
+        )) {
+            val e = PeerStatusException(403, """{"error":"$body"}""")
+            assertFalse(PeerErrors.isNotPaired(e), "body=$body")
+        }
     }
 
     @Test

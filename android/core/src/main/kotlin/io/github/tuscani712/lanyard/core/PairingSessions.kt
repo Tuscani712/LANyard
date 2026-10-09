@@ -26,6 +26,9 @@ data class SessionView(
     val granted: Permissions,
     val sas: String,
     val error: String = "",
+    // Whether the initiator negotiated tri-state permissions (G1); when false,
+    // the status poll must not carry `*_mode` fields.
+    val triAware: Boolean = false,
 )
 
 /** One incoming pairing request, as the phone's dialog shows it. */
@@ -97,6 +100,7 @@ class PairingSessions(
         val selfNonce: String,
         val peerNonce: String,
         val requested: Permissions,
+        val triAware: Boolean,
         val viaQr: Boolean,
         var status: String,
         var granted: Permissions,
@@ -172,6 +176,8 @@ class PairingSessions(
             selfNonce = randomHex(16),
             peerNonce = peerNonce,
             requested = requested,
+            // A request that carried any mode field proves the caller is tri-aware.
+            triAware = requested.browseMode != null || requested.pushMode != null || requested.textMode != null,
             viaQr = viaQr,
             status = STATUS_PENDING,
             granted = Permissions(),
@@ -202,16 +208,32 @@ class PairingSessions(
     fun accept(id: String, granted: Permissions): Boolean {
         val sess = sessions[id] ?: return false
         if (sess.status != STATUS_PENDING) return false
-        val push = granted.push && sess.requested.push
+        // G1: an old caller gets booleans only, where an Ask (which it cannot
+        // answer) degrades to deny. The tri-state modes are always kept
+        // internally; only a tri-aware caller ever has them put on the wire.
+        val triAware = sess.triAware
+        val wantBrowse = granted.browseMode ?: Permission.fromStoredBool(granted.browse)
+        val wantPush = granted.pushMode ?: Permission.fromStoredBool(granted.push)
+        val wantText = granted.textMode ?: Permission.fromStoredBool(granted.text)
+        // A grant may only narrow what the peer asked for: no request, no grant.
+        val browseMode = if (sess.requested.browse) wantBrowse else Permission.NEVER
+        val pushMode = if (sess.requested.push) wantPush else Permission.NEVER
+        val textMode = if (sess.requested.push) wantText else Permission.NEVER
+        fun bool(m: Permission) = if (triAware) m.permits else m == Permission.ALLOW
+        val push = bool(pushMode)
         sess.granted = Permissions(
-            browse = granted.browse && sess.requested.browse,
+            browse = bool(browseMode),
             push = push,
             pushMaxBytes = if (push) sess.requested.pushMaxBytes else 0,
             askOver = if (push) sess.requested.askOver else 0,
+            text = bool(textMode),
+            browseMode = browseMode,
+            pushMode = pushMode,
+            textMode = textMode,
         )
         sess.status = STATUS_ACCEPTED
         sess.updatedAt = clock()
-        diag("[pairing] peer=${Display.shortFp(sess.peerFp)} accepted id=$id granted=browse:${sess.granted.browse},push:${sess.granted.push}")
+        diag("[pairing] peer=${Display.shortFp(sess.peerFp)} accepted id=$id granted=browse:${sess.granted.browseMode ?: sess.granted.browse},push:${sess.granted.pushMode ?: sess.granted.push}")
         onChange()
         return true
     }
@@ -250,8 +272,12 @@ class PairingSessions(
                     name = sess.peerName.ifEmpty { Display.groupedHex(sess.peerFp) },
                     host = sess.peerHost,
                     port = 0,
-                    browse = sess.granted.browse,
-                    push = sess.granted.push,
+                    // The tri-state grant: prefer the negotiated mode, else the
+                    // legacy boolean with the store migration (true -> ALLOW,
+                    // false -> ASK).
+                    browse = sess.granted.browseMode ?: Permission.fromStoredBool(sess.granted.browse),
+                    push = sess.granted.pushMode ?: Permission.fromStoredBool(sess.granted.push),
+                    text = sess.granted.textMode ?: Permission.fromStoredBool(sess.granted.text),
                     pairedAt = clock(),
                     pushMaxBytes = sess.granted.pushMaxBytes,
                     askOver = sess.granted.askOver,
@@ -326,6 +352,7 @@ class PairingSessions(
         granted = sess.granted,
         sas = sas(sess),
         error = sess.error,
+        triAware = sess.triAware,
     )
 
     /** The SAS is only meaningful once the peer's nonce is known. */

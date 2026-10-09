@@ -88,8 +88,8 @@ class PeerClientNotPairedTest {
                     PeerClient("127.0.0.1", server.port, client, server.identity.deviceId).listShares()
                 }.exceptionOrNull()
                 check(ex is PeerStatusException && ex.code == 403) { "expected a 403, got $ex" }
-                // The wording is generic for display, but the pairing is untouched.
-                assertEquals(PeerErrors.NOT_PAIRED, PeerErrors.userMessage(ex))
+                // G3: a pull refusal reads as its own line, never "Not paired".
+                assertEquals(PeerErrors.PULL_NOT_PERMITTED, PeerErrors.userMessage(ex))
                 assertNull(notified, "a pull-permission refusal must not remove the pairing")
             } finally {
                 PeerClient.onNotPaired = previous
