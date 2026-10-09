@@ -1682,6 +1682,8 @@ function renderSettingsLogs(pane, s) {
 }
 function renderSettingsAbout(pane, s) {
   pane.appendChild(settingsField("Running version", el("div", "muted", s.version || "")));
+  pane.appendChild(settingsField("License", el("div", "muted", "AGPL-3.0 (GNU Affero General Public License v3.0)")));
+  pane.appendChild(settingsField("Source code", el("div", "muted", "https://github.com/Tuscani712/LANyard")));
   // Updates. The whole block is hidden until a release channel is configured
   // (the compiled default has none), so no update control is ever offered that
   // could make the app contact the internet by itself.
