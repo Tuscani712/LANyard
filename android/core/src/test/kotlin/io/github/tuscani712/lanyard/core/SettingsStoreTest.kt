@@ -89,7 +89,8 @@ class SettingsStoreTest {
     fun formatsSpeedPerUnit() {
         assertEquals("1.0 MB/s", formatSpeed(1_048_576.0, SpeedUnit.MBps))
         assertEquals("8.0 Mbps", formatSpeed(1_000_000.0, SpeedUnit.Mbps))
-        assertEquals("0.0 MB/s", formatSpeed(0.0, SpeedUnit.MBps))
+        // A zero/unknown rate is shown in bytes, never as a misleading "0.0 MB/s".
+        assertEquals("0 B/s", formatSpeed(0.0, SpeedUnit.MBps))
     }
 
     @Test

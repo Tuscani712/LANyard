@@ -40,15 +40,20 @@ data class TransferRecord(
     // filesystem path), for the "Open folder" action. Null when the destination
     // has no location (or for sends), so the action is simply left off.
     val destinationUri: String? = null,
-    // How many files a Preparing row covers (the picked selection), so the device
-    // screen can say "Preparing N file(s)" for a batch. 0 when not known.
+    // The total number of files this row covers (the picked selection for a
+    // send, the offer's file list for a receive), so the device screen can say
+    // "Preparing N file(s)" for a batch and Finishing can be judged per push.
+    // 0 when not known.
     val fileCount: Int = 0,
-    // Set while a live row is in its final window: every byte has arrived
-    // (receive) or been written (send), but the transfer is still hashing,
-    // copying the spool into the destination, or waiting for the receiver's
-    // confirmation. Non-null means "Finishing…"; the value is the size in
-    // bytes being finalized, shown next to the label. Always cleared when the
-    // row ends (Done/Failed/Cancelled), on cancel, and on any fresh byte.
+    // How many of [fileCount] files have fully arrived (receive) or been written
+    // and acknowledged (send). Drives the push-level Finishing window.
+    val filesDone: Int = 0,
+    // Set while a live row is in its final window: every file of the push has
+    // arrived/written, but the transfer is still hashing, copying the spool into
+    // the destination, or waiting for the receiver's confirmation. Non-null
+    // means "Finishing…"; the value is the size in bytes being finalized, shown
+    // next to the label. Always cleared when the row ends
+    // (Done/Failed/Cancelled), on cancel, and on any fresh byte.
     val finishingBytes: Long? = null,
 ) {
     /** True while this row is in its "Finishing…" window (set, not yet ended). */
@@ -114,15 +119,23 @@ class TransferBoard(
     }
 
     /**
-     * Enters the "Finishing…" window for a live row: all bytes have arrived or
-     * been written, and the row is now hashing, copying the spool into the
-     * destination, or waiting for the receiver's confirmation. [bytes] is the
-     * size being finalized, shown next to the label. Null (and a no-op) when the
-     * row is absent or already finished, so a late callback cannot revive a row.
+     * Records that [completedFiles] of a push's [fileCount] files are fully
+     * done, and opens the "Finishing…" window only once the whole push is done.
+     *
+     * Finishing is deliberately push-level: the receive path reports each file
+     * as it arrives, so a single tiny file finishing must never flip a
+     * multi-file row to "Finishing…" while the rest are still streaming. The
+     * window opens only when the last file is done; [bytes] is the size shown
+     * next to the label. Null (and a no-op) when the row is absent or already
+     * finished, so a late callback cannot revive a row.
      */
-    fun markFinishing(id: String, bytes: Long): TransferRecord? {
+    fun markFinishing(id: String, completedFiles: Int, fileCount: Int, bytes: Long): TransferRecord? {
         val row = records.firstOrNull { it.id == id } ?: return null
         if (row.state != TransferState.Running && row.state != TransferState.Queued) return null
+        val total = if (fileCount > 0) fileCount else row.fileCount
+        val done = maxOf(row.filesDone, completedFiles)
+        update(id) { it.copy(filesDone = done) }
+        if (total <= 0 || done < total) return row
         update(id) { it.copy(finishingBytes = bytes) }
         return row
     }

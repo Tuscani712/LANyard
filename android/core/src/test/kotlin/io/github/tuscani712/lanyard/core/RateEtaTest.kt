@@ -1,6 +1,7 @@
 package io.github.tuscani712.lanyard.core
 
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -86,5 +87,54 @@ class RateEtaTest {
             t += 100
         }
         assertTrue(changes <= 6, "the shown text changed $changes times over 5 s (must be ~1/s)")
+    }
+
+    @Test
+    fun byteRateScalesItsUnitSoAMovingTransferNeverShowsZeroMbPerSecond() {
+        // Sub-1 KB/s must read in bytes, not as "0.0 MB/s".
+        assertEquals("500 B/s", formatSpeed(500.0, SpeedUnit.MBps))
+        assertEquals("1023 B/s", formatSpeed(1023.0, SpeedUnit.MBps))
+        // The KB/s boundary.
+        assertEquals("1.0 KB/s", formatSpeed(1_024.0, SpeedUnit.MBps))
+        assertEquals("1.5 KB/s", formatSpeed(1_536.0, SpeedUnit.MBps))
+        assertEquals("1024.0 KB/s", formatSpeed(1_048_575.0, SpeedUnit.MBps))
+        // The MB/s boundary.
+        assertEquals("1.0 MB/s", formatSpeed(1_048_576.0, SpeedUnit.MBps))
+        assertEquals("5.0 MB/s", formatSpeed(5.0 * 1_048_576.0, SpeedUnit.MBps))
+        assertFalse(
+            formatSpeed(50_000.0, SpeedUnit.MBps).startsWith("0.0"),
+            "a live 50 KB/s transfer must never read as 0.0 MB/s",
+        )
+    }
+
+    @Test
+    fun bitRateScalesItsUnitToo() {
+        assertEquals("800 bps", formatSpeed(100.0, SpeedUnit.Mbps))
+        assertEquals("1.0 Mbps", formatSpeed(125_000.0, SpeedUnit.Mbps))
+        assertEquals("100.0 Mbps", formatSpeed(12_500_000.0, SpeedUnit.Mbps))
+    }
+
+    @Test
+    fun etaIsTheWorseOfTheByteAndFileEstimates() {
+        // Byte rate says 10 s; file rate says 30 s: the transfer cannot beat the
+        // slower of the two, so the max is shown.
+        assertEquals(
+            30L,
+            estimateCombinedEtaSeconds(remainingBytes = 10, bytesPerSecond = 1.0, remainingFiles = 30, filesPerSecond = 1.0),
+        )
+        // Only one side has an honest rate: use it.
+        assertEquals(30L, estimateCombinedEtaSeconds(10, 0.0, 30, 1.0))
+        assertEquals(10L, estimateCombinedEtaSeconds(10, 1.0, 0, 0.0))
+        // Neither: stay blank rather than invent a number.
+        assertNull(estimateCombinedEtaSeconds(10, 0.0, 30, 0.0))
+        assertNull(estimateCombinedEtaSeconds(0, 1.0, 0, 1.0), "a finished transfer has no ETA")
+    }
+
+    @Test
+    fun fileRateMeterTracksFilesPerSecond() {
+        val meter = FileRateMeter(windowMillis = 3_000)
+        assertNull(meter.sample(0, 0), "the first file sample has no elapsed time")
+        assertEquals(2.0, meter.sample(1_000, 2) ?: error("expected a file rate"), 1e-9)
+        assertEquals(2.0, meter.sample(2_000, 4) ?: error("expected a file rate"), 1e-9)
     }
 }

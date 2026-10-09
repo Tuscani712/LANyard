@@ -171,6 +171,31 @@ class PeerClient(
     }
 
     /**
+     * Asks the receiver to cancel the push [pushId] because this side cancelled
+     * it. Best-effort with a short timeout, so a slow or wedged peer cannot hold
+     * up our teardown. Returns true when the receiver acknowledged the cancel;
+     * false when it has no such route (an older peer answers 404) or the id is
+     * already gone (404). Any other status is an error the caller may ignore.
+     */
+    fun pushCancel(pushId: String, timeoutMillis: Int = 2_000): Boolean {
+        val conn = open("POST", "/push/${encode(pushId)}/cancel", "{}".toByteArray(), emptyMap())
+        conn.connectTimeout = timeoutMillis
+        conn.readTimeout = timeoutMillis
+        val status = conn.responseCode
+        // A peer that closes the connection right after its status line can make
+        // reading the (error) body throw; the status is all we need.
+        val text = runCatching {
+            (if (status in 200..299) conn.inputStream else conn.errorStream)
+                ?.bufferedReader()?.use { it.readText() } ?: ""
+        }.getOrDefault("")
+        return when {
+            status in 200..299 -> true
+            status == 404 -> false
+            else -> throw PeerStatusException(status, text)
+        }
+    }
+
+    /**
      * Streams one file's remaining bytes to the peer's inbox, hashing the whole
      * file as it goes. The body is read with a fixed buffer, so a whole file is
      * never held in memory. [onBytes] reports bytes written (after [offset]).

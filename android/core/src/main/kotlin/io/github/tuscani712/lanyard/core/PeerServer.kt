@@ -510,6 +510,8 @@ class PeerServer(
             head.method == "POST" && path == "/api/v1/snippet" -> handleSnippet(body, fp, peer)
             path.startsWith("/api/v1/push/") && path.endsWith("/complete") ->
                 handlePushComplete(body, fp, peer, path)
+            path.startsWith("/api/v1/push/") && path.endsWith("/cancel") ->
+                handlePushCancel(fp, peer, path)
             else -> 404 to errorJson("not found")
         }
     }
@@ -600,6 +602,28 @@ class PeerServer(
         val sha = json.str("sha256")
         val st = receiver.complete(id, fp, rel, sha)
         return 200 to """{"rel_path":${jsonStr(st.relPath)},"done":true}"""
+    }
+
+    /**
+     * A sender ended an outgoing push and asks us to free its spool. Paired peer
+     * with push permission, and only the peer that owns the push may cancel it.
+     *
+     * Idempotent and harmless: a known id the caller owns ends the push as
+     * Cancelled with the sender's reason ("Cancelled by the sender"), leaving
+     * Finishing/Receiving at once. A repeat request, an id we never saw, or one
+     * already finished is answered `200` so an older/newer sender can retry
+     * without error; an id owned by a *different* peer is refused `403`.
+     */
+    private fun handlePushCancel(fp: String, peer: PairedPeer?, path: String): Pair<Int, String> {
+        requirePush(fp, peer)
+        val id = idBetween(path, "/api/v1/push/", "/cancel")
+        val owner = receiver.ownerFingerprint(id)
+        if (owner != null && !owner.equals(fp, ignoreCase = true)) {
+            diag("[push] peer=${fp.take(8)} cancel refused owner-mismatch id=$id")
+            throw PeerHttpException(403, "not your push")
+        }
+        receiver.cancelBySender(id, fp)
+        return 200 to """{"cancelled":true}"""
     }
 
     private fun handleFileBody(

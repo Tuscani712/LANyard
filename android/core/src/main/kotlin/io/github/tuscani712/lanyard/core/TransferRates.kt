@@ -37,6 +37,54 @@ fun estimateEtaSeconds(remainingBytes: Long, bytesPerSecond: Double): Long? {
 }
 
 /**
+ * The honest ETA for a multi-file transfer: the larger of the byte-based
+ * estimate and the file-based estimate.
+ *
+ * A transfer can be "fast on bytes" (a few large files) yet still have many
+ * tiny files to open, hash and place; or byte-slow but file-quick. Taking the
+ * max of the two keeps the estimate from under-promising either way. Either
+ * side may be null (no honest rate yet); the other is then used, and both null
+ * yields null so the UI stays blank rather than inventing a number.
+ */
+fun estimateCombinedEtaSeconds(
+    remainingBytes: Long,
+    bytesPerSecond: Double,
+    remainingFiles: Long,
+    filesPerSecond: Double,
+): Long? {
+    val byteEta = estimateEtaSeconds(remainingBytes, bytesPerSecond)
+    val fileEta = estimateEtaSeconds(remainingFiles, filesPerSecond)
+    return when {
+        byteEta == null -> fileEta
+        fileEta == null -> byteEta
+        else -> maxOf(byteEta, fileEta)
+    }
+}
+
+/**
+ * A rolling files-per-second estimate, mirroring [SpeedMeter] but sampling a
+ * cumulative count of completed files instead of bytes. [SpeedMeter] already
+ * implements the window/reset/stall semantics we need, so this is a thin,
+ * separately-documented wrapper: the two rates stay independent, so a byte
+ * stall (which blanks the byte rate) need not blank a file-count ETA that is
+ * still meaningful.
+ */
+class FileRateMeter(
+    windowMillis: Long = TransferTuning.WINDOW_MS,
+    stallAfterMillis: Long = TransferTuning.STALL_AFTER_MS,
+) {
+    private val meter = SpeedMeter(windowMillis = windowMillis, stallAfterMillis = stallAfterMillis)
+
+    /** See [SpeedMeter.sample]; [cumulativeFiles] is the count of finished files. */
+    @Synchronized
+    fun sample(nowMillis: Long, cumulativeFiles: Long): Double? = meter.sample(nowMillis, cumulativeFiles)
+
+    /** Forgets every sample; the next [sample] behaves like a fresh start. */
+    @Synchronized
+    fun reset() = meter.reset()
+}
+
+/**
  * A compact remaining-time string: `45s`, `2m 14s`, or `1h 2m` (seconds are
  * dropped once an hour is on the clock).
  */
@@ -97,6 +145,7 @@ class RateEtaDisplay(
     private val refreshMillis: Long = TransferTuning.DISPLAY_REFRESH_MS,
 ) {
     private val meter = SpeedMeter(windowMillis = windowMillis, stallAfterMillis = windowMillis)
+    private val fileMeter = FileRateMeter(windowMillis = windowMillis, stallAfterMillis = windowMillis)
     private var shownAt: Long? = null
     private var snapshot = Snapshot(0.0, null)
 
@@ -104,16 +153,26 @@ class RateEtaDisplay(
      * Feeds one progress callback. The meter is sampled every call; the returned
      * [Snapshot] only changes when at least [refreshMillis] have passed, so a
      * caller that renders it redraws at most ~once a second.
+     *
+     * [doneFiles]/[totalFiles] are optional (0 means "unknown"): when known, a
+     * second rolling files-per-second rate feeds a file-based ETA, and the shown
+     * ETA is the larger of the byte-based and file-based estimates.
      */
     @Synchronized
-    fun sample(nowMillis: Long, done: Long, total: Long): Snapshot {
+    fun sample(nowMillis: Long, done: Long, total: Long, doneFiles: Int = 0, totalFiles: Int = 0): Snapshot {
         val rate = meter.sample(nowMillis, done)
+        val fileRate = if (totalFiles > 0) fileMeter.sample(nowMillis, doneFiles.toLong()) else null
         val due = shownAt?.let { nowMillis - it >= refreshMillis } ?: true
         if (due) {
             shownAt = nowMillis
             snapshot = Snapshot(
                 bytesPerSecond = rate ?: 0.0,
-                etaSeconds = estimateEtaSeconds((total - done).coerceAtLeast(0L), rate ?: 0.0),
+                etaSeconds = estimateCombinedEtaSeconds(
+                    remainingBytes = (total - done).coerceAtLeast(0L),
+                    bytesPerSecond = rate ?: 0.0,
+                    remainingFiles = (totalFiles - doneFiles).coerceAtLeast(0).toLong(),
+                    filesPerSecond = fileRate ?: 0.0,
+                ),
             )
         }
         return snapshot
@@ -123,6 +182,7 @@ class RateEtaDisplay(
     @Synchronized
     fun reset() {
         meter.reset()
+        fileMeter.reset()
         shownAt = null
         snapshot = Snapshot(0.0, null)
     }

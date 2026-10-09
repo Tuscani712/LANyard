@@ -545,7 +545,12 @@ object TransferManager {
             publish()
             persist()
         } else {
-            add(TransferRecord(id, "send", peer.name, peer.fingerprint, label, total, 0, TransferState.Queued, null, 0.0, now()))
+            add(
+                TransferRecord(
+                    id, "send", peer.name, peer.fingerprint, label, total, 0, TransferState.Queued, null, 0.0, now(),
+                    fileCount = sources.size,
+                ),
+            )
         }
         TransferService.start(app)
         val throttle = throttle()
@@ -590,7 +595,7 @@ object TransferManager {
     // like any other transfer. A receive left Running when the app restarts is
     // turned into a Failed "Interrupted" row by loadHistory().
 
-    fun noteReceiveStarted(id: String, peerName: String, peerFp: String, label: String, total: Long) {
+    fun noteReceiveStarted(id: String, peerName: String, peerFp: String, label: String, total: Long, files: Int) {
         if (board.firstOrNull(id) != null) return
         // A fresh push from this peer supersedes any row still waiting to resume
         // for it: the peer is retrying, so the old interrupted row is stale. Its
@@ -606,30 +611,35 @@ object TransferManager {
                 interrupted?.remove(it.id)
             }
         pushReceives.add(id)
-        add(TransferRecord(id, "receive", peerName, peerFp, label, total, 0, TransferState.Running, null, 0.0, now()))
+        add(
+            TransferRecord(
+                id, "receive", peerName, peerFp, label, total, 0, TransferState.Running, null, 0.0, now(),
+                fileCount = files,
+            ),
+        )
         // An incoming push has no enqueue* call, so start the foreground service
         // here too: the ongoing notification mirrors its progress and keeps it
         // alive; the service stops itself once nothing is running or queued.
         TransferService.start(app)
     }
 
-    fun noteReceiveProgress(id: String, done: Long, total: Long) {
+    fun noteReceiveProgress(id: String, done: Long, total: Long, filesDone: Int = 0, filesTotal: Int = 0) {
         if (!board.isLive(id)) return
-        val snap = sampleRate(id, done, total)
+        val snap = sampleRate(id, done, total, filesDone, filesTotal)
         board.progress(id, done, total, snap.bytesPerSecond, snap.etaSeconds)
         publishProgress()
     }
 
     /**
-     * Enters the "Finishing…" window for a live row: every byte has arrived
-     * (receive) or been written (send), and the row is now hashing, copying the
-     * spool into the destination, or waiting for the receiver's confirmation.
-     * [bytes] is the size being finalized. Published immediately (not throttled)
-     * so the state appears as soon as the last byte lands, and cleared by the
-     * next [noteReceiveProgress] byte or when the row ends.
+     * Enters the "Finishing…" window for a live row, but only once the whole
+     * push is done: [completedFiles] of [fileCount] have all their bytes in.
+     * The board ignores a per-file callback while other files still stream.
+     * Published immediately (not throttled) so the state appears as soon as the
+     * last file's bytes land, and cleared by the next [noteReceiveProgress] byte
+     * or when the row ends.
      */
-    fun noteFinishing(id: String, bytes: Long) {
-        if (board.markFinishing(id, bytes) == null) return
+    fun noteFinishing(id: String, completedFiles: Int, fileCount: Int, bytes: Long) {
+        if (board.markFinishing(id, completedFiles, fileCount, bytes) == null) return
         publish()
     }
 
@@ -637,6 +647,17 @@ object TransferManager {
         pushReceives.remove(id)
         if (!board.isLive(id)) return
         end(id, TransferState.Done, message, folder, folderUri)
+    }
+
+    /**
+     * Ends a receive as Cancelled because the sender cancelled it. Distinct from
+     * [noteReceiveFailed]: the transfer was not a failure, so the row reads
+     * Cancelled with the sender's reason and leaves Finishing/Receiving at once.
+     */
+    fun noteReceiveCancelled(id: String, reason: String) {
+        pushReceives.remove(id)
+        if (!board.isLive(id)) return
+        end(id, TransferState.Cancelled, reason)
     }
 
     /** Marks a push this phone abandoned (declined or cut off) as failed. */
@@ -753,7 +774,7 @@ object TransferManager {
                             publishProgress()
                         }
                     },
-                    onFinishing = { _, bytes -> noteFinishing(id, bytes) },
+                    onFinishing = { completed, files, bytes -> noteFinishing(id, completed, files, bytes) },
                     isCancelled = { cancel.get() },
                 )
             } catch (e: Exception) {
@@ -977,8 +998,8 @@ object TransferManager {
      * yields 0.0 / null, so the row and notification go blank rather than
      * flashing a spike; the ETA always comes from that same smoothed rate.
      */
-    private fun sampleRate(id: String, done: Long, total: Long): RateEtaDisplay.Snapshot =
-        rateDisplays.getOrPut(id) { RateEtaDisplay() }.sample(now(), done, total)
+    private fun sampleRate(id: String, done: Long, total: Long, filesDone: Int = 0, filesTotal: Int = 0): RateEtaDisplay.Snapshot =
+        rateDisplays.getOrPut(id) { RateEtaDisplay() }.sample(now(), done, total, filesDone, filesTotal)
 
     private fun newId(): String {
         val buf = ByteArray(6)

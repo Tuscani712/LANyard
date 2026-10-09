@@ -57,12 +57,13 @@ class PushSession(
     fun push(
         sources: List<PushSource>,
         onProgress: (fileIndex: Int, sent: Long, fileTotal: Long) -> Unit = { _, _, _ -> },
-        // Fired after every byte of a file is on the wire but before the
+        // Fired once, when the LAST file's bytes are on the wire but before the
         // receiver's complete response is read: the file is still being hashed
-        // and placed there. Progress stays capped below 100% until that response
-        // (see [SendProgress]), so without this the row would sit silently at the
-        // cap. [bytes] is the file's full size being confirmed.
-        onFinishing: (fileIndex: Int, bytes: Long) -> Unit = { _, _ -> },
+        // and placed there. Push-level, not per file, so one small file cannot
+        // flip a multi-file row to Finishing while the rest still stream.
+        // [completed]/[files] are the push's file counts; [bytes] is the last
+        // file's size.
+        onFinishing: (completed: Int, files: Int, bytes: Long) -> Unit = { _, _, _ -> },
         isCancelled: () -> Boolean = { false },
     ): PushResult {
         if (sources.isEmpty()) return PushResult.Failed("nothing to send")
@@ -76,9 +77,21 @@ class PushSession(
 
         var overall = 0L
         var sentFiles = 0
+        // The push_id of the batch currently in flight, so a local cancel can
+        // tell the receiver to free its spool before we tear the connection down.
+        var activePushId: String? = null
+
+        // Best-effort: a local cancel propagates to the receiver; an older peer
+        // without the route answers 404, which is ignored. Never let the notify
+        // itself fail the cancellation.
+        fun propagateCancel() {
+            activePushId?.let { id -> runCatching { client.pushCancel(id) } }
+        }
+        fun cancelled(): Nothing = throw PushCancelledException()
+
         return try {
             batches.forEachIndexed { batchNo, batch ->
-                if (isCancelled()) throw PushCancelledException()
+                if (isCancelled()) cancelled()
                 val batchBytes = batch.sumOf { requests[it].size }
                 val offer = try {
                     client.pushOffer(batch.map { requests[it] })
@@ -88,10 +101,11 @@ class PushSession(
                     return failed(PushResult.Failed(e.message ?: "the offer failed"))
                 }
                 if (!offer.accepted) return failed(PushResult.Refused)
+                activePushId = offer.pushId
                 diag("[push] offer files=${batch.size} bytes=$batchBytes batch=${batchNo + 1}/${batches.size}")
 
                 for (index in batch) {
-                    if (isCancelled()) throw PushCancelledException()
+                    if (isCancelled()) cancelled()
                     val source = sources[index]
                     diag(
                         "[push] file ${sentFiles + 1} of ${sources.size} " +
@@ -112,19 +126,24 @@ class PushSession(
                         isCancelled = isCancelled,
                         throttle = throttle,
                     )
-                    // Every byte is written; the receiver still has to hash and place
-                    // the file before it answers. That wait is the finishing window.
-                    onFinishing(index, source.size)
+                    // Every byte is written. Only the last file of the whole push
+                    // opens the Finishing window (push-level): the receiver still
+                    // has to hash and place it before it answers.
+                    if (index == sources.lastIndex) {
+                        onFinishing(sources.size, sources.size, source.size)
+                    }
                     client.pushCompleteFile(offer.pushId, source.relPath, result.sha256)
                     overall += result.bytes
                     sentFiles++
                     onProgress(index, source.size, source.size)
                 }
                 client.pushCompleteAll(offer.pushId)
+                activePushId = null
             }
             diag("[push] complete files=$sentFiles bytes=$overall")
             PushResult.Sent(sentFiles, overall)
         } catch (_: PushCancelledException) {
+            propagateCancel()
             diag("[push] failed reason=cancelled")
             PushResult.Cancelled
         } catch (e: PeerStatusException) {

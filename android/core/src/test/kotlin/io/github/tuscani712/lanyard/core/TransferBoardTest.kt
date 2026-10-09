@@ -126,7 +126,7 @@ class TransferBoardTest {
         val b = board()
         b.add(row("t_fin", "receive", TransferState.Running))
 
-        b.markFinishing("t_fin", 700L)
+        b.markFinishing("t_fin", 1, 1, 700L)
 
         val finishing = b.firstOrNull("t_fin")
         assertEquals(TransferState.Running, finishing?.state, "Finishing is a window, not a terminal state")
@@ -145,7 +145,7 @@ class TransferBoardTest {
     fun endingFinishingAsFailedClearsIt() {
         val b = board()
         b.add(row("t_fin", "receive", TransferState.Running))
-        b.markFinishing("t_fin", 700L)
+        b.markFinishing("t_fin", 1, 1, 700L)
 
         b.end("t_fin", TransferState.Failed, "checksum mismatch")
 
@@ -156,7 +156,7 @@ class TransferBoardTest {
     fun cancellingAFinishingRowClearsIt() {
         val b = board()
         b.add(row("t_fin", "receive", TransferState.Running))
-        b.markFinishing("t_fin", 700L)
+        b.markFinishing("t_fin", 1, 1, 700L)
 
         assertNotNull(b.cancel("t_fin"))
 
@@ -168,7 +168,7 @@ class TransferBoardTest {
     fun freshBytesLeaveTheFinishingWindow() {
         val b = board()
         b.add(row("t_fin", "send", TransferState.Running))
-        b.markFinishing("t_fin", 700L)
+        b.markFinishing("t_fin", 1, 1, 700L)
 
         // A later file's bytes arrive: the send is moving again, not finishing.
         b.progress("t_fin", done = 700, total = 1_400, speed = 10.0)
@@ -180,8 +180,34 @@ class TransferBoardTest {
     fun markFinishingIgnoresFinishedRows() {
         val b = board()
         b.add(row("t_done", "receive", TransferState.Done))
-        assertNull(b.markFinishing("t_done", 700L))
+        assertNull(b.markFinishing("t_done", 1, 1, 700L))
         assertTrue(b.firstOrNull("t_done")?.finishing == false)
+    }
+
+    @Test
+    fun oneTinyFileFinishingDoesNotFlipAMultiFileRow() {
+        val b = board()
+        b.add(
+            TransferRecord(
+                id = "t_multi", direction = "receive", peerName = "Desk", peerFingerprint = "ab".repeat(32),
+                label = "Inbox", total = 1_500, done = 500, state = TransferState.Running,
+                startedAt = now, fileCount = 3,
+            ),
+        )
+
+        // The first (tiny) file finishes while the other two still stream.
+        b.markFinishing("t_multi", 1, 3, 500L)
+        assertFalse(b.firstOrNull("t_multi")?.finishing == true, "one of three files must not open Finishing")
+        assertEquals(1, b.firstOrNull("t_multi")?.filesDone)
+
+        // The second finishes: still not the whole push.
+        b.markFinishing("t_multi", 2, 3, 500L)
+        assertFalse(b.firstOrNull("t_multi")?.finishing == true, "two of three files must not open Finishing")
+
+        // Only the last file opens it.
+        b.markFinishing("t_multi", 3, 3, 500L)
+        assertTrue(b.firstOrNull("t_multi")?.finishing == true, "the last file must open Finishing")
+        assertEquals(500L, b.firstOrNull("t_multi")?.finishingBytes)
     }
 
     @Test

@@ -98,7 +98,7 @@ class PushProgressTest {
             val result = PushSession(clientFor(phone, client)).push(
                 listOf(PushSource("big.bin", total, 0) { ByteArrayInputStream(bytes) }),
                 onProgress = { _, sent, _ -> events.add("progress:$sent") },
-                onFinishing = { _, size -> events.add("finishing:$size") },
+                onFinishing = { _, _, size -> events.add("finishing:$size") },
             )
 
             assertTrue(result is PushResult.Sent, "expected Sent, got $result")

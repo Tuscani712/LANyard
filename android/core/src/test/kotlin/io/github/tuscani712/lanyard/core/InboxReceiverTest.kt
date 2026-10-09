@@ -74,7 +74,7 @@ class InboxReceiverTest {
             spoolRoot = ownSpool,
             destination = PushDestination { rel, f, _ -> placed[rel] = f.length(); rel.substringAfterLast('/') },
             freeBytes = { 1L shl 40 },
-            onFinishing = { _, bytes -> events.add("finishing:$bytes") },
+            onFinishing = { _, _, _, bytes -> events.add("finishing:$bytes") },
             onDone = { _, _, files, _ -> events.add("done:$files") },
         )
         val o = r.offer("p", "P", listOf(req("big.bin", 4)), 0, 0)
@@ -503,7 +503,7 @@ class InboxReceiverTest {
             destination = PushDestination { rel, _, _ -> rel },
             freeBytes = { 1L shl 40 },
             onOffer = { pushId, _, _, _ -> offers.add(pushId) },
-            onProgress = { _, done, _ -> progress.add(done) },
+            onProgress = { _, done, _, _, _ -> progress.add(done) },
             onDone = { pushId, _, _, _ -> dones.add(pushId) },
         )
         val o = r.offer("p", "P", listOf(req("a.bin", 4)), 0, 0)
@@ -512,6 +512,30 @@ class InboxReceiverTest {
         assertEquals(listOf(o.pushId), offers)
         assertEquals(listOf(o.pushId), dones)
         assertTrue(progress.isNotEmpty() && progress.last() == 4L, "progress should report the bytes written: $progress")
+    }
+
+    @Test
+    fun progressIsWholeTransferCumulativeAcrossFilesAndNeverGoesBackwards() {
+        val progress = java.util.Collections.synchronizedList(mutableListOf<Long>())
+        val totals = java.util.Collections.synchronizedList(mutableListOf<Long>())
+        val filesDone = java.util.Collections.synchronizedList(mutableListOf<Int>())
+        val r = InboxReceiver(
+            spoolRoot = spool,
+            destination = PushDestination { rel, _, _ -> rel },
+            freeBytes = { 1L shl 40 },
+            onProgress = { _, done, total, fd, _ -> progress.add(done); totals.add(total); filesDone.add(fd) },
+        )
+        val o = r.offer("p", "P", listOf(req("a.bin", 4), req("b.bin", 6)), 0, 0)
+        r.writeChunk(o.pushId, "p", "a.bin", 0, byteArrayOf(1, 2, 3, 4).inputStream())
+        val afterA = progress.last()
+        assertEquals(4L, afterA, "after the first file the whole-transfer count is that file's bytes")
+        r.writeChunk(o.pushId, "p", "b.bin", 0, byteArrayOf(5, 6, 7, 8, 9, 10).inputStream())
+
+        // The counter is cumulative over the whole push and never decreases at
+        // the file boundary (which is what made the meter think it had reset).
+        assertEquals(progress.sorted(), progress.toList(), "whole-transfer progress must be monotonic: $progress")
+        assertEquals(10L, progress.last(), "the last progress is the push total: $progress")
+        assertTrue(totals.all { it == 10L }, "total is the whole push, not the current file: $totals")
     }
 
     @Test

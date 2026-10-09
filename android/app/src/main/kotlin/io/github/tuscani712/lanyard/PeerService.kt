@@ -327,16 +327,26 @@ object PeerService {
             freeBytes = { spoolDir.usableSpace },
             onChange = { publish() },
             onOffer = { pushId, fp, files, total ->
-                TransferManager.noteReceiveStarted(pushId, trustStore.find(fp)?.name?.takeIf { it.isNotBlank() } ?: "A device", fp, "Inbox", total)
+                TransferManager.noteReceiveStarted(
+                    pushId,
+                    trustStore.find(fp)?.name?.takeIf { it.isNotBlank() } ?: "A device",
+                    fp,
+                    "Inbox",
+                    total,
+                    files,
+                )
             },
-            onProgress = { pushId, done, total -> TransferManager.noteReceiveProgress(pushId, done, total) },
-            onFinishing = { pushId, bytes -> TransferManager.noteFinishing(pushId, bytes) },
+            onProgress = { pushId, done, total, filesDone, filesTotal ->
+                TransferManager.noteReceiveProgress(pushId, done, total, filesDone, filesTotal)
+            },
+            onFinishing = { pushId, completed, files, bytes -> TransferManager.noteFinishing(pushId, completed, files, bytes) },
             onDone = { pushId, _, files, _ ->
                 val folder = receiver.destinationFolder().takeIf { it.isNotBlank() }
                 val folderUri = receiver.destinationFolderLocation().takeIf { it.isNotBlank() }
                 TransferManager.noteReceiveDone(pushId, "Received $files file(s)", folder, folderUri)
             },
             onCancelled = { pushId, reason -> TransferManager.noteReceiveFailed(pushId, reason) },
+            onCancelledBySender = { pushId, reason -> TransferManager.noteReceiveCancelled(pushId, reason) },
             onFailed = { pushId, reason -> TransferManager.noteReceiveFailed(pushId, reason) },
             destinationReady = ready@{
                 val uri = SettingsHolder.settings.value.downloadFolder?.let { Uri.parse(it) } ?: return@ready true

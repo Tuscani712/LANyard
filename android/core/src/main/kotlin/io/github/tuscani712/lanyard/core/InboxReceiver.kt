@@ -30,6 +30,9 @@ fun interface PushDestination {
     fun folderLocation(): String = ""
 }
 
+/** The reason a row shows when the sender cancels an outgoing push. */
+const val SENDER_CANCELLED_REASON = "Cancelled by the sender"
+
 /** One file in an accepted push. */
 data class PushFileState(
     val relPath: String,
@@ -80,14 +83,23 @@ class InboxReceiver(
     private val freeBytes: () -> Long,
     private val onChange: () -> Unit = {},
     private val onOffer: (pushId: String, peerFp: String, files: Int, total: Long) -> Unit = { _, _, _, _ -> },
-    private val onProgress: (pushId: String, done: Long, total: Long) -> Unit = { _, _, _ -> },
-    // Fired once every body byte of a file has arrived and the receiver is now
-    // hashing the spool part and copying it into the destination (or, on the
-    // whole-file fast path, copying it). The bytes are all in but the file is
-    // not placed yet, so the row shows "Finishing…" instead of a silent 100%.
-    private val onFinishing: (pushId: String, bytes: Long) -> Unit = { _, _ -> },
+    // Whole-transfer progress: the cumulative bytes of EVERY file in the push
+    // (not the current file), the push total, and how many of the push's files
+    // are complete. Feeding the whole-transfer counter means the meter never
+    // sees the counter go backwards at a file boundary.
+    private val onProgress: (pushId: String, done: Long, total: Long, filesDone: Int, filesTotal: Int) -> Unit =
+        { _, _, _, _, _ -> },
+    // Fired once, when the LAST file of the push has all its bytes in and the
+    // receiver is now hashing/placing. Push-level, never per file: [completed]
+    // equals [files] at that point. [bytes] is the last file's size.
+    private val onFinishing: (pushId: String, completed: Int, files: Int, bytes: Long) -> Unit =
+        { _, _, _, _ -> },
     private val onDone: (pushId: String, peerFp: String, files: Int, total: Long) -> Unit = { _, _, _, _ -> },
     private val onCancelled: (pushId: String, reason: String) -> Unit = { _, _ -> },
+    // Fired when the peer that owns a push asks us to cancel it (the sender
+    // cancelled). Distinct from [onCancelled] (a receiver-side cancel) so the
+    // row can end as Cancelled with the sender's reason, not as a failure.
+    private val onCancelledBySender: (pushId: String, reason: String) -> Unit = { _, _ -> },
     // Fired when an in-flight receive dies on its own (a file body threw, or the
     // connection was closed mid-body) rather than finishing or being declined.
     // It is mutually exclusive with [onDone] and [onCancelled].
@@ -148,11 +160,35 @@ class InboxReceiver(
 
         /** The time of the last byte parsed, or the last body start/end. */
         @Volatile var lastProgress: Long = createdAt
+
+        /**
+         * Cumulative bytes received across every file of this push. Fed whole to
+         * the progress callback so the rate meter sees a monotonic counter: a
+         * new file no longer looks like the counter resetting to zero.
+         */
+        val transferred = java.util.concurrent.atomic.AtomicLong(0)
+
+        /** File bodies fully read so far, for the file-based ETA rate. */
+        val bodiesFinished = java.util.concurrent.atomic.AtomicInteger(0)
+
+        // Files that have reached their finishing point (all body bytes in).
+        // Guarded by itself; the last one to arrive opens the push-level
+        // Finishing window exactly once.
+        private val finishingSeen = HashSet<String>()
+
+        /**
+         * Marks [rel] as having all its bytes in. Returns true when this call
+         * completes the last outstanding file of the push, so Finishing is
+         * reported once for the whole push rather than once per file.
+         */
+        fun markFileFinishing(rel: String): Boolean = synchronized(finishingSeen) {
+            if (!finishingSeen.add(rel)) return false
+            finishingSeen.size >= files.size
+        }
     }
 
     private val sessions = LinkedHashMap<String, Session>()
     private val cancelled = HashSet<String>()
-    private val placeLock = Any()
 
     // A daemon reaper sweeps stalled/idle pushes, mirroring the desktop. The
     // sweep interval tracks the shorter timeout so a test-sized timeout is
@@ -304,6 +340,7 @@ class InboxReceiver(
             if (st.part.isFile) st.done = minOf(st.part.length(), st.size)
         }
         val sess = Session(id, peerFp, Display.safeName(peerName), files, total, clock())
+        sess.transferred.set(files.values.sumOf { it.done })
         sessions[id] = sess
         diag("[push] peer=${Display.shortFp(peerFp)} offer accepted id=$id files=${files.size} bytes=$total resumed=${files.values.count { it.done > 0 }}")
         safeCallback("change") { onChange() }
@@ -365,18 +402,23 @@ class InboxReceiver(
             if (st.done != 0L) throw PeerHttpException(409, "file already partly received")
             beginBody(s, rel)
             diag("[push] peer=${Display.shortFp(peerFp)} file id=$id cls=${Display.pathClass(rel)} offset=0 size=${st.size} whole=true")
-            return try {
+            try {
                 writeStream(s, st, 0, input, sha256)
-                safeCallback("finishing") { onFinishing(s.id, st.size) }
+                if (s.markFileFinishing(rel)) {
+                    safeCallback("finishing") { onFinishing(s.id, s.files.size, s.files.size, st.size) }
+                }
                 st.placedName = place(st)
                 synchronized(this) { st.done = st.size }
                 safeCallback("change") { onChange() }
-                st.size
             } catch (e: Exception) {
                 fail(s.id, reasonFor(e))
                 throw e
             }
         }
+        // Diagnostics are written outside the per-file placement lock, so a slow
+        // log sink can never serialize two files' placements.
+        diag("[push] placed cls=${Display.pathClass(rel)} dest=${destinationLabel()}")
+        return st.size
     }
 
     /** A person-readable reason for a receive that died mid-body. */
@@ -399,10 +441,12 @@ class InboxReceiver(
             if (st.part.length() != st.size) {
                 throw PeerHttpException(409, "size mismatch: have ${st.part.length()}, expected ${st.size}")
             }
-            // All bytes are in: the file is about to be hashed and copied into
-            // the destination, which for a large file takes seconds. Tell the UI
-            // before the slow part, not after.
-            safeCallback("finishing") { onFinishing(s.id, st.size) }
+            // All bytes are in: if this is the last file of the push, tell the UI
+            // before the slow hashing/copy, not after. Push-level: a tiny file
+            // finishing while the rest still stream does not open the window.
+            if (s.markFileFinishing(rel)) {
+                safeCallback("finishing") { onFinishing(s.id, s.files.size, s.files.size, st.size) }
+            }
             val got = hashFile(st.part)
             if (!got.equals(sha256, ignoreCase = true)) throw PeerHttpException(409, "checksum mismatch")
             st.placedName = place(st)
@@ -433,8 +477,7 @@ class InboxReceiver(
         if (!s.peerFp.equals(peerFp, ignoreCase = true)) return false
         cancelled.add(id)
         sessions.remove(id)
-        val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
-        for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
+        deleteSpool(s)
         diag("[push] peer=${Display.shortFp(peerFp)} cancelled id=$id spool=deleted")
         safeCallback("change") { onChange() }
         safeCallback("cancelled") { onCancelled(id, "The transfer was cancelled") }
@@ -453,12 +496,48 @@ class InboxReceiver(
         val s = sessions.remove(id) ?: return null
         cancelled.add(id)
         s.dead = true
-        val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
-        for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
+        deleteSpool(s)
         diag("[push] peer=${Display.shortFp(s.peerFp)} cancelled id=$id source=local spool=deleted")
         safeCallback("change") { onChange() }
         safeCallback("cancelled") { onCancelled(id, "The transfer was cancelled") }
         return s.peerFp
+    }
+
+    /**
+     * Cancels a live push at its owning peer's request (the sender cancelled).
+     * The `.lanpart` spool is freed through the same path as a local cancel, an
+     * in-flight body is marked dead so it aborts on its next byte, and the row
+     * is reported Cancelled with the sender's reason — never as a failure.
+     *
+     * Returns true when a live session owned by [peerFp] was ended; false when
+     * [id] is unknown or owned by another peer (the caller answers harmlessly).
+     */
+    @Synchronized
+    fun cancelBySender(id: String, peerFp: String): Boolean {
+        val s = sessions[id] ?: return false
+        if (!s.peerFp.equals(peerFp, ignoreCase = true)) return false
+        cancelled.add(id)
+        sessions.remove(id)
+        s.dead = true
+        deleteSpool(s)
+        diag("[push] peer=${Display.shortFp(peerFp)} cancelled id=$id source=sender spool=deleted")
+        safeCallback("change") { onChange() }
+        safeCallback("cancelled-by-sender") { onCancelledBySender(id, SENDER_CANCELLED_REASON) }
+        return true
+    }
+
+    /**
+     * The fingerprint of the peer that owns the live push [id], or null when the
+     * id is unknown (never offered, already finished, or already cancelled).
+     * Used to enforce owner-only cancellation.
+     */
+    @Synchronized
+    fun ownerFingerprint(id: String): String? = sessions[id]?.peerFp
+
+    /** Deletes every `.lanpart` part belonging to [s] (peer-keyed spool). */
+    private fun deleteSpool(s: Session) {
+        val peerDir = File(spoolRoot, s.peerFp.take(16).lowercase())
+        for (rel in s.files.keys) File(peerDir, rel + ".lanpart").delete()
     }
 
     /**
@@ -556,8 +635,17 @@ class InboxReceiver(
                 out.write(buf, 0, n)
                 digest.update(buf, 0, n)
                 written += n
-                synchronized(this) { st.done = offset + written; s.lastProgress = clock() }
-                safeCallback("progress") { onProgress(s.id, offset + written, st.size) }
+                synchronized(this) {
+                    val previous = st.done
+                    st.done = offset + written
+                    // Fold the per-file delta into the whole-push counter so a
+                    // new file never makes the reported total jump backwards.
+                    s.transferred.addAndGet(st.done - previous)
+                    s.lastProgress = clock()
+                }
+                safeCallback("progress") {
+                    onProgress(s.id, s.transferred.get(), s.total, s.bodiesFinished.get(), s.files.size)
+                }
             }
             if (written >= limit && input.read() >= 0) {
                 // One byte past the offered size: truncate the part and refuse.
@@ -566,7 +654,10 @@ class InboxReceiver(
                 st.done = 0
                 throw PeerHttpException(400, "file longer than offered size")
             }
-            out.fd.sync()
+            // close() flushes the OS cache; no per-file fsync. A power loss can
+            // lose an unflushed partial, but a kept `.lanpart` is re-verified by
+            // SHA on resume anyway, so the sync bought latency, not correctness.
+            s.bodiesFinished.incrementAndGet()
         } finally {
             runCatching { out.close() }
             s.bodyFinished(st.relPath)
@@ -596,24 +687,29 @@ class InboxReceiver(
         }
     }
 
-    /** Places one verified file, one at a time, then deletes the spool part. */
+    /**
+     * Places one verified file, then deletes the spool part.
+     *
+     * Guarded by the file's own [PushFileState.lock] (reentrant: callers already
+     * hold it), never a global lock, so two different files can be hashed and
+     * copied into the destination at the same time. A duplicate request returns
+     * the same name without writing or deleting anything again. The diagnostics
+     * line is written by the callers, outside this critical section.
+     */
     private fun place(st: PushFileState): String {
-        synchronized(placeLock) {
-            // Already placed by an earlier/duplicate request: return the same
-            // name without writing or deleting anything again.
+        synchronized(st.lock) {
             if (st.placed) return st.placedName!!
             val name = destination.place(st.relPath, st.part, st.size)
             st.part.delete()
             st.placedName = name
             st.placed = true
-            val folder = destination.folder()
-            diag(
-                "[push] placed cls=${Display.pathClass(st.relPath)} " +
-                    "dest=${if (folder.isBlank()) "unknown" else folder}",
-            )
             return name
         }
     }
+
+    /** The destination folder label, for the placement diagnostics line. */
+    private fun destinationLabel(): String =
+        destination.folder().takeIf { it.isNotBlank() } ?: "unknown"
 
     /** The folder received files are placed into, for the UI and the log. */
     fun destinationFolder(): String = destination.folder()

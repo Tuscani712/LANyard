@@ -75,4 +75,18 @@ class SpeedMeterTest {
         meter.reset()
         assertNull(meter.sample(2_000, 2_000_000), "a reset meter has no history")
     }
+
+    @Test
+    fun aWholeTransferCounterDoesNotClearAtAFileBoundary() {
+        // The receive path now feeds whole-transfer cumulative bytes, so a new
+        // file continues the same monotonic counter. A rate must keep flowing
+        // across that boundary instead of being treated as a reset.
+        val meter = SpeedMeter(windowMillis = 3_000)
+        assertNull(meter.sample(0, 0))
+        assertEquals(1_000.0, rate(meter, 1_000, 1_000), 1.0)
+        // File A ended at 1_000 bytes; file B's bytes continue from 1_000.
+        val acrossBoundary = meter.sample(2_000, 2_000)
+        assertTrue(acrossBoundary != null, "a monotonic whole-transfer counter must not clear the meter")
+        assertEquals(1_000.0, acrossBoundary!!, 1.0)
+    }
 }

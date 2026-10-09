@@ -53,7 +53,7 @@ class ConcurrentFilePushTest {
             },
             // The app's receive-progress path, verbatim in shape: one shared
             // meter per push id, sampled from every concurrent callback.
-            onProgress = { id, done, total -> appProgress(id, done, total) },
+            onProgress = { id, done, total, _, _ -> appProgress(id, done, total) },
             onDone = { id, _, _, _ -> if (board.isLive(id)) board.end(id, TransferState.Done, "done") },
             onFailed = { id, _ -> if (board.isLive(id)) board.end(id, TransferState.Failed, "failed") },
             onCancelled = { id, _ -> if (board.isLive(id)) board.end(id, TransferState.Cancelled, "cancelled") },
@@ -233,7 +233,7 @@ class ConcurrentFilePushTest {
             destination = PushDestination { rel, f, _ -> placed[rel] = f.length(); rel },
             freeBytes = { 1L shl 40 },
             onChange = { },
-            onProgress = { _, _, _ -> throw IllegalStateException("progress callback blew up") },
+            onProgress = { _, _, _, _, _ -> throw IllegalStateException("progress callback blew up") },
         )
         receiver.use { r ->
             val identity = Identity.generate("Pixel")

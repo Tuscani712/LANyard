@@ -78,8 +78,40 @@ class JsonFileSettingsStore(private val file: File) : SettingsStore {
     }
 }
 
-/** Formats a byte-per-second rate for display, in the chosen unit. */
+/**
+ * Formats a byte-per-second rate for display, in the chosen unit.
+ *
+ * The byte-rate formatter scales the unit (B/s, KB/s, MB/s, GB/s) so a transfer
+ * that is genuinely moving never reads as the misleading "0.0 MB/s": a slow but
+ * live receive shows e.g. "812 B/s" or "3.4 KB/s" instead. The bit-rate formatter
+ * scales the same way (bps, Kbps, Mbps). Both are shared by the Transfers row,
+ * the notification and the diagnostics, so no surface can drift.
+ */
 fun formatSpeed(bytesPerSecond: Double, unit: SpeedUnit): String = when (unit) {
-    SpeedUnit.MBps -> "%.1f MB/s".format(bytesPerSecond / 1_048_576.0)
-    SpeedUnit.Mbps -> "%.1f Mbps".format(bytesPerSecond * 8.0 / 1_000_000.0)
+    SpeedUnit.MBps -> formatByteRate(bytesPerSecond)
+    SpeedUnit.Mbps -> formatBitRate(bytesPerSecond)
+}
+
+/** A byte rate scaled to the largest unit that keeps it at or above 1.0. */
+fun formatByteRate(bytesPerSecond: Double): String {
+    val v = bytesPerSecond.coerceAtLeast(0.0)
+    if (v.isNaN() || v.isInfinite()) return "0 B/s"
+    return when {
+        v < 1_024.0 -> "%.0f B/s".format(v)
+        v < 1_048_576.0 -> "%.1f KB/s".format(v / 1_024.0)
+        v < 1_073_741_824.0 -> "%.1f MB/s".format(v / 1_048_576.0)
+        else -> "%.1f GB/s".format(v / 1_073_741_824.0)
+    }
+}
+
+/** A bit rate (from bytes/second) scaled to the largest sensible unit. */
+fun formatBitRate(bytesPerSecond: Double): String {
+    val bits = (bytesPerSecond.coerceAtLeast(0.0)) * 8.0
+    if (bits.isNaN() || bits.isInfinite()) return "0 bps"
+    return when {
+        bits < 1_000.0 -> "%.0f bps".format(bits)
+        bits < 1_000_000.0 -> "%.1f Kbps".format(bits / 1_000.0)
+        bits < 1_000_000_000.0 -> "%.1f Mbps".format(bits / 1_000_000.0)
+        else -> "%.1f Gbps".format(bits / 1_000_000_000.0)
+    }
 }
