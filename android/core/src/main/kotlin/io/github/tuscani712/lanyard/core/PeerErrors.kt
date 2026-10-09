@@ -5,6 +5,19 @@ import java.net.ConnectException
 import java.net.SocketTimeoutException
 
 /**
+ * A person-readable reason for a transfer body that failed with [e]. A short
+ * read (the peer closed before the promised bytes) reads as a lost connection
+ * rather than the raw "shorter" I/O message.
+ */
+internal fun transferFailureReason(e: Exception): String = when {
+    e is java.io.IOException -> "Connection lost"
+    e is PushCancelledException -> "The transfer was cancelled"
+    !e.message.isNullOrBlank() ->
+        if (e.message!!.contains("shorter", ignoreCase = true)) "Connection lost" else e.message!!
+    else -> "Connection lost"
+}
+
+/**
  * The one place a peer's HTTP failure becomes a line a person should read.
  *
  * This mirrors the desktop's `peerapi.UserMessage` / `peerapi.IsNotPaired`:

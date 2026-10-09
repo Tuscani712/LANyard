@@ -2,7 +2,7 @@ package io.github.tuscani712.lanyard.core
 
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
-import java.net.URL
+import java.net.URI
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.HttpsURLConnection
 
@@ -32,7 +32,7 @@ class ProbeClient(
     fun observedFingerprint(): String = recorder.fingerprint ?: ""
 
     fun hello(): PeerHello {
-        val conn = URL(url).openConnection() as HttpsURLConnection
+        val conn = URI.create(url).toURL().openConnection() as HttpsURLConnection
         conn.sslSocketFactory = socketFactory
         conn.hostnameVerifier = HostnameVerifier { _, _ -> true }
         conn.requestMethod = "GET"

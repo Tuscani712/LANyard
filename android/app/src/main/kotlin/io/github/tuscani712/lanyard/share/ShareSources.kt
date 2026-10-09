@@ -9,7 +9,6 @@ import io.github.tuscani712.lanyard.core.PushSource
 import io.github.tuscani712.lanyard.core.ShareValidation
 import java.io.File
 import java.io.FileInputStream
-import java.io.IOException
 import java.security.SecureRandom
 
 /** The outcome of preparing one shared URI: a spooled source, or why it failed. */

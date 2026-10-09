@@ -48,9 +48,9 @@ data class Prompt(
 object PairingFlow {
     /**
      * The whole probe phase shares one deadline. A phone can advertise up to
-     * [PairLink.MAX_ADDRS] addresses and each dead one used to burn its own
-     * connect+read timeout, so an unreachable peer could stall pairing for
-     * minutes. With this budget the phase always ends promptly.
+     * [PairLink.MAX_ADDRS] addresses; probing each one with its own
+     * connect+read timeout could stall pairing for minutes. With this budget
+     * the phase always ends promptly.
      */
     const val PROBE_DEADLINE_MS = 12_000L
 

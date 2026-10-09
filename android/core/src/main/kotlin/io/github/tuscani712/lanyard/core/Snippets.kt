@@ -12,7 +12,6 @@ data class ReceivedSnippet(
     val id: String,
     val peerFingerprint: String,
     val text: String,
-    val receivedAt: Long,
 )
 
 /**
@@ -45,14 +44,11 @@ object SnippetProtocol {
 }
 
 /**
- * A small, bounded, in-memory store of snippets received from paired peers. The
- * phone had no landing spot for inbound text before this: a desktop's
- * `POST /snippet` was answered 404 and silently dropped. The Transfers screen
- * shows these with a Copy button.
+ * A small, bounded, in-memory store of snippets received from paired peers.
+ * The Transfers screen shows these with a Copy button.
  */
 class ReceivedSnippets(
     private val cap: Int = DEFAULT_CAP,
-    private val clock: () -> Long = System::currentTimeMillis,
 ) {
     private val items = ArrayDeque<ReceivedSnippet>()
     private val random = SecureRandom()
@@ -60,7 +56,7 @@ class ReceivedSnippets(
     /** Stores [text] from [peerFingerprint] and returns the stored snippet. */
     @Synchronized
     fun add(peerFingerprint: String, text: String): ReceivedSnippet {
-        val snippet = ReceivedSnippet(newId(), peerFingerprint, text, clock())
+        val snippet = ReceivedSnippet(newId(), peerFingerprint, text)
         items.addFirst(snippet)
         while (items.size > cap) items.removeLast()
         return snippet

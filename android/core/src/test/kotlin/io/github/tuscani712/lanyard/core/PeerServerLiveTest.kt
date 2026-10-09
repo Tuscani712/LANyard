@@ -1,7 +1,6 @@
 package io.github.tuscani712.lanyard.core
 
 import com.google.gson.JsonObject
-import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Assumptions.assumeTrue

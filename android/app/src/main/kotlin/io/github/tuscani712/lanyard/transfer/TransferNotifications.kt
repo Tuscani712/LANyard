@@ -7,7 +7,6 @@ import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
 import android.media.RingtoneManager
-import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import io.github.tuscani712.lanyard.MainActivity
@@ -29,7 +28,6 @@ object TransferChannels {
     const val DONE = "lanyard.transfers.done"
 
     fun ensure(context: Context) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val manager = ContextCompat.getSystemService(context, NotificationManager::class.java) ?: return
 
         val progress = NotificationChannel(PROGRESS, "Transfer progress", NotificationManager.IMPORTANCE_LOW).apply {

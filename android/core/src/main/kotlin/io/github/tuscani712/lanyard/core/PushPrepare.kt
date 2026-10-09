@@ -84,18 +84,11 @@ class PushPrepareGate {
     @Synchronized
     fun isPreparing(peerFingerprint: String): Boolean = peerKey.containsKey(peerFingerprint.lowercase())
 
-    /** The open window's key for a peer, or null. */
-    @Synchronized
-    fun activeKey(peerFingerprint: String): String? = peerKey[peerFingerprint.lowercase()]
-
     /** How many prepare windows are open (all peers). */
     @Synchronized
     fun activeCount(): Int = keys.size
 
     companion object {
-        /** Shown when the same selection is picked again while it is preparing. */
-        const val DUPLICATE_REASON = "Those files are already being prepared."
-
         /**
          * Shown when a different selection is made for a peer that is already
          * preparing one. Deliberately the same "not now, try again" shape as the

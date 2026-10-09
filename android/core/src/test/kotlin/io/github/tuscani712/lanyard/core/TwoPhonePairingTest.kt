@@ -7,7 +7,6 @@ import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
-import java.io.File
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.nio.file.Files
@@ -551,10 +550,8 @@ class TwoPhonePairingTest {
     }
 
     /**
-     * Task 37b: the whole probe phase shares one deadline. Sixteen dead/hung
-     * addresses used to cost 16 x (connect + read) each; now the phase stops
-     * once the budget is spent, so pairing fails fast instead of stalling for
-     * minutes.
+     * The whole probe phase shares one deadline, so many dead/hung addresses
+     * fail fast instead of stalling pairing for minutes.
      */
     @Test
     @Timeout(60)
@@ -688,9 +685,9 @@ class TwoPhonePairingTest {
     }
 
     /**
-     * Task 37b: a flood of idle unpaired connections must not occupy every
-     * worker thread. Beyond the idle cap they are closed, and a paired peer's
-     * traffic still succeeds.
+     * A flood of idle unpaired connections must not occupy every worker thread.
+     * Beyond the idle cap they are closed, and a paired peer's traffic still
+     * succeeds.
      */
     @Test
     @Timeout(90)
@@ -735,9 +732,9 @@ class TwoPhonePairingTest {
     }
 
     /**
-     * Task 37b: the server's diagnostic log records the pairing session request
-     * (with the peer's short fingerprint) and its outcome, so a person can see
-     * why a pair succeeded or was refused.
+     * The server's diagnostic log records the pairing session request (with the
+     * peer's short fingerprint) and its outcome, so a person can see why a pair
+     * succeeded or was refused.
      */
     @Test
     @Timeout(60)

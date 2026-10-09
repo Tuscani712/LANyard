@@ -6,7 +6,6 @@ import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.Timeout
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
-import java.io.InputStream
 import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
 

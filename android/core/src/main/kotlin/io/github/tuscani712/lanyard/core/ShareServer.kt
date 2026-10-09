@@ -125,7 +125,6 @@ class ShareServer(
         query: Map<String, String>,
         rangeHeader: String?,
         ifRange: String?,
-        body: ByteArray,
         peer: PairedPeer,
         progress: () -> Unit,
     ) {

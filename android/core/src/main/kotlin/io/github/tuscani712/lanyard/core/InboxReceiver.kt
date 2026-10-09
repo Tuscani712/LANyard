@@ -117,7 +117,7 @@ class InboxReceiver(
     private val clock: () -> Long = System::currentTimeMillis,
     // Whether a verified file can actually be saved right now (a download folder
     // is set and writable). When false, an offer is refused up front with a clear
-    // reason instead of being accepted and failing later mid-transfer (Task 30).
+    // reason instead of being accepted and failing later mid-transfer.
     private val destinationReady: () -> Boolean = { true },
     // How long a body that is actually being read may make no progress before
     // the reaper fails the session (mirrors the desktop). It only applies while
@@ -148,9 +148,6 @@ class InboxReceiver(
         // flight, and by the long idle timeout once they are all done.
         private val inFlightFiles: MutableSet<String> =
             java.util.concurrent.ConcurrentHashMap.newKeySet()
-
-        /** Number of file bodies currently being read for this push. */
-        val inFlightCount: Int get() = inFlightFiles.size
 
         /** True while any body is actually being read for this push. */
         val inFlight: Boolean get() = inFlightFiles.isNotEmpty()
@@ -241,12 +238,6 @@ class InboxReceiver(
                 diag("[push] callback-failed event=$event ${t.javaClass.simpleName}: ${t.message?.take(160)} at ${topFrame(t)}")
             }
         }
-    }
-
-    /** The top stack frame of [t], for the diagnostics log. */
-    private fun topFrame(t: Throwable): String {
-        val f = t.stackTrace.firstOrNull() ?: return "unknown"
-        return "${f.className.substringAfterLast('.')}.${f.methodName}(${f.fileName}:${f.lineNumber})"
     }
 
     /**
@@ -393,7 +384,7 @@ class InboxReceiver(
         return try {
             writeStream(s, st, offset, input, null)
         } catch (e: Exception) {
-            fail(s.id, reasonFor(e))
+                fail(s.id, transferFailureReason(e))
             throw e
         }
     }
@@ -421,7 +412,7 @@ class InboxReceiver(
                 synchronized(this) { st.done = st.size }
                 safeCallback("change") { onChange() }
             } catch (e: Exception) {
-                fail(s.id, reasonFor(e))
+            fail(s.id, transferFailureReason(e))
                 throw e
             }
         }
@@ -432,14 +423,6 @@ class InboxReceiver(
     }
 
     /** A person-readable reason for a receive that died mid-body. */
-    private fun reasonFor(e: Exception): String = when {
-        e is java.io.IOException -> "Connection lost"
-        e is PushCancelledException -> "The transfer was cancelled"
-        !e.message.isNullOrBlank() ->
-            if (e.message!!.contains("shorter", ignoreCase = true)) "Connection lost" else e.message!!
-        else -> "Connection lost"
-    }
-
     /** Verifies a streamed part against [sha256] and places it. */
     fun complete(id: String, peerFp: String, rel: String, sha256: String): PushFileState {
         val s = session(id, peerFp)

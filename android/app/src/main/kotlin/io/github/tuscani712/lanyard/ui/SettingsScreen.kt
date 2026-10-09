@@ -1,8 +1,6 @@
 package io.github.tuscani712.lanyard.ui
 
 import android.Manifest
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -869,11 +867,6 @@ private fun requestIgnoreBatteryOptimizations(context: Context) {
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         runCatching { context.startActivity(fallback) }
     }
-}
-
-private fun copyToClipboard(context: Context, label: String, value: String) {
-    val manager = context.getSystemService(ClipboardManager::class.java) ?: return
-    manager.setPrimaryClip(ClipData.newPlainText(label, value))
 }
 
 private fun shareText(context: Context, title: String, text: String) {

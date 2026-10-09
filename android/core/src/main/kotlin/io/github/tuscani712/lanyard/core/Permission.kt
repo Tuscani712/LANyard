@@ -1,13 +1,5 @@
 package io.github.tuscani712.lanyard.core
 
-import com.google.gson.JsonDeserializationContext
-import com.google.gson.JsonDeserializer
-import com.google.gson.JsonElement
-import com.google.gson.JsonPrimitive
-import com.google.gson.JsonSerializationContext
-import com.google.gson.JsonSerializer
-import java.lang.reflect.Type
-
 /**
  * A tri-state permission for one action (G1). It is the *local* policy for the
  * incoming direction — what this phone allows the peer to do to it — and is the
@@ -80,24 +72,5 @@ enum class Permission(val wire: String) {
          * old peer is never left expecting a prompt that will not come.
          */
         fun wireBool(p: Permission): Boolean = p == ALLOW
-    }
-}
-
-/**
- * Store adapter: writes the lowercase wire string; reads either that string or
- * the legacy boolean (migration `false -> ASK`). Anything unreadable becomes
- * [Permission.ASK] — the safe "ask rather than silently allow or deny".
- */
-class PermissionStoreAdapter : JsonSerializer<Permission>, JsonDeserializer<Permission> {
-    override fun serialize(src: Permission, typeOfSrc: Type, context: JsonSerializationContext): JsonElement =
-        JsonPrimitive(src.wire)
-
-    override fun deserialize(json: JsonElement, typeOfT: Type, context: JsonDeserializationContext): Permission {
-        if (json.isJsonPrimitive) {
-            val p = json.asJsonPrimitive
-            if (p.isBoolean) return Permission.fromStoredBool(p.asBoolean)
-            Permission.fromString(p.asString)?.let { return it }
-        }
-        return Permission.ASK
     }
 }

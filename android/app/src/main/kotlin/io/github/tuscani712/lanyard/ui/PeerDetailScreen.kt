@@ -26,8 +26,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Folder
-import androidx.compose.material.icons.filled.InsertDriveFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -65,6 +65,7 @@ import io.github.tuscani712.lanyard.core.PairedPeer
 import io.github.tuscani712.lanyard.core.PeerDetailBody
 import io.github.tuscani712.lanyard.core.Permission
 import io.github.tuscani712.lanyard.core.UnpairPrompt
+import io.github.tuscani712.lanyard.core.formatBytes
 import io.github.tuscani712.lanyard.core.peerDetailBody
 
 @Composable
@@ -563,14 +564,14 @@ private fun TreeView(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(
-                        if (entry.isDir) Icons.Filled.Folder else Icons.Filled.InsertDriveFile,
+                        if (entry.isDir) Icons.Filled.Folder else Icons.AutoMirrored.Filled.InsertDriveFile,
                         contentDescription = null,
                         modifier = Modifier.size(24.dp),
                     )
                     Spacer(Modifier.width(12.dp))
                     Text(entry.name, modifier = Modifier.weight(1f), style = MaterialTheme.typography.bodyLarge)
                     if (!entry.isDir) {
-                        Text(humanSize(entry.size), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(formatBytes(entry.size), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                 }
             }
@@ -591,16 +592,4 @@ private fun CenterMessage(text: String, spinner: Boolean = false) {
         }
         Text(text, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
-}
-
-private fun humanSize(bytes: Long): String {
-    if (bytes < 1024) return "$bytes B"
-    val units = listOf("KB", "MB", "GB", "TB")
-    var value = bytes.toDouble() / 1024
-    var unit = 0
-    while (value >= 1024 && unit < units.lastIndex) {
-        value /= 1024
-        unit++
-    }
-    return "%.1f %s".format(value, units[unit])
 }

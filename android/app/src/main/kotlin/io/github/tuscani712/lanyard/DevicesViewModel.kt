@@ -22,7 +22,6 @@ import io.github.tuscani712.lanyard.core.Permission
 import io.github.tuscani712.lanyard.core.PermissionAction
 import io.github.tuscani712.lanyard.core.ProbeClient
 import io.github.tuscani712.lanyard.core.SelfFilter
-import io.github.tuscani712.lanyard.core.TransferState
 import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.core.Unpair
 import io.github.tuscani712.lanyard.net.NearbyDevice

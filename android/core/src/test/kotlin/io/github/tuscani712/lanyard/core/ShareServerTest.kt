@@ -24,10 +24,9 @@ class ShareServerTest {
         range: String? = null,
         ifRange: String? = null,
         peer: PairedPeer = this.peer,
-        body: ByteArray = ByteArray(0),
     ): String {
         val out = ByteArrayOutputStream()
-        server.handle(out, method, path, query, range, ifRange, body, peer) {}
+        server.handle(out, method, path, query, range, ifRange, peer) {}
         return out.toString(Charsets.ISO_8859_1)
     }
 
@@ -176,12 +175,12 @@ class ShareServerTest {
         val server = ShareServer(blocking, maxConcurrent = 1)
         val first = ByteArrayOutputStream()
         val t = Thread {
-            server.handle(first, "GET", "/api/v1/shares/s1/file", mapOf("path" to "a.bin"), null, null, ByteArray(0), peer) {}
+            server.handle(first, "GET", "/api/v1/shares/s1/file", mapOf("path" to "a.bin"), null, null, peer) {}
         }
         t.start()
         assertTrue(blocking.started.await(5, java.util.concurrent.TimeUnit.SECONDS))
         val second = ByteArrayOutputStream()
-        server.handle(second, "GET", "/api/v1/shares/s1/file", mapOf("path" to "a.bin"), null, null, ByteArray(0), peer) {}
+        server.handle(second, "GET", "/api/v1/shares/s1/file", mapOf("path" to "a.bin"), null, null, peer) {}
         assertEquals(503, status(second.toString(Charsets.ISO_8859_1)))
         blocking.release.countDown()
         t.join()

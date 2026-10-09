@@ -4,7 +4,7 @@ import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
 import java.io.InputStream
-import java.net.URL
+import java.net.URI
 import java.net.URLEncoder
 import java.security.MessageDigest
 import javax.net.ssl.HostnameVerifier
@@ -222,7 +222,7 @@ class PeerClient(
         isCancelled: () -> Boolean = { false },
         throttle: Throttle = NoThrottle,
     ): StreamedFile {
-        val conn = URL(base + "/push/${encode(pushId)}/file?path=${encodeQuery(relPath)}").openConnection()
+        val conn = URI.create(base + "/push/${encode(pushId)}/file?path=${encodeQuery(relPath)}").toURL().openConnection()
             as HttpsURLConnection
         conn.sslSocketFactory = socketFactory
         conn.hostnameVerifier = HostnameVerifier { _, _ -> true }
@@ -390,7 +390,7 @@ class PeerClient(
         body: ByteArray?,
         headers: Map<String, String>,
     ): HttpsURLConnection {
-        val conn = URL(base + path).openConnection() as HttpsURLConnection
+        val conn = URI.create(base + path).toURL().openConnection() as HttpsURLConnection
         conn.sslSocketFactory = socketFactory
         // Identity is pinned by fingerprint in the trust manager, not by hostname.
         conn.hostnameVerifier = HostnameVerifier { _, _ -> true }

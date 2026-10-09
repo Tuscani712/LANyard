@@ -14,6 +14,7 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -36,6 +37,10 @@ class QrScanActivity : ComponentActivity() {
     private var previewView: PreviewView? = null
     private val executor = Executors.newSingleThreadExecutor()
     private val answered = AtomicBoolean(false)
+    private val cameraPermission =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) bindCamera()
+        }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -54,7 +59,7 @@ class QrScanActivity : ComponentActivity() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             bindCamera()
         } else {
-            requestPermissions(arrayOf(Manifest.permission.CAMERA), REQUEST_CAMERA)
+            cameraPermission.launch(Manifest.permission.CAMERA)
         }
     }
 
@@ -133,17 +138,7 @@ class QrScanActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_CAMERA &&
-            grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
-        ) {
-            bindCamera()
-        }
-    }
-
     companion object {
-        private const val REQUEST_CAMERA = 41
         const val EXTRA_LINK = "link"
         const val EXTRA_PASTE = "paste"
     }

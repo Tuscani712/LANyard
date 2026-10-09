@@ -1,7 +1,5 @@
 package io.github.tuscani712.lanyard.ui
 
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.widget.Toast
@@ -182,11 +180,6 @@ private fun statusVisual(status: CheckStatus): Pair<ImageVector, Color> = when (
     CheckStatus.Warning -> Icons.Filled.Warning to WarnAmber
     CheckStatus.Failed -> Icons.Filled.Cancel to FailRed
     CheckStatus.Skipped -> Icons.Filled.Info to Color(0xFF8B949E)
-}
-
-private fun copyToClipboard(context: Context, label: String, value: String) {
-    val manager = context.getSystemService(ClipboardManager::class.java) ?: return
-    manager.setPrimaryClip(ClipData.newPlainText(label, value))
 }
 
 /** Sends the durable log file through the system share sheet via FileProvider. */

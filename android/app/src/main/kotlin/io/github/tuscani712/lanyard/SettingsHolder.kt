@@ -49,8 +49,4 @@ object SettingsHolder {
         }
         return result
     }
-
-    fun dismissSaveError() {
-        _saveError.value = null
-    }
 }

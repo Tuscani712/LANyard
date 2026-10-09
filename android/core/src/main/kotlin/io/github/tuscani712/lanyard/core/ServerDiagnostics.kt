@@ -1,24 +1,33 @@
 package io.github.tuscani712.lanyard.core
 
 /**
- * How serious one diagnostics event is. Mirrors the desktop's `xferlog` levels
- * (Batch 6d): routine, healthy chatter is [Debug] and is kept out of the durable
- * log, while anything a person may need to diagnose stays at [Info] or above.
+ * The deepest stack frame of [t] as `Class.method(File:line)`, for a diagnostics
+ * line: the top frame is the actual failure site. "unknown" when there is none.
+ */
+internal fun topFrame(t: Throwable): String {
+    val f = t.stackTrace.firstOrNull() ?: return "unknown"
+    return "${f.className.substringAfterLast('.')}.${f.methodName}(${f.fileName}:${f.lineNumber})"
+}
+
+/**
+ * How serious one diagnostics event is. Mirrors the desktop's `xferlog` levels:
+ * routine, healthy chatter is [Debug] and is kept out of the durable log, while
+ * anything a person may need to diagnose stays at [Info] or above.
  */
 enum class DiagLevel { Debug, Info, Warn, Error }
 
 /**
  * A small in-memory ring buffer of server events, so a person can paste what
- * the phone saw without adb (Task 30). It keeps the last [capacity] events,
- * oldest first. Events are deliberately low-detail: no file contents, no full
- * fingerprints (only a short prefix), no tokens, no secrets. The report is
- * redacted again on the way out by [Redaction].
+ * the phone saw without adb. It keeps the last [capacity] events, oldest first.
+ * Events are deliberately low-detail: no file contents, no full fingerprints
+ * (only a short prefix), no tokens, no secrets. The report is redacted again on
+ * the way out by [Redaction].
  *
- * A [RotatingWriter] can be attached (Batch 4F): every event is then also
- * redacted and appended to a durable, rotating file, so the log survives a
- * restart. The in-memory ring stays the fast, current-run view.
+ * A [RotatingWriter] can be attached: every event is then also redacted and
+ * appended to a durable, rotating file, so the log survives a restart. The
+ * in-memory ring stays the fast, current-run view.
  *
- * Levels (Batch 6d) keep the durable log calm. A routine successful probe or a
+ * Levels keep the durable log calm. A routine successful probe or a
  * re-announced peer is recorded at [DiagLevel.Debug]: it stays in the ring (so
  * the copied diagnostics report remains complete) but is never written to the
  * durable, rotating file. Genuine failures stay at [DiagLevel.Warn]/[DiagLevel.Error]

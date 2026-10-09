@@ -29,6 +29,9 @@ class NsdDiscovery(
     private val resolving = HashSet<String>()
     private val shortByService = HashMap<String, String>()
 
+    // resolveService's replacement (registerServiceInfoCallback) requires API 34
+    // while minSdk is 26, so the legacy call remains.
+    @Suppress("DEPRECATION")
     fun start(onFound: (NearbyDevice) -> Unit, onLost: (String) -> Unit, trigger: String = "screen") {
         if (listener != null) return
         lock = wifiManager.createMulticastLock("lanyard-mdns").apply {
@@ -90,6 +93,8 @@ class NsdDiscovery(
         lock = null
     }
 
+    // NsdServiceInfo.host's replacement (hostAddresses) requires API 34; minSdk is 26.
+    @Suppress("DEPRECATION")
     private fun resolver(onFound: (NearbyDevice) -> Unit) = object : NsdManager.ResolveListener {
         override fun onResolveFailed(info: NsdServiceInfo, errorCode: Int) {
             resolving.remove(info.serviceName)

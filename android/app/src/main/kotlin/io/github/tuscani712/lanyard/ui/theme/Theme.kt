@@ -56,6 +56,8 @@ private val LightColors = lightColorScheme(
     outline = LightOutline,
 )
 
+@Suppress("DEPRECATION") // statusBarColor still paints the bar below API 35; dropping it would
+// change the look on older devices, so it stays until the app moves fully edge-to-edge.
 @Composable
 fun LanyardTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),

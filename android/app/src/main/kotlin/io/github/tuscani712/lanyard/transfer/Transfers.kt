@@ -404,10 +404,6 @@ object TransferManager {
         SettingsHolder.update { it.copy(downloadFolder = uri.toString()) }
     }
 
-    fun clearTree() {
-        SettingsHolder.update { it.copy(downloadFolder = null) }
-    }
-
     // --- prepare (spool) window ---
 
     /**

@@ -13,15 +13,14 @@ import java.security.MessageDigest
 import javax.net.ssl.SSLSocket
 
 /**
- * Task 30 regressions. Two defects turned a working push into a bare `EOF` on
- * the sender:
- *  1. authorization was decided once per connection, so a keep-alive connection
- *     opened before a peer paired stayed "not paired" for its whole life; and
+ * Regressions guarded here:
+ *  1. authorization must be decided per request, not once per connection, so a
+ *     keep-alive connection opened before a peer paired is not treated as
+ *     unpaired for its whole life; and
  *  2. an unexpected handler failure (the save location could not be written)
- *     was not caught, so the server closed the connection with no response at
- *     all instead of answering with an HTTP status.
+ *     must answer with an HTTP status rather than closing with no response.
  */
-class PeerServerTask30Test {
+class PeerServerRegressionTest {
 
     private class Phone(destination: PushDestination, destinationReady: () -> Boolean = { true }) : AutoCloseable {
         val identity: Identity = Identity.generate("Pixel 8 Pro")

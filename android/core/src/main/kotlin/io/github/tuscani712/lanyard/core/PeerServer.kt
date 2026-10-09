@@ -294,11 +294,6 @@ class PeerServer(
      * only the message. The frame is a class/method/file:line triple; no file
      * contents or user paths are involved.
      */
-    private fun topFrame(e: Throwable): String {
-        val f = e.stackTrace.firstOrNull() ?: return "unknown"
-        return "${f.className.substringAfterLast('.')}.${f.methodName}(${f.fileName}:${f.lineNumber})"
-    }
-
     /** A person-readable reason for the diagnostics report. */
     private fun closeReason(reason: String): String = when {
         reason == "idle" || reason == "idle-unpaired-cap" -> "idle timeout"
@@ -399,8 +394,8 @@ class PeerServer(
             // Authorization is evaluated per request, at the moment it is read,
             // not once per connection: a keep-alive connection opened before
             // this peer paired (or after an unpair) must not carry a stale trust
-            // decision. That stale classification made a just-paired desktop's
-            // uploads fail on a reused connection (Task 30).
+            // decision, which would make a just-paired desktop's uploads fail on
+            // a reused connection.
             val peer = isPaired(fp)
             diag("${area(head.path)} req ${head.method} ${reqLabel(head)} peer=${fp.take(8)}")
             // The connection budget also counts only the request being served,
@@ -791,7 +786,7 @@ class PeerServer(
             }
             w
         } catch (e: Exception) {
-            receiver.fail(id, bodyFailureReason(e))
+            receiver.fail(id, transferFailureReason(e))
             // A body that aborts because the receiving person cancelled the push
             // must answer 410 Gone ("cancelled by the receiver"), not a 500: the
             // sender ends its row as Cancelled with that reason. The connection
@@ -809,14 +804,6 @@ class PeerServer(
     }
 
     /** A person-readable reason for a file body that ended abnormally. */
-    private fun bodyFailureReason(e: Exception): String = when {
-        e is java.io.IOException -> "Connection lost"
-        e is PushCancelledException -> "The transfer was cancelled"
-        !e.message.isNullOrBlank() ->
-            if (e.message!!.contains("shorter", ignoreCase = true)) "Connection lost" else e.message!!
-        else -> "Connection lost"
-    }
-
     private fun handleSessionRequest(body: ByteArray, fp: String, socket: SSLSocket): String {
         val short = fp.take(8)
         if (!allowSessionRequest()) {
@@ -1039,10 +1026,11 @@ class PeerServer(
         // record it in the report.
         val watcher = StatusWatcher(out)
         try {
-            val body = if (head.method == "POST") readSmallBody(ssl, input, head, maxBodyBytes, started) else ByteArray(0)
+            // Drain a POST body so it cannot be misread as the next request.
+            if (head.method == "POST") readSmallBody(ssl, input, head, maxBodyBytes, started)
             shares.handle(
                 watcher, head.method, head.path, parseQuery(head.query),
-                head.headers["range"], head.headers["if-range"], body, peer,
+                head.headers["range"], head.headers["if-range"], peer,
             ) { guard?.kick() }
             logResp(watcher.code, head, fp, started)
         } catch (e: PeerHttpException) {
@@ -1084,7 +1072,7 @@ class PeerServer(
         }
 
         override fun write(b: ByteArray, off: Int, len: Int) {
-            if (!captured) for (i in off until off + len) scan(b[i].toChar())
+            if (!captured) for (i in off until off + len) scan(b[i].toInt().toChar())
             delegate.write(b, off, len)
         }
 
