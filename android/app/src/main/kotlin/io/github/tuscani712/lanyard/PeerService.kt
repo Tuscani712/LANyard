@@ -31,6 +31,7 @@ import io.github.tuscani712.lanyard.core.ReceivedSnippets
 import io.github.tuscani712.lanyard.core.RotatingWriter
 import io.github.tuscani712.lanyard.core.ServerDiagnostics
 import io.github.tuscani712.lanyard.core.ShareServer
+import io.github.tuscani712.lanyard.core.SwitchingDestination
 import io.github.tuscani712.lanyard.core.TrustStore
 import io.github.tuscani712.lanyard.core.Unpair
 import io.github.tuscani712.lanyard.net.AndroidMeteredNetwork
@@ -314,14 +315,11 @@ object PeerService {
             SettingsHolder.settings.value.downloadFolder?.let { Uri.parse(it) }
         }
         defaultDestination = defaultInboxDestination(app)
-        val destination = PushDestination { rel, spool, size ->
-            // A folder chosen in Settings wins; otherwise every install can
-            // receive straight away into Downloads/LANyard.
-            if (SettingsHolder.settings.value.downloadFolder != null) {
-                safDestination.place(rel, spool, size)
-            } else {
-                defaultDestination.place(rel, spool, size)
-            }
+        // A folder chosen in Settings wins; otherwise every install can receive
+        // straight away into Downloads/LANyard. Forwards folder()/folderLocation()
+        // too, so a finished receive knows where it landed (Open folder).
+        val destination = SwitchingDestination {
+            if (SettingsHolder.settings.value.downloadFolder != null) safDestination else defaultDestination
         }
         receiver = InboxReceiver(
             spoolRoot = spoolDir,
