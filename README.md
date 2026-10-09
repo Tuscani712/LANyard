@@ -1,8 +1,8 @@
 # LANyard File Transfer
 
 Send files and folders directly between your own devices on the same network. No cloud, no accounts, no
-server. One small program (about 9 MB, nothing else to install) runs on each device; the devices find each
-other, and everything between them is encrypted.
+server. One small program (about 12 MB, nothing else to install) runs on each computer, and an Android app runs on
+your phone; the devices find each other, and everything between them is encrypted.
 
 * **Share** a file or a folder, for as long as you choose (30 minutes, until you stop it, once, always).
 * **Download** from any device you can see, with progress, speed, ETA and **resume** after any interruption.
@@ -11,7 +11,10 @@ other, and everything between them is encrypted.
 * **Pair with a QR code** (or a pasted link): the code carries the device's fingerprint, so there are no six digits to compare.
 * **Send text**: a short message or a link, without making a file.
 * **History**: every finished or failed transfer stays listed, with **Resend**.
+* **Permissions per device**: browsing, pushing and text are each **Allow**, **Ask each time** or **Never**.
+* **Rename** any paired device for yourself; the name stays on your device.
 * **Desktop notifications** for pairing requests and finished transfers, and a **Troubleshoot** wizard for when devices do not connect.
+* **Android app** with the same features: pair by QR code, send files and folders from the share sheet or the app, receive, browse and download.
 
 Status: the full design is in `p2p_file_transfer_specification_v2.md`. Binaries are **not code-signed yet**, so
 Windows SmartScreen and macOS Gatekeeper will warn the first time.
@@ -41,12 +44,35 @@ Windows SmartScreen and macOS Gatekeeper will warn the first time.
 | :--- | :--- | :--- |
 | For | one transfer with a device you do not keep trusting | your own machines, unattended use |
 | Remote can browse | only the shares you **offer** into the session | every active share open to paired devices |
-| Remote can push to you | only if you **accept each transfer** | if you allow it (optionally ask above a size) |
+| Remote can push to you | only if you **accept each transfer** | per its permissions: Allow, Ask each time, or Never |
 | Lasts | one transfer, then it closes (or "Keep connected") | until you unpair |
 
 Both start the same way: one device asks, the other accepts, and **both screens must show the same 6-digit
 code**. That check is what stops someone in the middle of the network from impersonating a device. If the
 codes differ, press Reject.
+
+## Devices and permissions
+
+Open a device to see everything you can do with it, in the same order on the desktop and on the phone: its
+status, address and last-seen time; **Send files**, **Send folder** and **Send text**; **Browse their shares**;
+**Permissions**; and **Manage** (**Rename**, **Unpair**, and on the desktop **Disconnect** and **Mount as drive**).
+Anything you cannot do right now stays visible but greyed out, with the reason (for example "Offline").
+
+For each paired device you choose what it may do to you, separately for **browse/pull**, **push** and **text**:
+
+* **Allow**: it just happens.
+* **Ask each time** (the default): you get a prompt (and a notification). The other device shows "Waiting for
+  approval on ..." until you answer; no answer counts as a refusal. A browse is asked once per browsing session.
+* **Never**: refused, and the other device is told exactly what was refused ("push not permitted").
+
+The boxes ticked while pairing become **Allow**; unticked ones become **Ask each time**. Change them later on the
+device page or in Settings. The section also shows, read-only, what that device allows you to do.
+
+**Rename** gives a device a name that only you see (in lists, transfers, notifications and the log); it is never
+sent to the other device, and unpairing forgets it.
+
+Cancelling works from either end: when the sender or the receiver cancels, the other side stops at once and shows
+"Cancelled by the sender" or "Cancelled by the receiver".
 
 ## Shares and how long they last
 
@@ -71,8 +97,8 @@ why ("This share has expired.") and keeps the files and partial files it already
 ## Pair with a QR code
 
 On the device that should be found, click the QR button at the top right of **View Devices**. It shows a QR code
-and a `lanyard://pair?...` link. On the other device, scan it (a phone app, when there is one) or paste the link
-into the same panel and press **Pair**.
+and a `lanyard://pair?...` link. On a phone, scan it with the LANyard app (**Devices -> Scan QR**); on another
+computer, paste the link into the same panel and press **Pair**.
 
 * The link carries this device's **certificate fingerprint**. The scanning device refuses to continue if the
   certificate it meets on the network is not that one, so a device pretending to be it is rejected before anything
@@ -87,8 +113,8 @@ into the same panel and press **Pair**.
 
 Open a paired or connected device and use **Send text** to send a short message or a link (up to 64 KB). It
 appears on the other device under **Transfers** as "Text from ...", with **Copy** and **Dismiss**. Text is shown as
-plain text and links are never opened for you. It uses the same permission as pushing files, and snippets are kept
-in memory only (they are gone after a restart).
+plain text and links are never opened for you. It has its own **text** permission (see *Devices and
+permissions*), and snippets are kept in memory only (they are gone after a restart).
 
 ## History and resend
 
@@ -114,7 +140,7 @@ firewall or settings.
 
 ## Mount a paired device as a drive
 
-On a paired device's card, **Mount as drive**. The device's shares appear as a **read-only** drive.
+On a paired device's page, **Manage -> Mount as drive** (desktop only). The device's shares appear as a **read-only** drive.
 
 * **Windows:** pick a drive letter (for example `Z:`). This uses Windows' WebClient service, which must be
   running; if it is not, LANyard tells you. Start it once with `sc start WebClient` in an administrator prompt.
@@ -148,7 +174,8 @@ one computer for testing.
 The **Settings** button in the window: device name, **Device ID** (a friendly label; the real identity is the certificate
 fingerprint), light/dark theme, speed unit (MB/s or Mbps), a sound when a transfer finishes, **desktop notifications**,
 **start LANyard when I sign in**, **minimize to system tray** (where a tray exists), default download folder, Inbox
-folder, bandwidth limit, peer port, paired devices (edit what each may do, or unpair), **Troubleshoot**, and
+folder, bandwidth limit, **Network & Discovery** (peer port; beacon port under Advanced), paired devices (edit what
+each may do, or unpair), **Troubleshoot**, and
 **Cancel all shares**. `lanyard settings` covers the same basics from the command line.
 
 ## How it is protected
@@ -183,7 +210,7 @@ address** with the other device's IP address and the port shown at the top of it
 
 ## Downloads and building
 
-Release builds are produced by `build.ps1 -Release` into `dist\release\`:
+Release builds are produced by `build.ps1 -Release` on Windows into `dist\release\`, or with the Go commands below on Linux:
 
 | File | For |
 | :--- | :--- |
@@ -199,6 +226,36 @@ scripts); the Windows, macOS and cross-compiled Linux builds are a single static
 native Linux window build uses cgo and needs the WebKitGTK libraries, see *Linux*). Windows builds carry the app icon (in Explorer,
 the taskbar and the browser tab) and a **system-tray icon** (left-click to open the window, right-click to quit;
 `--no-tray` to skip it). Tests: `go test ./...`; end-to-end scripts are `dist\itest*.ps1`.
+
+On Linux, the release set is built with:
+
+```
+go build -trimpath -ldflags='-s -w' -o lanyard-linux-x64 ./cmd/lanyard                     # native window (cgo)
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o lanyard-linux-x64-static ./cmd/lanyard
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags='-s -w' -o lanyard-linux-arm64-static ./cmd/lanyard
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags='-s -w -H windowsgui' -o lanyard-win-x64.exe ./cmd/lanyard
+CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o lanyard-win-x64-console.exe ./cmd/lanyard
+```
+
+## Android
+
+The app (`android/`, id `io.github.tuscani712.lanyard`) runs on Android 8.0 (API 26) and later. Install the APK
+(allow "install unknown apps" for your file manager once), open it, and pair with a computer by scanning its QR
+code or pasting its link.
+
+* **Send** from the app (a device page: Send files, Send folder, Send text) or from any app's **Share** menu.
+  While files are being prepared you see "Preparing N file(s)…" with Cancel.
+* **Receive**: pushes land in `Download/LANyard` (Settings can pick another folder), with a notification and
+  **Open folder** when they finish. The phone is reachable while the app is open or a transfer is running.
+* **Browse and download** a computer's shares into a folder you pick.
+* Transfers keep running with the screen off (a foreground service with a notification). **Keep screen on during
+  transfers** (Settings -> Receiving, on by default) keeps the screen awake while the app is open and a transfer
+  runs, and **Allow background activity** turns off battery optimization for phones that stop apps anyway.
+* **Settings -> Troubleshoot** and **Copy log** help with connection problems.
+
+Build: JDK 21 and the Android SDK (platform 35), then `cd android && ./gradlew :app:assembleRelease` (signing is read
+from the properties file named by `LANYARD_KEYSTORE_PROPS`; without it, build `:app:assembleDebug`). Tests:
+`./gradlew :core:test :app:testDebugUnitTest`.
 
 ## Linux
 
@@ -219,18 +276,18 @@ modules under MIT, BSD and ISC licenses. They are listed in `THIRD_PARTY.md`.
 
 Settings, the device key and certificate, trust list and log live in `%APPDATA%\LANyard` (Windows),
 `~/Library/Application Support/LANyard` (macOS) or `~/.config/LANyard` (Linux); the log is `lanyard.log` there.
-Received pushes go to the Inbox folder, by default `Inbox` inside that folder.
+Received pushes go to the Inbox folder, by default a `LANyard` folder in your home folder (on Android,
+`Download/LANyard`).
 
 ## Known limits
 
-* Not signed or notarized yet. Not yet tested across several physical machines and operating systems; please
-  report what you see.
+* Not signed or notarized yet. Tested between a Linux desktop and an Android phone; Windows, macOS, GNOME and
+  Wayland have had little or no testing on real machines. Please report what you see.
 * Received files are not encrypted at rest (use your disk's own encryption).
 * Mounting needs an OS component (WebClient on Windows, davfs2 on Linux).
 * The Linux window needs WebKitGTK installed; the tray needs a desktop with a tray host. Not tested on GNOME or Wayland yet.
-* Desktop notifications are Linux-only for now (Windows toasts are not wired up). Text snippets and QR pairing have
-  been exercised on one computer (two instances) but not yet across two physical machines.
-* There is no mobile app yet; the pairing link is designed so that a phone app can scan it.
+* Desktop notifications are Linux-only for now (Windows toasts are not wired up).
+* The Android app is reachable only while it is open or a transfer is running. There is no iOS app yet.
 
 ## License
 

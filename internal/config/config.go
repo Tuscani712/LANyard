@@ -55,7 +55,7 @@ type Settings struct {
 	Notifications *bool `json:"notifications,omitempty"`
 	// DefaultDownloadFolder prefills the download destination.
 	DefaultDownloadFolder string `json:"default_download_folder,omitempty"`
-	// InboxFolder is where pushes land; empty means <data-dir>/Inbox.
+	// InboxFolder is where pushes land; empty means DefaultInboxDir.
 	InboxFolder string `json:"inbox_folder,omitempty"`
 	// BandwidthLimitMBps caps transfer throughput; 0 means unlimited.
 	BandwidthLimitMBps int `json:"bandwidth_limit_mbps,omitempty"`
