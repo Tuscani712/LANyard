@@ -25,6 +25,10 @@ data class TransferRecord(
     // Where a finished receive landed (the destination folder's label), for the
     // "Done" row. Null for sends or when the destination cannot name itself.
     val destinationFolder: String? = null,
+    // An openable location for [destinationFolder] (a SAF tree URI or a
+    // filesystem path), for the "Open folder" action. Null when the destination
+    // has no location (or for sends), so the action is simply left off.
+    val destinationUri: String? = null,
     // Set while a live row is in its final window: every byte has arrived
     // (receive) or been written (send), but the transfer is still hashing,
     // copying the spool into the destination, or waiting for the receiver's
@@ -125,10 +129,16 @@ class TransferBoard(
 
     /**
      * Ends a live row with [state] (Done/Failed/Cancelled). Null when not live.
-     * [destinationFolder] is recorded only for a completed receive, so a Done row
-     * can show where the files landed.
+     * [destinationFolder] and [destinationUri] are recorded only for a completed
+     * receive, so a Done row can show (and open) where the files landed.
      */
-    fun end(id: String, state: TransferState, message: String, destinationFolder: String? = null): TransferRecord? {
+    fun end(
+        id: String,
+        state: TransferState,
+        message: String,
+        destinationFolder: String? = null,
+        destinationUri: String? = null,
+    ): TransferRecord? {
         val row = records.firstOrNull { it.id == id } ?: return null
         if (row.state != TransferState.Running && row.state != TransferState.Queued) return null
         val finishedAt = clock()
@@ -149,6 +159,11 @@ class TransferBoard(
                     destinationFolder ?: it.destinationFolder
                 } else {
                     it.destinationFolder
+                },
+                destinationUri = if (state == TransferState.Done) {
+                    destinationUri ?: it.destinationUri
+                } else {
+                    it.destinationUri
                 },
             )
         }

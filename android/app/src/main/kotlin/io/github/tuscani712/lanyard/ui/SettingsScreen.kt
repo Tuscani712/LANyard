@@ -663,7 +663,7 @@ private fun PairedSettingRow(status: PairedStatus, onUnpair: () -> Unit) {
                 fontFamily = FontFamily.Monospace,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            val seen = if (status.online) "Online now" else "Offline"
+            val seen = if (status.online) "Online now" else status.offlineReason ?: "Offline"
             Text(
                 "$seen · ${permissionsLabel(peer)}",
                 style = MaterialTheme.typography.bodySmall,

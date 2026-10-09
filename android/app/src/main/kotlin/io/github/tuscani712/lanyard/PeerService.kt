@@ -25,6 +25,9 @@ import io.github.tuscani712.lanyard.core.JsonFilePendingUnpairStore
 import io.github.tuscani712.lanyard.core.Permissions
 import io.github.tuscani712.lanyard.core.PushApproval
 import io.github.tuscani712.lanyard.core.PushDestination
+import io.github.tuscani712.lanyard.core.PushProtocol
+import io.github.tuscani712.lanyard.core.ReceivedSnippet
+import io.github.tuscani712.lanyard.core.ReceivedSnippets
 import io.github.tuscani712.lanyard.core.RotatingWriter
 import io.github.tuscani712.lanyard.core.ServerDiagnostics
 import io.github.tuscani712.lanyard.core.ShareServer
@@ -39,8 +42,11 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
@@ -60,6 +66,13 @@ data class PushApprovalRequest(
 )
 
 /**
+ * A peer that just proved it is online (a successful hello either direction, an
+ * inbound handshake, or an mDNS sighting). [host]/[port] are absent when the
+ * signal came from an inbound handshake, which carries no address.
+ */
+data class PeerReachable(val shortId: String, val host: String?, val port: Int?)
+
+/**
  * The app-scoped home of the phone-side peer server and the shared trust store.
  *
  * Lifetime: [start] while the app is foregrounded (any screen), [stop] when it is
@@ -74,6 +87,7 @@ object PeerService {
     private lateinit var sessionStore: PairingSessions
     private lateinit var inviteStore: PairInvites
     private lateinit var receiver: InboxReceiver
+    private lateinit var snippets: ReceivedSnippets
     private lateinit var safDestination: SafInboxDestination
     private lateinit var defaultDestination: PushDestination
     private lateinit var shareStore: ShareStore
@@ -109,12 +123,38 @@ object PeerService {
     val shares: StateFlow<List<AppShare>> = _shares.asStateFlow()
 
     /**
+     * Text snippets received from paired peers. The phone had no landing spot
+     * for inbound text before, so a desktop's `POST /snippet` was answered 404
+     * and dropped. Newest first; the Transfers screen shows each with Copy.
+     */
+    private val _receivedText = MutableStateFlow<List<ReceivedSnippet>>(emptyList())
+    val receivedText: StateFlow<List<ReceivedSnippet>> = _receivedText.asStateFlow()
+
+    /**
      * A peer we still had paired answered a request with 403 exactly "not
      * paired": it unpaired us. A permission refusal does not count. The message
      * is shown once and cleared by the UI.
      */
     private val _unpairedByPeer = MutableStateFlow<String?>(null)
     val unpairedByPeer: StateFlow<String?> = _unpairedByPeer.asStateFlow()
+
+    /**
+     * The fingerprint of a peer that just finished pairing *to* this phone (an
+     * inbound pairing: the desktop initiated and this phone confirmed). The
+     * Devices screen watches this so a freshly paired desktop is listed and
+     * probed at once instead of showing "paired but offline". Cleared by
+     * [acknowledgePairingConfirmed].
+     */
+    private val _pairingConfirmed = MutableStateFlow<String?>(null)
+    val pairingConfirmed: StateFlow<String?> = _pairingConfirmed.asStateFlow()
+
+    /**
+     * Every "peer is reachable" signal that carries an address or a short id. A
+     * successful inbound handshake is proof the peer is online, so the Devices
+     * screen marks it so without waiting for the next probe.
+     */
+    private val _reachable = MutableSharedFlow<PeerReachable>(extraBufferCapacity = 16)
+    val reachable: SharedFlow<PeerReachable> = _reachable.asSharedFlow()
 
     private val approvalLock = Any()
     private var approvalWaiter: CompletableDeferred<Boolean>? = null
@@ -163,6 +203,11 @@ object PeerService {
         _unpairedByPeer.value = null
     }
 
+    /** Clears [pairingConfirmed] once the Devices screen has handled it. */
+    fun acknowledgePairingConfirmed() {
+        _pairingConfirmed.value = null
+    }
+
     /** Records an unpair notification that could not be delivered, for retry. */
     fun rememberPendingUnpair(peer: PairedPeer, generation: Long) {
         if (!initialized) return
@@ -207,6 +252,9 @@ object PeerService {
      */
     fun onPeerReachable(shortId: String? = null, host: String? = null, port: Int? = null) {
         if (!initialized) return
+        // Proof the peer is online right now: let the Devices screen mark it so
+        // without a probe (a successful inbound handshake carries no address).
+        if (shortId != null) _reachable.tryEmit(PeerReachable(shortId, host, port))
         // An interrupted transfer to this peer may now be continued.
         TransferManager.onPeerReachable(shortId)
         lifetimeScope.launch(Dispatchers.IO) { unpairRetries.onPeerReachable(shortId, host, port) }
@@ -251,11 +299,17 @@ object PeerService {
             trust = trustStore,
             onChange = { publish() },
             diag = { diagnostics.record(it) },
-            // A successful (re-)pair forgets any unpair queued for that peer.
-            onPaired = { fp -> pendingUnpairs.remove(fp) },
+            // A successful (re-)pair forgets any unpair queued for that peer,
+            // and tells the Devices screen so a desktop that paired *to* the
+            // phone is listed and probed without waiting for mDNS.
+            onPaired = { fp ->
+                pendingUnpairs.remove(fp)
+                _pairingConfirmed.value = fp
+            },
         )
         inviteStore = PairInvites()
         spoolDir = File(app.filesDir, "spool").apply { mkdirs() }
+        snippets = ReceivedSnippets()
         safDestination = SafInboxDestination(app) {
             SettingsHolder.settings.value.downloadFolder?.let { Uri.parse(it) }
         }
@@ -281,7 +335,8 @@ object PeerService {
             onFinishing = { pushId, bytes -> TransferManager.noteFinishing(pushId, bytes) },
             onDone = { pushId, _, files, _ ->
                 val folder = receiver.destinationFolder().takeIf { it.isNotBlank() }
-                TransferManager.noteReceiveDone(pushId, "Received $files file(s)", folder)
+                val folderUri = receiver.destinationFolderLocation().takeIf { it.isNotBlank() }
+                TransferManager.noteReceiveDone(pushId, "Received $files file(s)", folder, folderUri)
             },
             onCancelled = { pushId, reason -> TransferManager.noteReceiveFailed(pushId, reason) },
             onFailed = { pushId, reason -> TransferManager.noteReceiveFailed(pushId, reason) },
@@ -370,6 +425,8 @@ object PeerService {
             // A peer that just handshook with us is reachable: retry its unpair.
             onPeerReachable = { fp -> onPeerReachable(fp.take(16)) },
             shares = ShareServer(shareSource, diag = { diagnostics.record(it) }).also { shareServer = it },
+            snippets = snippets,
+            onSnippetsChanged = { _receivedText.value = snippets.list() },
             diagnostics = diagnostics,
         )
         val port = try {
@@ -441,6 +498,13 @@ object PeerService {
         _interrupted.value = false
     }
 
+    /** Removes one received text snippet from the Transfers surface. */
+    fun dismissReceivedText(id: String) {
+        if (!initialized) return
+        snippets.dismiss(id)
+        _receivedText.value = snippets.list()
+    }
+
     /**
      * The `lanyard://pair?...` link for this device's QR code, or null until the
      * server is listening. The one-time invite is reused while still valid.
@@ -510,6 +574,10 @@ object PeerService {
         addProperty("os", "android")
         addProperty("version", appVersion)
         addProperty("port", port)
+        // Advertise what this phone will accept, so a desktop can batch a large
+        // offer instead of guessing (and tripping a 413). See PushProtocol.
+        addProperty("max_offer_bytes", PushProtocol.MAX_OFFER_BODY_BYTES)
+        addProperty("max_offer_files", PushProtocol.MAX_OFFER_FILES)
     }
 
     private fun txt(id: Identity, port: Int): Map<String, String> = mapOf(

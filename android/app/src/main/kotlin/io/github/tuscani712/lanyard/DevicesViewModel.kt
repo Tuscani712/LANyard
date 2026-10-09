@@ -14,6 +14,9 @@ import io.github.tuscani712.lanyard.core.DiagLevel
 import io.github.tuscani712.lanyard.core.DiscoveredAddr
 import io.github.tuscani712.lanyard.core.PeerClient
 import io.github.tuscani712.lanyard.core.PeerErrors
+import io.github.tuscani712.lanyard.core.PeerProbeMonitor
+import io.github.tuscani712.lanyard.core.PeerProbeSet
+import io.github.tuscani712.lanyard.core.PeerStatusException
 import io.github.tuscani712.lanyard.core.ProbeClient
 import io.github.tuscani712.lanyard.core.SelfFilter
 import io.github.tuscani712.lanyard.core.TrustStore
@@ -25,21 +28,34 @@ import io.github.tuscani712.lanyard.share.spoolShare
 import io.github.tuscani712.lanyard.transfer.TransferManager
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.IOException
 
 /** How long a paired peer's reachability result is reused before re-probing. */
 private const val ONLINE_PROBE_CACHE_MS = 5_000L
 
+/** How often the Devices screen re-probes its paired peers while it is showing. */
+private const val PROBE_INTERVAL_MS = PeerProbeSet.DEFAULT_INTERVAL_MS
+
 /** A paired peer plus its last-known reachability. */
-data class PairedStatus(val peer: PairedPeer, val online: Boolean)
+data class PairedStatus(
+    val peer: PairedPeer,
+    val online: Boolean,
+    // Why the last probe failed (timeout vs refused vs other), for the row. Null
+    // while online or before the first probe has finished.
+    val offlineReason: String? = null,
+)
 
 /** The pairing attempt's state, for the Add-device dialog. */
 sealed interface PairingStatus {
@@ -104,8 +120,28 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     private val discovery = NsdDiscovery(app, diag = { msg, level -> PeerService.diagnostics.record(msg, level) })
 
     // Last reachability probe per peer fingerprint, so a burst of mDNS events
-    // does not re-probe (and re-log) the same peer. See [isOnline].
-    private val onlineCache = HashMap<String, Pair<Long, Boolean>>()
+    // does not re-probe (and re-log) the same peer. Carries the offline reason
+    // so the row can say why, not just "offline". See [isOnline].
+    private data class ProbeResult(val at: Long, val online: Boolean, val reason: String?)
+
+    private val onlineCache = HashMap<String, ProbeResult>()
+
+    // Schedules probes for the current paired set. A peer that becomes known
+    // (including a desktop that paired *to* the phone) is probed at once, and a
+    // periodic [runProbeLoop] re-probes the set while the screen is showing.
+    private val probes = PeerProbeMonitor(
+        peers = {
+            val own = SelfFilter.ownShortId(IdentityHolder.identity?.deviceId.orEmpty())
+            store.list()
+                .filterNot { SelfFilter.isSelf(SelfFilter.ownShortId(it.fingerprint), own) }
+        },
+        probe = { isOnline(it) },
+        onResult = { peer, online -> applyProbeResult(peer, online) },
+        intervalMs = PROBE_INTERVAL_MS,
+    )
+
+    // The periodic probe loop, alive only while the Devices screen is started.
+    private var probeJob: Job? = null
 
     // The nearby (SAS) pairing runs on Dispatchers.IO and blocks there until the
     // person confirms the code; this is the same waiter pattern PeerService uses
@@ -130,13 +166,28 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 if (message != null) _state.update { it.copy(unpairNotice = message) }
             }
         }
+        // A desktop that paired *to* this phone lands in the trust store with no
+        // mDNS/refresh of ours: refresh at once so it is not stuck "paired but
+        // offline" until something else happens.
+        viewModelScope.launch {
+            PeerService.pairingConfirmed.collect { fingerprint ->
+                if (fingerprint != null) {
+                    refreshPaired()
+                    PeerService.acknowledgePairingConfirmed()
+                }
+            }
+        }
+        // A successful inbound handshake (or outbound hello) is proof a peer is
+        // online; mark it so without waiting for the next probe.
+        viewModelScope.launch {
+            PeerService.reachable.collect { event -> markReachable(event.shortId) }
+        }
     }
 
     fun refreshPaired() {
         viewModelScope.launch {
             _state.update { it.copy(refreshing = true) }
             val identity = IdentityHolder.identity
-            val own = SelfFilter.ownShortId(identity?.deviceId.orEmpty())
             val paired = withContext(Dispatchers.IO) {
                 if (identity == null) return@withContext emptyList()
                 // A device unpaired while offline may be reachable now.
@@ -145,12 +196,14 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
                 // (the request carries none). Fill it from mDNS once discovered.
                 val discovered = _state.value.nearby.map { DiscoveredAddr(it.shortId, it.host, it.port) }
                 PeerAddresses.fillFromDiscovery(store.list(), discovered).forEach { store.save(it) }
-                store.list()
-                    // Never list this device as one of its own paired peers.
-                    .filterNot { SelfFilter.isSelf(SelfFilter.ownShortId(it.fingerprint), own) }
-                    .map { peer ->
-                        PairedStatus(peer, isOnline(peer))
-                    }
+                // Register the current set: a peer that is new (including one
+                // that just paired *to* us) or re-addressed is probed now; an
+                // unchanged peer keeps its last result and is left to the loop.
+                val peers = probes.sync()
+                peers.map { peer ->
+                    val online = isOnline(peer)
+                    PairedStatus(peer, online, if (online) null else offlineReasonFor(peer.fingerprint))
+                }
             }
             _state.update { it.copy(paired = paired, refreshing = false) }
         }
@@ -192,11 +245,30 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
             },
             trigger = "screen",
         )
+        startProbeLoop()
     }
 
     /** Stops mDNS browsing (advertising and the peer server are app-scoped). */
     fun stopNearby() {
         discovery.stop()
+        probeJob?.cancel()
+        probeJob = null
+    }
+
+    /**
+     * Re-probes the known paired set every [PROBE_INTERVAL_MS] while the Devices
+     * screen is started, so a peer that comes back (or goes away) is noticed even
+     * when no mDNS sighting or inbound request arrives. Runs on IO because each
+     * probe is a blocking TLS hello, and stops with [stopNearby].
+     */
+    private fun startProbeLoop() {
+        if (probeJob != null) return
+        probeJob = viewModelScope.launch {
+            while (isActive) {
+                delay(PROBE_INTERVAL_MS)
+                withContext(Dispatchers.IO) { probes.tick() }
+            }
+        }
     }
 
     /**
@@ -504,6 +576,44 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    /**
+     * A probe finished while a paired peer's status is being tracked: update the
+     * matching row when it is already listed (a freshly registered peer is added
+     * by [refreshPaired] itself).
+     */
+    private fun applyProbeResult(peer: PairedPeer, online: Boolean) {
+        val fp = peer.fingerprint.lowercase()
+        val reason = if (online) null else offlineReasonFor(peer.fingerprint)
+        _state.update { current ->
+            if (current.paired.none { it.peer.fingerprint.equals(fp, ignoreCase = true) }) return@update current
+            current.copy(paired = current.paired.map {
+                if (it.peer.fingerprint.equals(fp, ignoreCase = true)) {
+                    it.copy(online = online, offlineReason = reason)
+                } else {
+                    it
+                }
+            })
+        }
+    }
+
+    /**
+     * A peer proved it is online (an inbound handshake or a successful hello):
+     * mark the matching paired row online and remember it, so a desktop that
+     * paired *to* the phone is not shown offline. [shortId] is the first 16 hex
+     * characters of the peer's fingerprint, as carried by the reachable event.
+     */
+    private fun markReachable(shortId: String) {
+        val fp = _state.value.paired.map { it.peer }.firstOrNull {
+            SelfFilter.ownShortId(it.fingerprint).equals(shortId, ignoreCase = true)
+        }?.fingerprint ?: return
+        synchronized(onlineCache) { onlineCache[fp] = ProbeResult(System.currentTimeMillis(), true, null) }
+        _state.update { current ->
+            current.copy(paired = current.paired.map {
+                if (it.peer.fingerprint.equals(fp, ignoreCase = true)) it.copy(online = true) else it
+            })
+        }
+    }
+
     private fun isOnline(peer: PairedPeer): Boolean {
         val identity = IdentityHolder.identity ?: return false
         val now = System.currentTimeMillis()
@@ -511,12 +621,15 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         // throttles the same way): a repeated mDNS event must not re-probe and
         // re-log the same peer.
         synchronized(onlineCache) {
-            onlineCache[peer.fingerprint]?.let { (at, value) ->
-                if (now - at < ONLINE_PROBE_CACHE_MS) return value
+            onlineCache[peer.fingerprint]?.let { cached ->
+                if (now - cached.at < ONLINE_PROBE_CACHE_MS) return cached.online
             }
         }
         val started = now
         val short = peer.fingerprint.take(8)
+        // Only set when the probe throws: why it could not be reached, so the row
+        // and the diagnostic line can distinguish a firewall from a closed app.
+        var reason: String? = null
         val online = try {
             val probe = ProbeClient(peer.host, peer.port, identity)
             probe.hello()
@@ -541,16 +654,22 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
             match
         } catch (e: Exception) {
             // A peer that is asleep or has left is a normal, recoverable event,
-            // not an error: info stays visible without being alarming.
+            // not an error: info stays visible without being alarming. The reason
+            // separates a timeout (firewall) from a refusal (app closed).
+            reason = PeerErrors.offlineReason(e)
             PeerService.diagnostics.record(
-                "[discovery] peer=$short hello addr=${peer.host}:${peer.port} result=offline elapsed=${System.currentTimeMillis() - started}ms error=${e.javaClass.simpleName}",
+                "[discovery] peer=$short hello addr=${peer.host}:${peer.port} result=offline elapsed=${System.currentTimeMillis() - started}ms error=${e.javaClass.simpleName} reason=${PeerErrors.offlineReasonCode(e)}",
                 DiagLevel.Info,
             )
             false
         }
-        synchronized(onlineCache) { onlineCache[peer.fingerprint] = System.currentTimeMillis() to online }
+        synchronized(onlineCache) { onlineCache[peer.fingerprint] = ProbeResult(System.currentTimeMillis(), online, reason) }
         return online
     }
+
+    /** The last offline reason for [fingerprint], or null while online/unknown. */
+    private fun offlineReasonFor(fingerprint: String): String? =
+        synchronized(onlineCache) { onlineCache[fingerprint]?.reason }
 
     private fun resultMessage(result: PairResult): String = when (result) {
         is PairResult.Paired -> "Paired with ${result.peer.name.ifEmpty { "the device" }}."
@@ -561,7 +680,13 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
         PairResult.InvalidLink -> "That is not a valid pairing link."
     }
 
-    private fun friendly(t: Throwable): String = PeerErrors.userMessage(t)
+    private fun friendly(t: Throwable): String = when {
+        t is PeerStatusException -> PeerErrors.userMessage(t)
+        // A transport failure reads with the same timeout/refused distinction the
+        // Devices row shows, so an open-peer error is not a bare "offline".
+        t is IOException -> PeerErrors.offlineReason(t)
+        else -> t.message ?: PeerErrors.OFFLINE_UNREACHABLE
+    }
 
     private fun JsonObject.str(key: String): String =
         get(key)?.takeIf { !it.isJsonNull }?.asString ?: ""

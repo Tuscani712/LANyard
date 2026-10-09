@@ -472,10 +472,10 @@ object TransferManager {
         publish()
     }
 
-    fun noteReceiveDone(id: String, message: String, folder: String? = null) {
+    fun noteReceiveDone(id: String, message: String, folder: String? = null, folderUri: String? = null) {
         pushReceives.remove(id)
         if (!board.isLive(id)) return
-        end(id, TransferState.Done, message, folder)
+        end(id, TransferState.Done, message, folder, folderUri)
     }
 
     /** Marks a push this phone abandoned (declined or cut off) as failed. */
@@ -552,8 +552,19 @@ object TransferManager {
             if (!board.isLive(id)) { cancels.remove(id); return } // cancelled before it started
             setState(id, TransferState.Running)
             val sent = LongArray(sources.size)
+            val client = PeerClient(peer.host, peer.port, identity, peer.fingerprint)
+            // Learn the receiver's advertised offer caps so a large send is split
+            // into batches the peer can accept. A hello failure is not fatal: the
+            // offer itself reports reachability, and PushBatching falls back to
+            // this phone's own conservative limits.
+            val hello = runCatching { client.hello() }.getOrNull()
             val result = try {
-                PushSession(PeerClient(peer.host, peer.port, identity, peer.fingerprint), throttle).push(
+                PushSession(
+                    client,
+                    throttle,
+                    maxOfferBytes = hello?.maxOfferBytes ?: 0,
+                    maxOfferFiles = hello?.maxOfferFiles ?: 0,
+                ).push(
                     sources = sources,
                     onProgress = { index, bytes, _ ->
                         sent[index] = bytes
@@ -618,7 +629,7 @@ object TransferManager {
             DownloadResult.Failed(PeerErrors.userMessage(e))
         }
         cancels.remove(id)
-        finishDownload(id, result, DocumentFile.fromTreeUri(app, tree)?.name)
+        finishDownload(id, result, DocumentFile.fromTreeUri(app, tree)?.name, tree.toString())
     }
 
     /**
@@ -706,9 +717,9 @@ object TransferManager {
         }
     }
 
-    private fun finishDownload(id: String, result: DownloadResult, folder: String? = null) {
+    private fun finishDownload(id: String, result: DownloadResult, folder: String? = null, folderUri: String? = null) {
         when (result) {
-            is DownloadResult.Done -> end(id, TransferState.Done, "Received ${result.files} file(s)", folder)
+            is DownloadResult.Done -> end(id, TransferState.Done, "Received ${result.files} file(s)", folder, folderUri)
             DownloadResult.Cancelled -> end(id, TransferState.Cancelled, "Cancelled")
             DownloadResult.ShareEnded -> end(id, TransferState.Failed, "The sender stopped this share")
             DownloadResult.PeerUnreachable -> markInterrupted(id)
@@ -734,8 +745,14 @@ object TransferManager {
     }
 
     /** Ends a live row; a row already ended (e.g. by Cancel) is left alone. */
-    private fun end(id: String, state: TransferState, message: String, folder: String? = null) {
-        if (board.end(id, state, message, folder) == null) return
+    private fun end(
+        id: String,
+        state: TransferState,
+        message: String,
+        folder: String? = null,
+        folderUri: String? = null,
+    ) {
+        if (board.end(id, state, message, folder, folderUri) == null) return
         pushReceives.remove(id)
         cleanups.remove(id)?.invoke()
         cancels.remove(id)

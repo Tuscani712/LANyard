@@ -24,6 +24,9 @@ class SafInboxDestination(
             ?.let { "$it (chosen folder)" }
             ?: "the chosen folder"
 
+    /** The chosen folder's SAF tree URI, so the OS can open it (read permission held). */
+    override fun folderLocation(): String = treeUri()?.toString().orEmpty()
+
     override fun place(relPath: String, spool: File, size: Long): String {
         val uri = treeUri() ?: throw IOException("Choose a download folder in Settings first.")
         val root = DocumentFile.fromTreeUri(context, uri)

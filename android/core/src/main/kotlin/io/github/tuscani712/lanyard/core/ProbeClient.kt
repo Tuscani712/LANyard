@@ -50,6 +50,8 @@ class ProbeClient(
             os = json.str("os"),
             version = json.str("version"),
             port = json.int("port"),
+            maxOfferBytes = json.long("max_offer_bytes"),
+            maxOfferFiles = json.int("max_offer_files"),
         )
     }
 
@@ -58,6 +60,9 @@ class ProbeClient(
 
     private fun JsonObject.int(key: String): Int =
         get(key)?.takeIf { !it.isJsonNull }?.asInt ?: 0
+
+    private fun JsonObject.long(key: String): Long =
+        get(key)?.takeIf { !it.isJsonNull }?.asLong ?: 0L
 
     companion object {
         /** Connect and read timeout for one probe attempt, in milliseconds. */

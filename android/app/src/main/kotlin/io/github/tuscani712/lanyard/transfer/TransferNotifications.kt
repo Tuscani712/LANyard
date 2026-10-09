@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import io.github.tuscani712.lanyard.MainActivity
 import io.github.tuscani712.lanyard.SettingsHolder
+import io.github.tuscani712.lanyard.core.OpenFolder
 import io.github.tuscani712.lanyard.core.TransferRecord
 import io.github.tuscani712.lanyard.core.TransferState
 import io.github.tuscani712.lanyard.core.formatSpeed
@@ -91,7 +92,20 @@ object TransferNotifications {
             .setContentIntent(open)
             .setAutoCancel(true)
             .setOnlyAlertOnce(true)
-            .build()
-        manager.notify(DONE_ID, notification)
+        // A finished receive gets a second action to open the folder it landed
+        // in. A send, or a receive with no openable location, gets no action.
+        if (ok && record.direction == "receive" && OpenFolder.targetFor(record.destinationUri) != null) {
+            val openFolder = PendingIntent.getBroadcast(
+                context, 1,
+                Intent(context, TransferOpenFolderReceiver::class.java).apply {
+                    action = TransferOpenFolderReceiver.ACTION_OPEN_FOLDER
+                    putExtra(TransferOpenFolderReceiver.EXTRA_FOLDER, record.destinationUri)
+                    putExtra(TransferOpenFolderReceiver.EXTRA_LABEL, record.destinationFolder)
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            notification.addAction(0, "Open folder", openFolder)
+        }
+        manager.notify(DONE_ID, notification.build())
     }
 }

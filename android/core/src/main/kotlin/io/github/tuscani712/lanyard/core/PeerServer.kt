@@ -74,6 +74,14 @@ class PeerServer(
     private val idleUnpairedGraceMillis: Int = 1_000,
     private val maxSessionRequestsPerMinute: Int = 10,
     private val maxBodyBytes: Int = 64 * 1024,
+    // The offer JSON body cap. Kept as a field (not the constant directly) so a
+    // test can lower it to exercise the 413 path without an 8 MB body. The
+    // advertised `/hello` value stays [PushProtocol.MAX_OFFER_BODY_BYTES].
+    private val maxOfferBodyBytes: Int = PushProtocol.MAX_OFFER_BODY_BYTES,
+    // Received text snippets. When null the snippet route answers 503, since
+    // there is nowhere for the text to land.
+    private val snippets: ReceivedSnippets? = null,
+    private val onSnippetsChanged: () -> Unit = {},
     private val clock: () -> Long = System::currentTimeMillis,
     private val diagnostics: ServerDiagnostics? = null,
 ) {
@@ -249,6 +257,7 @@ class PeerServer(
     private fun area(path: String): String = when {
         path.startsWith("/api/v1/session") || path.startsWith("/api/v1/trust") -> "[pairing]"
         path.startsWith("/api/v1/push") -> "[push]"
+        path.startsWith("/api/v1/snippet") -> "[push]"
         path.startsWith("/api/v1/shares") -> "[pull]"
         path.startsWith("/api/v1/hello") -> "[discovery]"
         else -> "[conn]"
@@ -345,8 +354,8 @@ class PeerServer(
             val closing = closeWhy != null
             try {
                 if (head.path == "/api/v1/shares" || head.path.startsWith("/api/v1/shares/")) {
-                    handleShares(out, head, peer, ssl, input, started)
-                    if (closing) return closeWhy!!
+                    val closeAfter = handleShares(out, head, peer, ssl, input, started)
+                    if (closing || closeAfter) return closeWhy ?: "body-error"
                     continue
                 }
                 val fileBody = head.method == "PUT" && isFileBodyPath(head.path)
@@ -365,8 +374,10 @@ class PeerServer(
                     }
                 } catch (e: PeerHttpException) {
                     // If a file body was being read, the rest of it is still on the
-                    // wire, so the connection cannot be reused: close it.
-                    val mustClose = closing || fileBody
+                    // wire, so the connection cannot be reused: close it. An
+                    // oversized small body (413) sets closeConnection too, so its
+                    // unread body is never misparsed as the next request.
+                    val mustClose = closing || fileBody || e.closeConnection
                     respond(out, e.code, errorJson(e.message), mustClose)
                     logResp(e.code, head, fp, started, e.message ?: "")
                     if (mustClose) return "body-error"
@@ -455,7 +466,13 @@ class PeerServer(
         val cl = head.headers["content-length"] ?: throw PeerHttpException(411, "content-length required")
         val n = cl.toLongOrNull() ?: throw PeerHttpException(400, "bad content-length")
         if (n < 0) throw PeerHttpException(400, "bad content-length")
-        if (n > cap) throw PeerHttpException(413, "body too large")
+        if (n > cap) {
+            // Refuse without reading: the body is still on the wire, so this
+            // connection must not be reused. Closing after the 413 keeps an
+            // oversized offer from being misparsed as the next request (the
+            // spurious "malformed-head" bug behind issue #4).
+            throw PeerHttpException(413, "body too large", closeConnection = true)
+        }
         ssl.soTimeout = remainingMillis(started, headerTimeoutMillis)
         return readExactly(input, n.toInt())
     }
@@ -490,6 +507,7 @@ class PeerServer(
                 handleTrustRevoke(fp)
             path.startsWith("/api/v1/session/") -> handleSession(head, fp, path)
             head.method == "POST" && path == "/api/v1/push/offer" -> handlePushOffer(body, fp, peer)
+            head.method == "POST" && path == "/api/v1/snippet" -> handleSnippet(body, fp, peer)
             path.startsWith("/api/v1/push/") && path.endsWith("/complete") ->
                 handlePushComplete(body, fp, peer, path)
             else -> 404 to errorJson("not found")
@@ -499,14 +517,45 @@ class PeerServer(
     private fun isFileBodyPath(path: String): Boolean =
         path.startsWith("/api/v1/push/") && path.endsWith("/file")
 
-    private fun bodyCap(path: String): Int =
-        if (path == "/api/v1/push/offer") PushProtocol.MAX_OFFER_BODY_BYTES else maxBodyBytes
+    private fun bodyCap(path: String): Int = when (path) {
+        "/api/v1/push/offer" -> maxOfferBodyBytes
+        // JSON escaping can inflate a text snippet; the desktop allows the same
+        // `*2 + 4096` headroom, then validates the decoded size.
+        "/api/v1/snippet" -> SnippetProtocol.MAX_BODY_BYTES
+        else -> maxBodyBytes
+    }
 
     /** A push endpoint needs a paired fingerprint with the push permission. */
     private fun requirePush(fp: String, peer: PairedPeer?): PairedPeer {
         val p = peer ?: throw PeerHttpException(403, "not paired")
         if (!p.push) throw PeerHttpException(403, "push not permitted")
         return p
+    }
+
+    /**
+     * The text snippet gate, mirroring the desktop's `pushAccess`: a paired peer
+     * with the push permission only. The desktop refuses an unpaired caller with
+     * `not permitted` and a paired caller without the permission with
+     * `push not permitted`; both contain "not permitted", which is what
+     * [PeerErrors] surfaces.
+     */
+    private fun requireSnippet(peer: PairedPeer?): PairedPeer {
+        val p = peer ?: throw PeerHttpException(403, "not permitted")
+        if (!p.push) throw PeerHttpException(403, "push not permitted")
+        return p
+    }
+
+    private fun handleSnippet(body: ByteArray, fp: String, peer: PairedPeer?): Pair<Int, String> {
+        val p = requireSnippet(peer)
+        val store = snippets ?: throw PeerHttpException(503, "inbox unavailable")
+        val json = parseObject(body)
+        val text = json.str("text")
+        SnippetProtocol.validate(text)?.let { throw PeerHttpException(400, it) }
+        val snippet = store.add(p.fingerprint, text)
+        runCatching { onSnippetsChanged() }
+        diag("[push] snippet received peer=${fp.take(8)} bytes=${text.toByteArray(Charsets.UTF_8).size}")
+        // Matches the desktop's response shape: {"id":"s_..."}.
+        return 200 to """{"id":${jsonStr(snippet.id)}}"""
     }
 
     private fun handlePushOffer(body: ByteArray, fp: String, peer: PairedPeer?): Pair<Int, String> {
@@ -828,32 +877,36 @@ class PeerServer(
         fun stop() { stopped = true; task?.cancel(false) }
     }
 
-    private fun handleShares(out: OutputStream, head: Head, peer: PairedPeer?, ssl: SSLSocket, input: InputStream, started: Long) {
+    private fun handleShares(out: OutputStream, head: Head, peer: PairedPeer?, ssl: SSLSocket, input: InputStream, started: Long): Boolean {
         val fp = peer?.fingerprint ?: ""
-        if (shares == null) { respond(out, 404, errorJson("not found")); logResp(404, head, fp, started, "shares unavailable"); return }
-        if (peer == null) { respond(out, 403, errorJson("not paired")); logResp(403, head, fp, started, "not paired"); return }
-        if (!peer.browse) { respond(out, 403, errorJson("pull not permitted")); logResp(403, head, fp, started, "pull not permitted"); return }
-        val body = if (head.method == "POST") readSmallBody(ssl, input, head, maxBodyBytes, started) else ByteArray(0)
+        if (shares == null) { respond(out, 404, errorJson("not found")); logResp(404, head, fp, started, "shares unavailable"); return false }
+        if (peer == null) { respond(out, 403, errorJson("not paired")); logResp(403, head, fp, started, "not paired"); return false }
+        if (!peer.browse) { respond(out, 403, errorJson("pull not permitted")); logResp(403, head, fp, started, "pull not permitted"); return false }
         val isFileGet = (head.method == "GET" || head.method == "HEAD") && head.path.endsWith("/file")
         val guard = if (isFileGet) StallGuard(ssl, stallTimeoutMillis.toLong(), stallScheduler) else null
         // ShareServer writes its response directly, so watch the status line to
         // record it in the report.
         val watcher = StatusWatcher(out)
         try {
+            val body = if (head.method == "POST") readSmallBody(ssl, input, head, maxBodyBytes, started) else ByteArray(0)
             shares.handle(
                 watcher, head.method, head.path, parseQuery(head.query),
                 head.headers["range"], head.headers["if-range"], body, peer,
             ) { guard?.kick() }
             logResp(watcher.code, head, fp, started)
         } catch (e: PeerHttpException) {
-            respond(out, e.code, errorJson(e.message))
+            // An oversized share body leaves the rest on the wire: close it so it
+            // is not misparsed as the next request.
+            respond(out, e.code, errorJson(e.message), e.closeConnection)
             logResp(e.code, head, fp, started, e.message ?: "")
+            return e.closeConnection
         } catch (e: Exception) {
             respond(out, 500, errorJson("could not read the shared file"))
             logResp(500, head, fp, started, e.javaClass.simpleName)
         } finally {
             guard?.stop()
         }
+        return false
     }
 
     /** Wraps an [OutputStream] to observe the first response status code. */

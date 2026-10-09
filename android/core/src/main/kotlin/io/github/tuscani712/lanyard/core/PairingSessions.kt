@@ -2,8 +2,20 @@ package io.github.tuscani712.lanyard.core
 
 import java.security.SecureRandom
 
-/** An HTTP-level failure a handler maps to a status code and a short message. */
-class PeerHttpException(val code: Int, message: String) : RuntimeException(message)
+/**
+ * An HTTP-level failure a handler maps to a status code and a short message.
+ *
+ * [closeConnection] is set when the request body was not (and must not be)
+ * consumed — an oversized body, or any failure where the rest of the body is
+ * still on the wire. Without it, an early refusal (e.g. a 413 offer) would
+ * leave the unread body to be misparsed as the next keep-alive request, which
+ * the server would then log as a spurious `malformed-head`.
+ */
+class PeerHttpException(
+    val code: Int,
+    message: String,
+    val closeConnection: Boolean = false,
+) : RuntimeException(message)
 
 /** What a status poll returns to the initiating device. */
 data class SessionView(

@@ -20,6 +20,14 @@ fun interface PushDestination {
      * diagnostics log. Empty when the destination cannot name itself.
      */
     fun folder(): String = ""
+
+    /**
+     * An openable location for [folder] — a SAF `content://` tree URI or an
+     * absolute filesystem path — or empty when the destination has none. Kept
+     * separate from [folder] because that is a human label, not something the OS
+     * can open.
+     */
+    fun folderLocation(): String = ""
 }
 
 /** One file in an accepted push. */
@@ -590,6 +598,9 @@ class InboxReceiver(
 
     /** The folder received files are placed into, for the UI and the log. */
     fun destinationFolder(): String = destination.folder()
+
+    /** An openable location for [destinationFolder], or empty when there is none. */
+    fun destinationFolderLocation(): String = destination.folderLocation()
 
     private fun hashFile(file: File): String {
         val digest = MessageDigest.getInstance("SHA-256")

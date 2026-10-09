@@ -24,8 +24,10 @@ class PeerServerTest {
         idleMs: Int = 5_000,
         maxReq: Int = 10,
         maxBody: Int = 64 * 1024,
+        maxOfferBody: Int = PushProtocol.MAX_OFFER_BODY_BYTES,
         selfFpOverride: (() -> String)? = null,
         val diagnostics: ServerDiagnostics? = null,
+        val snippets: ReceivedSnippets? = null,
     ) : AutoCloseable {
         val identity: Identity = Identity.generate("Phone")
         private val trustFile = File.createTempFile("lanyard-trust", ".json").also { it.delete() }
@@ -44,6 +46,8 @@ class PeerServerTest {
             maxRequestsPerConnection = 64,
             maxSessionRequestsPerMinute = maxReq,
             maxBodyBytes = maxBody,
+            maxOfferBodyBytes = maxOfferBody,
+            snippets = snippets,
             diagnostics = diagnostics,
         )
         val port: Int = server.start(identity) { p ->
@@ -104,6 +108,35 @@ class PeerServerTest {
         response.lineSequence().firstOrNull()?.split(" ")?.getOrNull(1)?.toIntOrNull() ?: -1
 
     private fun body(response: String): String = response.substringAfter("\r\n\r\n")
+
+    /** Reads exactly one HTTP/1.1 response (head + Content-Length body) off [input]. */
+    private fun readOneResponse(input: java.io.InputStream): String {
+        val head = StringBuilder()
+        var state = 0
+        while (true) {
+            val b = input.read()
+            if (b < 0) break
+            head.append(b.toChar())
+            state = when {
+                state == 0 && b.toChar() == '\r' -> 1
+                state == 1 && b.toChar() == '\n' -> 2
+                state == 2 && b.toChar() == '\r' -> 3
+                state == 3 && b.toChar() == '\n' -> 4
+                else -> 0
+            }
+            if (state == 4) break
+        }
+        val text = head.toString()
+        val len = Regex("(?i)content-length:\\s*(\\d+)").find(text)?.groupValues?.get(1)?.toIntOrNull() ?: 0
+        val body = ByteArray(len)
+        var off = 0
+        while (off < len) {
+            val n = input.read(body, off, len - off)
+            if (n < 0) break
+            off += n
+        }
+        return text + String(body, Charsets.UTF_8)
+    }
 
     private fun sessionBody(
         mode: String = "pair",
@@ -298,6 +331,91 @@ class PeerServerTest {
         Harness(maxBody = 64).use { h ->
             val raw = "POST /api/v1/session/request HTTP/1.1\r\nHost: x\r\nContent-Length: 200\r\n\r\n"
             assertEquals(413, status(h.request(h.identity, raw)))
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun oversizedOfferDoesNotPoisonKeepAlive() {
+        val diag = ServerDiagnostics()
+        Harness(maxOfferBody = 128, diagnostics = diag).use { h ->
+            h.selfPair()
+            // A body larger than the offer cap, immediately followed by another
+            // request on the same connection. Before the fix the unread offer
+            // body was misparsed as the next request and logged malformed-head.
+            val oversized = "A".repeat(200)
+            val raw = post("/api/v1/push/offer", oversized) +
+                "GET /api/v1/hello HTTP/1.1\r\nHost: x\r\n\r\n"
+            val factory = Tls.socketFactory(h.identity, h.identity.deviceId)
+            factory.createSocket("127.0.0.1", h.port).use { rawSocket ->
+                val s = rawSocket as SSLSocket
+                s.startHandshake()
+                s.outputStream.write(raw.toByteArray())
+                s.outputStream.flush()
+                val first = readOneResponse(s.inputStream)
+                assertEquals(413, status(first), first)
+                // Either the server closed (EOF) or answered the next request;
+                // both are fine, a 400 malformed-head is not.
+                s.soTimeout = 2_000
+                runCatching { readOneResponse(s.inputStream) }
+            }
+            Thread.sleep(300)
+            val events = diag.snapshot()
+            assertTrue(events.any { it.contains("resp 413") }, events.toString())
+            assertFalse(events.any { it.contains("malformed-head") }, events.toString())
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun pairedPermittedSnippetIsStored() {
+        val store = ReceivedSnippets()
+        Harness(snippets = store).use { h ->
+            h.selfPair()
+            val resp = h.request(h.identity, post("/api/v1/snippet", """{"text":"hello phone"}"""))
+            assertEquals(200, status(resp), resp)
+            assertTrue(body(resp).contains("\"id\""), body(resp))
+            assertEquals(listOf("hello phone"), store.list().map { it.text })
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun unpairedSnippetIsRefused() {
+        val store = ReceivedSnippets()
+        Harness(snippets = store).use { h ->
+            val desk = Identity.generate("Desk")
+            val resp = h.request(desk, post("/api/v1/snippet", """{"text":"hello"}"""))
+            assertEquals(403, status(resp), resp)
+            assertTrue(body(resp).contains("not permitted"), body(resp))
+            assertTrue(store.list().isEmpty())
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun snippetWithoutPushPermissionIsRefused() {
+        val store = ReceivedSnippets()
+        Harness(snippets = store).use { h ->
+            h.trust.save(PairedPeer(h.identity.deviceId, "Self", "127.0.0.1", 1, browse = true, push = false, pairedAt = 0))
+            val resp = h.request(h.identity, post("/api/v1/snippet", """{"text":"hello"}"""))
+            assertEquals(403, status(resp), resp)
+            assertTrue(body(resp).contains("not permitted"), body(resp))
+            assertTrue(store.list().isEmpty())
+        }
+    }
+
+    @Test
+    @Timeout(60)
+    fun oversizedSnippetIsRejected() {
+        val store = ReceivedSnippets()
+        Harness(snippets = store).use { h ->
+            h.selfPair()
+            val big = "x".repeat(SnippetProtocol.MAX_SNIPPET_BYTES + 1)
+            val resp = h.request(h.identity, post("/api/v1/snippet", """{"text":"$big"}"""))
+            assertEquals(400, status(resp), resp)
+            assertTrue(body(resp).contains("exceeds"), body(resp))
+            assertTrue(store.list().isEmpty())
         }
     }
 

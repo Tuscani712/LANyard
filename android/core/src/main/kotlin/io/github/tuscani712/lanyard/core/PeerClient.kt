@@ -39,6 +39,11 @@ data class PeerHello(
     val os: String,
     val version: String,
     val port: Int,
+    // The receiver's advertised offer caps, for batching a push. Zero means the
+    // peer advertised none (an older build), so the sender falls back to its own
+    // conservative limits (see [PushBatching]).
+    val maxOfferBytes: Long = 0,
+    val maxOfferFiles: Int = 0,
 )
 
 /**
@@ -100,6 +105,8 @@ class PeerClient(
             os = json.str("os"),
             version = json.str("version"),
             port = json.int("port"),
+            maxOfferBytes = json.long("max_offer_bytes"),
+            maxOfferFiles = json.int("max_offer_files"),
         )
     }
 
@@ -134,17 +141,7 @@ class PeerClient(
     }
 
     fun pushOffer(files: List<PushFileRequest>): PushOffer {
-        val arr = JsonArray()
-        files.forEach { f ->
-            arr.add(JsonObject().apply {
-                addProperty("rel_path", f.relPath)
-                addProperty("size", f.size)
-                // Go's inbox.FileReq.MTime is a time.Time (RFC3339), not a number.
-                addProperty("mtime", java.time.Instant.ofEpochMilli(f.mtimeMillis).toString())
-            })
-        }
-        val body = JsonObject().apply { add("files", arr) }
-        val json = requestJson("POST", "/push/offer", body.toString())
+        val json = requestJson("POST", "/push/offer", pushOfferBody(files))
         val offsets = HashMap<String, Long>()
         json.getAsJsonArray("files")?.forEach { element ->
             val e = element.asJsonObject

@@ -4,6 +4,9 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
 
 /**
  * The peer-error mapping shared with the desktop (403 is never "unreachable").
@@ -73,9 +76,47 @@ class PeerErrorsTest {
     }
 
     @Test
+    fun payloadTooLargeReadsAsAnActionableMessage() {
+        val e = PeerStatusException(413, """{"error":"body too large"}""")
+        assertFalse(PeerErrors.isNotPaired(e))
+        assertEquals(PeerErrors.TOO_LARGE, PeerErrors.userMessage(e))
+    }
+
+    @Test
     fun transportFailureIsNotReportedAsNotPaired() {
         val e = RuntimeException("connect: connection refused")
         assertFalse(PeerErrors.isNotPaired(e))
         assertEquals("connect: connection refused", PeerErrors.userMessage(e))
+    }
+
+    @Test
+    fun offlineReasonDistinguishesTimeoutFromRefusal() {
+        assertEquals(
+            PeerErrors.OFFLINE_TIMEOUT,
+            PeerErrors.offlineReason(SocketTimeoutException("Read timed out")),
+            "a timed-out probe points at a firewall",
+        )
+        assertEquals(
+            PeerErrors.OFFLINE_REFUSED,
+            PeerErrors.offlineReason(ConnectException("Connection refused")),
+            "a refused connect means the app is likely closed",
+        )
+        assertEquals(
+            PeerErrors.OFFLINE_UNREACHABLE,
+            PeerErrors.offlineReason(IOException("no route to host")),
+            "any other transport error is neutral",
+        )
+        assertEquals(
+            PeerErrors.OFFLINE_UNREACHABLE,
+            PeerErrors.offlineReason(null),
+            "a missing throwable is neutral, never a crash",
+        )
+    }
+
+    @Test
+    fun offlineReasonCodeIsAShortGreppableToken() {
+        assertEquals("timeout", PeerErrors.offlineReasonCode(SocketTimeoutException()))
+        assertEquals("refused", PeerErrors.offlineReasonCode(ConnectException()))
+        assertEquals("unreachable", PeerErrors.offlineReasonCode(IOException("boom")))
     }
 }

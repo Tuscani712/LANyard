@@ -282,6 +282,19 @@ private fun PairedRow(status: PairedStatus, onClick: () -> Unit) {
                     fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
+                // Show *why* the peer is offline (timeout vs refused vs other),
+                // not just "Offline", so a firewall is distinguishable from an
+                // app that is closed.
+                if (!status.online) {
+                    status.offlineReason?.let {
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
             }
             Text(
                 if (status.online) "Online" else "Offline",

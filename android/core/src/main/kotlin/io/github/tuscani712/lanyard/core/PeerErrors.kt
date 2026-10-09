@@ -1,6 +1,8 @@
 package io.github.tuscani712.lanyard.core
 
 import com.google.gson.JsonParser
+import java.net.ConnectException
+import java.net.SocketTimeoutException
 
 /**
  * The one place a peer's HTTP failure becomes a line a person should read.
@@ -13,6 +15,19 @@ import com.google.gson.JsonParser
 object PeerErrors {
     /** Shown when a peer refuses an action with a generic 403. */
     const val NOT_PAIRED = "Not paired with this device."
+
+    /** An offline probe that timed out: a firewall may be dropping the packets. */
+    const val OFFLINE_TIMEOUT = "Timed out — may be blocked by a firewall."
+
+    /** An offline probe whose connect was actively refused: the app is likely closed. */
+    const val OFFLINE_REFUSED = "Connection refused — the app may be closed."
+
+    /** An offline probe that failed for some other transport reason. */
+    const val OFFLINE_UNREACHABLE = "Could not reach the device."
+
+    /** Shown when the peer's inbox cannot accept a list this large (HTTP 413). */
+    const val TOO_LARGE =
+        "The other device can't accept a list this large; send fewer files at a time."
 
     /**
      * The only reason that means the peer dropped the pairing. Match is exact
@@ -61,10 +76,33 @@ object PeerErrors {
         if (t == null) return ""
         if (t !is PeerStatusException) return t.message ?: "Could not reach the device."
         val msg = reason(t.body)
+        if (t.code == 413) return TOO_LARGE
         if (t.code == 403) {
             return if (msg.isNotEmpty() && !genericForbidden.contains(msg.lowercase())) msg else NOT_PAIRED
         }
         return msg.ifEmpty { "The other device answered with an error (HTTP ${t.code})." }
+    }
+
+    /**
+     * The wording for a failed reachability probe. A timeout is a firewall that
+     * drops packets, a connection refusal is a peer that is not listening (the
+     * app is closed); everything else is the neutral "could not reach". This is
+     * display-only and never changes whether a peer is treated as paired.
+     */
+    fun offlineReason(t: Throwable?): String = when (t) {
+        is SocketTimeoutException -> OFFLINE_TIMEOUT
+        is ConnectException -> OFFLINE_REFUSED
+        else -> OFFLINE_UNREACHABLE
+    }
+
+    /**
+     * A short, stable token for the diagnostics line (`reason=timeout`), so a
+     * copied report is greppable without the localised sentence.
+     */
+    fun offlineReasonCode(t: Throwable?): String = when (t) {
+        is SocketTimeoutException -> "timeout"
+        is ConnectException -> "refused"
+        else -> "unreachable"
     }
 
     /** Extracts the `error` field of an error body, else the trimmed body. */

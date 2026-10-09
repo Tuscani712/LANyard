@@ -4,6 +4,7 @@ import android.content.ContentValues
 import android.content.Context
 import android.os.Build
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.MediaStore
 import androidx.annotation.RequiresApi
 import io.github.tuscani712.lanyard.core.InboxPaths
@@ -29,10 +30,24 @@ fun defaultInboxDestination(context: Context): PushDestination =
 /** The folder name shown next to Downloads. */
 const val INBOX_FOLDER_NAME = InboxPaths.FOLDER_NAME
 
+/** The DocumentsContract authority for the device's primary shared storage. */
+private const val EXTERNAL_STORAGE_DOCUMENTS = "com.android.externalstorage.documents"
+
+/**
+ * A `content://` tree URI for a path relative to primary shared storage, so the
+ * folder is openable on every supported API without exposing a `file://` URI.
+ * Falls back to null when the document id cannot be encoded.
+ */
+internal fun primaryTreeUri(relativePath: String): String? = runCatching {
+    DocumentsContract.buildTreeDocumentUri(EXTERNAL_STORAGE_DOCUMENTS, "primary:$relativePath").toString()
+}.getOrNull()
+
 /** MediaStore Downloads/LANyard on Android 10+. */
 @RequiresApi(Build.VERSION_CODES.Q)
 private class MediaStoreInboxDestination(private val context: Context) : PushDestination {
     override fun folder(): String = InboxPaths.DEFAULT_LABEL
+
+    override fun folderLocation(): String = primaryTreeUri(InboxPaths.defaultRelative()).orEmpty()
 
     override fun place(relPath: String, spool: File, size: Long): String {
         val sub = relPath.substringBeforeLast('/', "")
@@ -74,6 +89,12 @@ private class MediaStoreInboxDestination(private val context: Context) : PushDes
 /** App-specific external files dir on Android 9 and below (no permission). */
 private class AppExternalInboxDestination(private val context: Context) : PushDestination {
     override fun folder(): String = InboxPaths.DEFAULT_LABEL
+
+    override fun folderLocation(): String {
+        val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), INBOX_FOLDER_NAME)
+        val relative = dir.absolutePath.substringAfter("/storage/emulated/0/", dir.absolutePath)
+        return primaryTreeUri(relative) ?: dir.absolutePath
+    }
 
     override fun place(relPath: String, spool: File, size: Long): String {
         val root = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), INBOX_FOLDER_NAME)

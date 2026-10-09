@@ -1,5 +1,6 @@
 package io.github.tuscani712.lanyard.ui
 
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -27,22 +28,33 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import io.github.tuscani712.lanyard.PeerService
 import io.github.tuscani712.lanyard.SettingsHolder
+import io.github.tuscani712.lanyard.core.Display
+import io.github.tuscani712.lanyard.core.OpenFolder
+import io.github.tuscani712.lanyard.core.ReceivedSnippet
 import io.github.tuscani712.lanyard.core.SpeedUnit
 import io.github.tuscani712.lanyard.core.TransferRecord
 import io.github.tuscani712.lanyard.core.TransferState
 import io.github.tuscani712.lanyard.core.formatBytes
 import io.github.tuscani712.lanyard.core.formatRateAndEta
 import io.github.tuscani712.lanyard.core.formatSpeed
+import io.github.tuscani712.lanyard.transfer.OpenFolderIntents
 import io.github.tuscani712.lanyard.transfer.TransferManager
 
 @Composable
 fun TransfersScreen(padding: PaddingValues) {
     val records by TransferManager.state.collectAsStateWithLifecycle()
     val settings by SettingsHolder.settings.collectAsStateWithLifecycle()
+    val receivedText by PeerService.receivedText.collectAsStateWithLifecycle()
+    val clipboard = LocalClipboardManager.current
 
     // Back never cancels a transfer: while anything is running, Back leaves the
     // transfers alone (the foreground service keeps them going). Nothing here
@@ -50,7 +62,7 @@ fun TransfersScreen(padding: PaddingValues) {
     val active = records.any { it.state == TransferState.Running || it.state == TransferState.Queued }
     BackHandler(enabled = active) { /* keep transfers running; do not cancel */ }
 
-    if (records.isEmpty()) {
+    if (records.isEmpty() && receivedText.isEmpty()) {
         Column(
             modifier = Modifier.fillMaxSize().padding(padding).padding(32.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -75,6 +87,22 @@ fun TransfersScreen(padding: PaddingValues) {
             }
         }
         LazyColumn(modifier = Modifier.fillMaxSize().weight(1f)) {
+            if (receivedText.isNotEmpty()) {
+                item(key = "received-text-header") {
+                    Text(
+                        "Received text",
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    )
+                }
+                items(receivedText, key = { "text_${it.id}" }) { snippet ->
+                    ReceivedTextRow(
+                        snippet,
+                        onCopy = { text -> clipboard.setText(AnnotatedString(text)) },
+                        onDismiss = { PeerService.dismissReceivedText(snippet.id) },
+                    )
+                }
+            }
             items(records, key = { it.id }) { record ->
                 TransferRow(
                     record,
@@ -88,7 +116,49 @@ fun TransfersScreen(padding: PaddingValues) {
 }
 
 @Composable
+private fun ReceivedTextRow(snippet: ReceivedSnippet, onCopy: (String) -> Unit, onDismiss: () -> Unit) {
+    Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+        Column(modifier = Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Icon(
+                    Icons.Filled.Download,
+                    contentDescription = null,
+                    modifier = Modifier.size(24.dp),
+                )
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("Text", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "from ${Display.shortFp(snippet.peerFingerprint)}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            Text(
+                snippet.text,
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 6,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                OutlinedButton(onClick = { onCopy(snippet.text) }) { Text("Copy") }
+                Spacer(Modifier.width(8.dp))
+                OutlinedButton(onClick = onDismiss) { Text("Dismiss") }
+            }
+        }
+    }
+}
+
+@Composable
 private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: () -> Unit, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    // "Open folder" is only for a finished receive that knows where it landed.
+    val openable = record.state == TransferState.Done &&
+        record.direction == "receive" &&
+        OpenFolder.targetFor(record.destinationUri) != null
     Card(modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -168,6 +238,20 @@ private fun TransferRow(record: TransferRecord, speedUnit: SpeedUnit, onCancel: 
             } else {
                 Spacer(Modifier.height(8.dp))
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                    if (openable) {
+                        OutlinedButton(
+                            onClick = {
+                                if (!OpenFolderIntents.open(context, record.destinationUri)) {
+                                    Toast.makeText(
+                                        context,
+                                        "Saved to ${record.destinationFolder ?: "the download folder"}",
+                                        Toast.LENGTH_LONG,
+                                    ).show()
+                                }
+                            },
+                        ) { Text("Open folder") }
+                        Spacer(Modifier.width(8.dp))
+                    }
                     OutlinedButton(onClick = onDismiss) { Text("Dismiss") }
                 }
             }
