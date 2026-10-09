@@ -40,6 +40,9 @@ data class TransferRecord(
     // filesystem path), for the "Open folder" action. Null when the destination
     // has no location (or for sends), so the action is simply left off.
     val destinationUri: String? = null,
+    // How many files a Preparing row covers (the picked selection), so the device
+    // screen can say "Preparing N file(s)" for a batch. 0 when not known.
+    val fileCount: Int = 0,
     // Set while a live row is in its final window: every byte has arrived
     // (receive) or been written (send), but the transfer is still hashing,
     // copying the spool into the destination, or waiting for the receiver's
@@ -234,3 +237,14 @@ class TransferBoard(
         records = loaded.take(historyCap)
     }
 }
+
+/**
+ * Files being prepared per peer (lowercased fingerprint), summed over every
+ * Preparing row. A batch is one row covering many files, so this sums each
+ * row's [TransferRecord.fileCount] (at least 1 per row) instead of counting rows.
+ */
+fun preparingFilesByPeer(rows: List<TransferRecord>): Map<String, Int> =
+    rows.asSequence()
+        .filter { it.state == TransferState.Preparing }
+        .groupBy { it.peerFingerprint.lowercase() }
+        .mapValues { (_, list) -> list.sumOf { it.fileCount.coerceAtLeast(1) } }

@@ -434,6 +434,7 @@ object TransferManager {
                     TransferRecord(
                         id, "send", peer.name, peer.fingerprint,
                         "${uris.size} file(s)", 0, 0, TransferState.Preparing, null, 0.0, now(),
+                        fileCount = uris.size,
                     ),
                 )
                 logPrepare("[push] preparing peer=${Display.shortFp(peer.fingerprint)} files=${uris.size} id=$id")

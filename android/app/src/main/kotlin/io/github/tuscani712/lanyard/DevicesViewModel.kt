@@ -212,10 +212,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Files being prepared per peer fingerprint, from the current board. */
     private fun preparingCounts(rows: List<io.github.tuscani712.lanyard.core.TransferRecord>): Map<String, Int> =
-        rows.asSequence()
-            .filter { it.state == TransferState.Preparing }
-            .groupingBy { it.peerFingerprint.lowercase() }
-            .eachCount()
+        io.github.tuscani712.lanyard.core.preparingFilesByPeer(rows)
 
     fun refreshPaired() {
         viewModelScope.launch {
