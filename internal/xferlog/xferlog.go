@@ -50,6 +50,7 @@ const (
 	StepOffer    = "offer"
 	StepFile     = "file"     // one per-file PUT (send) or receipt (receive)
 	StepComplete = "complete" // per-file or final finalize
+	StepCancel   = "cancel"   // a push the sender asked to stop
 	StepSnippet  = "snippet"  // short text message
 )
 
@@ -324,7 +325,7 @@ func (r *Recorder) Report() string {
 			fmt.Fprintf(&b, " elapsed=%s", e.Elapsed.Round(time.Millisecond))
 		}
 		if e.SpeedBps > 0 {
-			fmt.Fprintf(&b, " speed=%d B/s", e.SpeedBps)
+			fmt.Fprintf(&b, " speed=%s", FormatSpeed(e.SpeedBps))
 		}
 		if e.Error != "" {
 			fmt.Fprintf(&b, " err=%q", Scrub(e.Error))
@@ -345,4 +346,26 @@ func (e Entry) logTag() string {
 		return e.Step
 	}
 	return e.outcomeTag()
+}
+
+// FormatSpeed renders a bytes-per-second rate adaptively (B/s, KB/s, MB/s,
+// GB/s, TB/s) using decimal (1000) thresholds. It mirrors the desktop UI's
+// formatter so a slow transfer is never reported as the useless "0.0 MB/s". A
+// non-positive rate yields "", and the same boundaries as web/app.js's fmtRate
+// are pinned by tests on both sides.
+func FormatSpeed(bps int64) string {
+	if bps <= 0 {
+		return ""
+	}
+	units := []string{"B/s", "KB/s", "MB/s", "GB/s", "TB/s"}
+	v := float64(bps)
+	i := 0
+	for v >= 1000 && i < len(units)-1 {
+		v /= 1000
+		i++
+	}
+	if i == 0 {
+		return fmt.Sprintf("%d %s", bps, units[i])
+	}
+	return fmt.Sprintf("%.1f %s", v, units[i])
 }

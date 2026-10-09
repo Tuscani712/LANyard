@@ -95,3 +95,43 @@ func displayDue(last, now time.Time, every time.Duration) bool {
 	}
 	return last.IsZero() || now.Sub(last) >= every
 }
+
+// RollingCountPerSecond returns the event rate over the trailing window ending
+// at now, given event timestamps in time order. It is used for the
+// files-per-second rate that keeps a many-small-files ETA honest: dividing the
+// number of completions inside the window by the full window width (rather than
+// the span actually observed) mirrors rollingRate's anti-spike behaviour and
+// yields a stable figure even when a burst of files lands together. It returns
+// 0 when there is no window or no event inside it.
+func RollingCountPerSecond(times []time.Time, now time.Time, window time.Duration) float64 {
+	if window <= 0 || len(times) == 0 {
+		return 0
+	}
+	start := now.Add(-window)
+	n := 0
+	for _, t := range times {
+		if t.After(now) {
+			break
+		}
+		if !t.Before(start) {
+			n++
+		}
+	}
+	if n == 0 {
+		return 0
+	}
+	return float64(n) / window.Seconds()
+}
+
+// MaxETA combines the byte-based and file-based ETAs by taking the larger: a
+// many-small-files push is latency-bound, so its byte rate can make the byte
+// ETA swing wildly (hours) while the file rate stays honest. Taking the max
+// never reports a finish sooner than either estimate allows, so the shown ETA
+// is the conservative of the two. A non-positive value on either side is
+// ignored.
+func MaxETA(byteETA, fileETA int) int {
+	if fileETA > byteETA {
+		return fileETA
+	}
+	return byteETA
+}

@@ -178,3 +178,51 @@ func TestObserveRateDisplayAtMostOncePerSecond(t *testing.T) {
 		}
 	}
 }
+
+// MaxETA must take the conservative (larger) of the two estimates, so a
+// many-small-files push whose byte ETA is optimistic is not understated, and an
+// unknown side (0) never wins over a known one.
+func TestMaxETACombination(t *testing.T) {
+	cases := []struct {
+		byteETA, fileETA, want int
+	}{
+		{0, 0, 0},
+		{100, 0, 100},
+		{0, 300, 300},
+		{100, 200, 200}, // the file rate is the honest one, e.g. many small files
+		{900, 200, 900}, // the byte ETA is the conservative one
+		{200, 200, 200}, // tie
+	}
+	for _, c := range cases {
+		if got := MaxETA(c.byteETA, c.fileETA); got != c.want {
+			t.Errorf("MaxETA(%d, %d) = %d, want %d", c.byteETA, c.fileETA, got, c.want)
+		}
+	}
+}
+
+// RollingCountPerSecond counts only events inside the trailing window and
+// divides by the full window, mirroring rollingRate's anti-spike smoothing.
+func TestRollingCountPerSecond(t *testing.T) {
+	base := time.Unix(0, 0)
+	// Five completions, one per second, ending at t=5.
+	times := make([]time.Time, 0, 5)
+	for i := 1; i <= 5; i++ {
+		times = append(times, base.Add(time.Duration(i)*time.Second))
+	}
+	if got := RollingCountPerSecond(times, base.Add(5*time.Second), RateWindow); got != 1 {
+		t.Fatalf("5 in a 5s window = %v, want 1/s", got)
+	}
+	// A later evaluation prunes stale events: only the last two are inside.
+	if got := RollingCountPerSecond(times, base.Add(9*time.Second), RateWindow); got != 0.4 {
+		t.Fatalf("2 in a 5s window = %v, want 0.4/s", got)
+	}
+	if got := RollingCountPerSecond(nil, base, RateWindow); got != 0 {
+		t.Fatalf("no events = %v, want 0", got)
+	}
+	if got := RollingCountPerSecond(times, base.Add(time.Hour), RateWindow); got != 0 {
+		t.Fatalf("all events stale = %v, want 0", got)
+	}
+	if got := RollingCountPerSecond(times, base.Add(5*time.Second), 0); got != 0 {
+		t.Fatalf("zero window = %v, want 0", got)
+	}
+}

@@ -468,7 +468,7 @@ func TestCancelReportsReceivedFiles(t *testing.T) {
 	var gotPeer string
 	var gotFiles []ReceivedFile
 	var gotStarted time.Time
-	m.SetOnCancel(func(peerFP string, files []ReceivedFile, started time.Time) {
+	m.SetOnCancel(func(peerFP string, files []ReceivedFile, started time.Time, reason string) {
 		gotPeer, gotFiles, gotStarted = peerFP, files, started
 	})
 
@@ -491,6 +491,62 @@ func TestCancelReportsReceivedFiles(t *testing.T) {
 	}
 	if gotStarted.IsZero() {
 		t.Fatal("start time was not reported")
+	}
+}
+
+// CancelBy is owner-only: a sender may stop its own push, but another peer's
+// cancel must be a harmless no-op (and the route answers 200), so one paired
+// device can never stop another's push. It is also idempotent: a second cancel
+// of an already-gone id returns false.
+func TestCancelByOwnerOnlyAndIdempotent(t *testing.T) {
+	m := New(t.TempDir(), nil)
+	data := []byte("bytes")
+	p, err := m.Offer("peer-a", "paired", []FileReq{{RelPath: "a.txt", Size: int64(len(data))}}, 0)
+	if err != nil {
+		t.Fatalf("Offer: %v", err)
+	}
+
+	if m.CancelBy(p.ID, "peer-b", "Cancelled by the sender") {
+		t.Fatal("a non-owner cancel must not stop the push")
+	}
+	if got := m.Incoming(); len(got) != 1 {
+		t.Fatalf("push disappeared after a non-owner cancel: %+v", got)
+	}
+
+	if !m.CancelBy(p.ID, "peer-a", "Cancelled by the sender") {
+		t.Fatal("the owner's cancel must stop the push")
+	}
+	if got := m.Incoming(); len(got) != 0 {
+		t.Fatalf("push still listed after the owner cancelled: %+v", got)
+	}
+	// Idempotent: the id is gone, so a repeat is a no-op the route answers 200.
+	if m.CancelBy(p.ID, "peer-a", "Cancelled by the sender") {
+		t.Error("a second cancel of a gone push must be a no-op")
+	}
+	if m.CancelBy("p_nope", "peer-a", "Cancelled by the sender") {
+		t.Error("an unknown id must be a no-op")
+	}
+}
+
+// A sender-requested cancel carries its reason to onCancel so the receiver can
+// label the history row "Cancelled by the sender".
+func TestCancelByReportsReason(t *testing.T) {
+	m := New(t.TempDir(), nil)
+	var gotReason string
+	var called bool
+	m.SetOnCancel(func(peerFP string, files []ReceivedFile, started time.Time, reason string) {
+		called, gotReason = true, reason
+	})
+	data := []byte("kept")
+	p, err := m.Offer("peer", "paired", []FileReq{{RelPath: "a.txt", Size: int64(len(data))}}, 0)
+	if err != nil {
+		t.Fatalf("Offer: %v", err)
+	}
+	if !m.CancelBy(p.ID, "peer", "Cancelled by the sender") {
+		t.Fatal("CancelBy returned false")
+	}
+	if !called || gotReason != "Cancelled by the sender" {
+		t.Fatalf("onCancel reason = %q (called=%v), want %q", gotReason, called, "Cancelled by the sender")
 	}
 }
 

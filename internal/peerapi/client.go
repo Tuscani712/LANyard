@@ -369,6 +369,14 @@ func (c *Client) PushComplete(ctx context.Context, host string, port int, expect
 	return c.doJSON(ctx, http.MethodPost, u, strings.NewReader(string(b)), expectedFP, nil)
 }
 
+// CancelPush asks the receiver to stop an offered push. It is best-effort: an
+// older peer without the route answers 404 (a StatusError the caller ignores),
+// and the receiver treats an unknown id as a harmless success.
+func (c *Client) CancelPush(ctx context.Context, host string, port int, expectedFP, pushID string) error {
+	u := c.base(host, port) + "/push/" + url.PathEscape(pushID) + "/cancel"
+	return c.doJSON(ctx, http.MethodPost, u, nil, expectedFP, nil)
+}
+
 // VerifiedFile is one file the receiver has downloaded and hash-verified.
 type VerifiedFile struct {
 	Path   string `json:"path"`

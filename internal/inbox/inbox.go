@@ -164,6 +164,10 @@ type Push struct {
 	speedBits atomic.Uint64
 	// etaBits holds the displayed ETA in whole seconds, published atomically.
 	etaBits atomic.Int64
+	// fileDone times every completed file, for the rolling files-per-second rate
+	// that keeps a many-small-files ETA honest. Guarded by samplesMu so it can be
+	// appended as files land while Incoming() reads it.
+	fileDone []time.Time
 }
 
 // observeRate records the cumulative byte total and republishes the smoothed
@@ -201,6 +205,31 @@ func (p *Push) speed() float64 { return math.Float64frombits(p.speedBits.Load())
 
 // eta returns the current displayed ETA in whole seconds, or 0 when unknown.
 func (p *Push) eta() int { return int(p.etaBits.Load()) }
+
+// observeFileDone records a completed file for the rolling files-per-second
+// rate, pruning timestamps older than the smoothing window. It is called as
+// each file lands (whole-file Receive or per-file Complete).
+func (p *Push) observeFileDone(now time.Time) {
+	p.samplesMu.Lock()
+	p.fileDone = append(p.fileDone, now)
+	cutoff := now.Add(-RateWindow)
+	drop := 0
+	for drop < len(p.fileDone) && p.fileDone[drop].Before(cutoff) {
+		drop++
+	}
+	if drop > 0 {
+		p.fileDone = append(p.fileDone[:0], p.fileDone[drop:]...)
+	}
+	p.samplesMu.Unlock()
+}
+
+// fileRate returns the rolling files-per-second rate over the trailing window,
+// or 0 when no file has completed recently.
+func (p *Push) fileRate(now time.Time) float64 {
+	p.samplesMu.Lock()
+	defer p.samplesMu.Unlock()
+	return RollingCountPerSecond(p.fileDone, now, RateWindow)
+}
 
 // ErrCancelled is returned to the sender once the receiving person has
 // cancelled an accepted push.
@@ -314,8 +343,9 @@ func (m *Manager) Incoming() []IncomingView {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	out := make([]IncomingView, 0, len(m.pushes))
+	now := m.now()
 	for _, p := range m.pushes {
-		v := IncomingView{ID: p.ID, PeerFP: p.PeerFP, Mode: p.Mode, Total: p.Total, SpeedMBps: p.speed() / 1e6, ETASeconds: p.eta(), FilesTotal: len(p.Files), StartedAt: p.CreatedAt, Finishing: p.finishing()}
+		v := IncomingView{ID: p.ID, PeerFP: p.PeerFP, Mode: p.Mode, Total: p.Total, SpeedMBps: p.speed() / 1e6, FilesTotal: len(p.Files), StartedAt: p.CreatedAt, Finishing: p.finishing()}
 		for _, f := range p.Files {
 			d := f.Done
 			if l := f.live.Load(); l > d {
@@ -331,10 +361,29 @@ func (m *Manager) Incoming() []IncomingView {
 				v.Current = f.RelPath
 			}
 		}
+		// ETA is the conservative of the byte-based and file-based estimates: a
+		// many-small-files push is latency-bound, so the byte rate alone can make
+		// the ETA swing between hours; the rolling files-per-second rate keeps it
+		// honest and MaxETA takes whichever finishes later.
+		v.ETASeconds = MaxETA(p.eta(), fileETA(p, v.FilesTotal-v.FilesDone, now))
 		out = append(out, v)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].StartedAt.Before(out[j].StartedAt) })
 	return out
+}
+
+// fileETA is remaining files divided by the push's rolling files-per-second
+// rate, or 0 when either is unknown. It is a free function so the combination
+// stays a single testable step (see MaxETA).
+func fileETA(p *Push, remainingFiles int, now time.Time) int {
+	if remainingFiles <= 0 {
+		return 0
+	}
+	rate := p.fileRate(now)
+	if rate <= 0 {
+		return 0
+	}
+	return int(float64(remainingFiles) / rate)
 }
 
 // HasActivePush reports whether a push from peerFP is currently registered
@@ -355,15 +404,32 @@ func (m *Manager) HasActivePush(peerFP string) bool {
 }
 
 // Cancel stops an accepted push. Files already received stay; partial files
-// are removed. The sender's next request fails with ErrCancelled.
-func (m *Manager) Cancel(id string) bool {
+// are removed. The sender's next request fails with ErrCancelled. It is the
+// local UI path (the receiving person stopping a push).
+func (m *Manager) Cancel(id string) bool { return m.cancelOwned(id, "", "") }
+
+// CancelBy stops an accepted push only when it belongs to peerFP: a sender may
+// stop its own push but never another peer's. It reports whether a live push
+// was cancelled. An unknown id, or one owned by another peer, is a harmless
+// no-op so the caller can answer 200 (idempotent, safe to retry). reason is
+// carried to the Cancelled history entry.
+func (m *Manager) CancelBy(id, peerFP, reason string) bool {
+	return m.cancelOwned(id, peerFP, reason)
+}
+
+func (m *Manager) cancelOwned(id, peerFP, reason string) bool {
 	var received []ReceivedFile
 	var started time.Time
-	var peerFP string
+	var owner string
 	m.mu.Lock()
 	p, ok := m.pushes[id]
+	if ok && peerFP != "" && p.PeerFP != peerFP {
+		// Not the owner: leave the push untouched.
+		m.mu.Unlock()
+		return false
+	}
 	if ok {
-		peerFP, started = p.PeerFP, p.CreatedAt
+		owner, started = p.PeerFP, p.CreatedAt
 		for _, f := range p.Files {
 			if f.Size > 0 && f.Done >= f.Size {
 				name := filepath.Base(f.Final)
@@ -389,7 +455,7 @@ func (m *Manager) Cancel(id string) bool {
 		}
 	}
 	if m.onCancel != nil {
-		m.onCancel(peerFP, received, started)
+		m.onCancel(owner, received, started, reason)
 	}
 	m.onChange()
 	return true
@@ -411,7 +477,7 @@ type Manager struct {
 	onDone    func(peerFP string, files []ReceivedFile)
 	onSnippet func(peerFP, text string)
 	onFail    func(peerFP, reason string)
-	onCancel  func(peerFP string, files []ReceivedFile, started time.Time)
+	onCancel  func(peerFP string, files []ReceivedFile, started time.Time, reason string)
 
 	// Tunables; overridable before or during use. now is injectable for tests.
 	now           func() time.Time
@@ -557,9 +623,11 @@ func (m *Manager) notifyProgress() {
 // connection died or stalled. The reason is for logs and the transfer history.
 func (m *Manager) SetOnFail(fn func(peerFP, reason string)) { m.onFail = fn }
 
-// SetOnCancel registers a callback for a push the receiving person stops, with
-// the files that had already landed, so a Cancelled history entry is recorded.
-func (m *Manager) SetOnCancel(fn func(peerFP string, files []ReceivedFile, started time.Time)) {
+// SetOnCancel registers a callback for a push that is stopped, with the files
+// that had already landed and the reason ("" for a local cancel, "Cancelled by
+// the sender" for a sender-requested one), so a Cancelled history entry is
+// recorded.
+func (m *Manager) SetOnCancel(fn func(peerFP string, files []ReceivedFile, started time.Time, reason string)) {
 	m.onCancel = fn
 }
 
@@ -1084,6 +1152,7 @@ func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileSt
 	st.completeDone.Store(true)
 	m.releasePartLocked(st.Part, p.ID)
 	m.mu.Unlock()
+	p.observeFileDone(m.now())
 	m.onChange()
 	return st, false, nil
 }
@@ -1145,6 +1214,7 @@ func (m *Manager) Complete(id, peerFP, rel, wantSHA string) (*FileState, bool, e
 	m.mu.Lock()
 	m.releasePartLocked(st.Part, p.ID)
 	m.mu.Unlock()
+	p.observeFileDone(m.now())
 	m.onChange()
 	return st, false, nil
 }

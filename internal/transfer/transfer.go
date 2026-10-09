@@ -181,10 +181,17 @@ type Job struct {
 	lastBytes    int64              `json:"-"`
 	lastAt       time.Time          `json:"-"`
 	lastProgress time.Time          `json:"-"`
-	retryAt      time.Time          `json:"-"`
-	attempt      int                `json:"-"`
-	running      bool               `json:"-"`
-	wake         chan struct{}      `json:"-"` // nudges a retrying worker (peer reappeared)
+	// fileDone times every file completion, backing the rolling
+	// files-per-second rate that keeps a many-small-files ETA honest. Guarded by
+	// job.mu.
+	fileDone []time.Time `json:"-"`
+	// pushIDs are the receiver push ids this job has offered so far, so a cancel
+	// can ask the peer to stop each one. Guarded by job.mu.
+	pushIDs []string      `json:"-"`
+	retryAt time.Time     `json:"-"`
+	attempt int           `json:"-"`
+	running bool          `json:"-"`
+	wake    chan struct{} `json:"-"` // nudges a retrying worker (peer reappeared)
 }
 
 // View is the JSON shape handed to the local UI.
@@ -377,34 +384,53 @@ func archiveJob(j *Job) jobArchive {
 }
 
 func (m *Manager) persist() {
+	// Snapshot each job's classification and history times under its own lock,
+	// while holding m.mu. This keeps the whole list consistent without racing a
+	// worker goroutine that is still writing job.State (the lock order here,
+	// m.mu then job.mu, matches Cancel/CancelAll/view).
+	type entry struct {
+		job        *Job
+		terminal   bool
+		finishedAt time.Time
+		updatedAt  time.Time
+	}
 	m.mu.Lock()
-	jobs := make([]*Job, 0, len(m.jobs))
-	var finished []*Job
+	entries := make([]entry, 0, len(m.jobs))
 	for _, j := range m.jobs {
-		if isTerminal(j.State) {
-			finished = append(finished, j)
+		j.mu.Lock()
+		e := entry{job: j, terminal: isTerminal(j.State), finishedAt: j.FinishedAt, updatedAt: j.UpdatedAt}
+		j.mu.Unlock()
+		entries = append(entries, e)
+	}
+	jobs := make([]*Job, 0, len(entries))
+	var finished []entry
+	for _, e := range entries {
+		if e.terminal {
+			finished = append(finished, e)
 		} else {
-			jobs = append(jobs, j)
+			jobs = append(jobs, e.job)
 		}
 	}
 	// Keep only the newest history entries; older ones are dropped from memory
 	// and from the saved list, so neither grows without bound.
 	sort.Slice(finished, func(a, b int) bool {
-		ta, tb := finished[a].FinishedAt, finished[b].FinishedAt
+		ta, tb := finished[a].finishedAt, finished[b].finishedAt
 		if ta.Equal(tb) {
-			return finished[a].UpdatedAt.After(finished[b].UpdatedAt)
+			return finished[a].updatedAt.After(finished[b].updatedAt)
 		}
 		return ta.After(tb)
 	})
 	if len(finished) > historyKeep {
-		for _, j := range finished[historyKeep:] {
-			delete(m.jobs, j.ID)
+		for _, e := range finished[historyKeep:] {
+			delete(m.jobs, e.job.ID)
 		}
 		finished = finished[:historyKeep]
 	}
 	m.mu.Unlock()
 
-	jobs = append(jobs, finished...)
+	for _, e := range finished {
+		jobs = append(jobs, e.job)
+	}
 
 	var buf bytes.Buffer
 	buf.WriteByte('[')
@@ -606,6 +632,12 @@ func (m *Manager) RecordReceiveFailed(peerFP, peerName, reason string) {
 // like a finished or failed receive. Files that had already landed are kept and
 // listed; partial files are not.
 func (m *Manager) RecordReceiveCancelled(peerFP, peerName string, files []ReceivedFile, started time.Time) {
+	m.RecordReceiveCancelledReason(peerFP, peerName, "", files, started)
+}
+
+// RecordReceiveCancelledReason is RecordReceiveCancelled with a visible reason
+// (for example "Cancelled by the sender"), carried on the history row's note.
+func (m *Manager) RecordReceiveCancelledReason(peerFP, peerName, reason string, files []ReceivedFile, started time.Time) {
 	now := time.Now()
 	if started.IsZero() {
 		started = now
@@ -615,6 +647,7 @@ func (m *Manager) RecordReceiveCancelled(peerFP, peerName string, files []Receiv
 		Direction:  "receive",
 		PeerID:     peerFP,
 		PeerName:   peerName,
+		Note:       reason,
 		StartedAt:  started,
 		UpdatedAt:  now,
 		FinishedAt: now,
@@ -739,9 +772,16 @@ func (m *Manager) Cancel(id string, deletePartials bool) error {
 	}
 	dest := job.Dest
 	direction := job.Direction
+	host, port, peerID := job.Host, job.Port, job.PeerID
+	pushIDs := append([]string(nil), job.pushIDs...)
 	files := append([]*FileJob(nil), job.Files...)
 	job.mu.Unlock()
 	m.mu.Unlock()
+	// Tell the receiver to stop each offered push before we finish tearing down.
+	// Best-effort: a peer without the route answers 404 and is ignored.
+	if direction == "push" {
+		m.cancelPeerPushes(host, port, peerID, pushIDs)
+	}
 	_ = deletePartials // kept for callers; a cancelled download always drops its partial
 	if direction != "push" {
 		for _, f := range files {
@@ -755,10 +795,40 @@ func (m *Manager) Cancel(id string, deletePartials bool) error {
 	return nil
 }
 
+// cancelPeerPushes asks the receiver to cancel each of a job's offered pushes,
+// best-effort with a short timeout so a hung or older peer can never delay a
+// local cancel. A 404 (an older peer with no cancel route) is ignored; any
+// other failure is logged at debug level and otherwise dropped, because the
+// local job is already Cancelled and the receiver's own stall timeout will
+// eventually reap it.
+func (m *Manager) cancelPeerPushes(host string, port int, peerID string, pushIDs []string) {
+	if m.client == nil || len(pushIDs) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for _, id := range pushIDs {
+		err := m.client.CancelPush(ctx, host, port, peerID, id)
+		var se *peerapi.StatusError
+		if errors.As(err, &se) && se.Code == http.StatusNotFound {
+			continue // older peer: nothing to do
+		}
+		if err != nil && m.log != nil {
+			m.log.Debug("transfers: peer cancel not delivered", "push", id, "err", err)
+		}
+	}
+}
+
 // CancelAll cancels every unfinished job (both directions), keeping each as a
 // Cancelled history entry. Partial files are kept. Used by Cancel all shares
 // (§11.3).
 func (m *Manager) CancelAll() int {
+	type peerPush struct {
+		host, peerID string
+		port         int
+		ids          []string
+	}
+	var notify []peerPush
 	m.mu.Lock()
 	n := 0
 	for _, j := range m.jobs {
@@ -772,11 +842,17 @@ func (m *Manager) CancelAll() int {
 			if j.cancel != nil {
 				j.cancel()
 			}
+			if j.Direction == "push" && len(j.pushIDs) > 0 {
+				notify = append(notify, peerPush{host: j.Host, port: j.Port, peerID: j.PeerID, ids: append([]string(nil), j.pushIDs...)})
+			}
 			n++
 		}
 		j.mu.Unlock()
 	}
 	m.mu.Unlock()
+	for _, p := range notify {
+		m.cancelPeerPushes(p.host, p.port, p.peerID, p.ids)
+	}
 	if n > 0 {
 		m.persist()
 		m.onChange()
@@ -1007,11 +1083,34 @@ func (m *Manager) view(j *Job) *View {
 		}
 	}
 	// ETA comes from the same displayed smoothed speed, never from an
-	// instantaneous sample, so a burst after a pause cannot make it jump.
+	// instantaneous sample, so a burst after a pause cannot make it jump. A
+	// many-small-files push is latency-bound, so the byte rate alone can swing
+	// the estimate between hours; the rolling files-per-second rate keeps it
+	// honest and MaxETA takes the conservative (later) of the two.
 	remaining := j.Total - j.Done
+	byteETA := 0
 	if j.displaySpeed > 1 && remaining > 0 && j.State == StateTransferring {
-		v.ETASeconds = int(float64(remaining) / j.displaySpeed)
+		byteETA = int(float64(remaining) / j.displaySpeed)
 	}
+	fileETA := 0
+	if j.State == StateTransferring {
+		fileRemaining, fileTotal := 0, 0
+		for _, f := range j.Files {
+			fileTotal++
+			if f.State != FileDone {
+				fileRemaining++
+			}
+		}
+		if fileTotal == 0 {
+			fileRemaining = j.FilesTotalStored - j.FilesDoneStored
+		}
+		if fileRemaining > 0 {
+			if fr := inbox.RollingCountPerSecond(j.fileDone, time.Now(), inbox.RateWindow); fr > 0 {
+				fileETA = int(float64(fileRemaining) / fr)
+			}
+		}
+	}
+	v.ETASeconds = inbox.MaxETA(byteETA, fileETA)
 	firstOpen, firstPartial := -1, -1
 	downloading, verifying := 0, 0
 	for i, f := range j.Files {
@@ -1549,6 +1648,7 @@ func (m *Manager) downloadFile(ctx context.Context, job *Job, f *FileJob) error 
 		job.mu.Lock()
 		f.State = FileDone
 		setFileDone(job, f, f.Size)
+		m.noteFileDone(job)
 		job.mu.Unlock()
 		_ = os.Remove(part)
 		_ = os.Remove(statePath)
@@ -1736,6 +1836,7 @@ func (m *Manager) downloadFile(ctx context.Context, job *Job, f *FileJob) error 
 	job.mu.Lock()
 	f.State = FileDone
 	setFileDone(job, f, f.Size)
+	m.noteFileDone(job)
 	job.mu.Unlock()
 	m.onChange()
 	return nil
@@ -1850,6 +1951,21 @@ func contentRangeStart(h string) (int64, bool) {
 	}
 	v, err := strconv.ParseInt(h[:dash], 10, 64)
 	return v, err == nil
+}
+
+// noteFileDone records a completed file for the rolling files-per-second rate,
+// pruning entries older than inbox.RateWindow. Caller holds job.mu.
+func (m *Manager) noteFileDone(job *Job) {
+	now := time.Now()
+	job.fileDone = append(job.fileDone, now)
+	cutoff := now.Add(-inbox.RateWindow)
+	drop := 0
+	for drop < len(job.fileDone) && job.fileDone[drop].Before(cutoff) {
+		drop++
+	}
+	if drop > 0 {
+		job.fileDone = append(job.fileDone[:0], job.fileDone[drop:]...)
+	}
 }
 
 // bumpSpeed updates the exponentially smoothed speed. Caller holds job.mu. The

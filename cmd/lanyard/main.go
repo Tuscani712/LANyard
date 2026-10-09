@@ -34,7 +34,7 @@ import (
 	"lanyard/internal/xferlog"
 )
 
-const version = "1.1.0-beta.9"
+const version = "1.1.0-beta.10"
 
 type runInfo struct {
 	PID     int    `json:"pid"`
@@ -401,13 +401,13 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	})
 	// A push the receiving person stops is kept as a Cancelled history entry,
 	// like a finished or failed receive (files already landed are listed).
-	inboxMgr.SetOnCancel(func(peerFP string, files []inbox.ReceivedFile, started time.Time) {
+	inboxMgr.SetOnCancel(func(peerFP string, files []inbox.ReceivedFile, started time.Time, reason string) {
 		peer := resolvePeer(peerFP)
 		received := make([]transfer.ReceivedFile, 0, len(files))
 		for _, f := range files {
 			received = append(received, transfer.ReceivedFile{Name: f.Name, Size: f.Size})
 		}
-		trMgr.RecordReceiveCancelled(peerFP, peer, received, started)
+		trMgr.RecordReceiveCancelledReason(peerFP, peer, reason, received, started)
 	})
 
 	// A device asking to Connect or Pair is shown even when the window is not

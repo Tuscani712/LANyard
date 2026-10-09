@@ -206,11 +206,26 @@ function fmtBytes(n) {
   while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
   return `${v.toFixed(i ? 2 : 0)} ${u[i]}`;
 }
+// ---- speed formatting (extracted verbatim by speed_format_static_test.go) ----
+// fmtRate formats a byte-per-second value adaptively (B/s, KB/s, MB/s, GB/s, or
+// bps/Kbps/Mbps/Gbps when bits is true) so a slow transfer never reads as the
+// useless "0.0 MB/s". Thresholds are decimal (1000), matching the MB/s the peer
+// API reports (speed_mbps is bytes/1e6). A value only divides when it reaches
+// the next unit, so the largest figure shown is always >= 1.0.
+function fmtRate(bytesPerSec, bits) {
+  if (!bytesPerSec || bytesPerSec <= 0) return "--";
+  const units = bits ? ["bps", "Kbps", "Mbps", "Gbps", "Tbps"] : ["B/s", "KB/s", "MB/s", "GB/s", "TB/s"];
+  let v = bits ? bytesPerSec * 8 : bytesPerSec;
+  let i = 0;
+  while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+  const digits = i === 0 ? 0 : 1;
+  return `${v.toFixed(digits)} ${units[i]}`;
+}
 function fmtSpeed(mbps) {
   if (!mbps || mbps <= 0) return "--";
-  if (settings.speed_unit === "mbps") return `${(mbps * 8).toFixed(1)} Mbps`;
-  return `${mbps.toFixed(1)} MB/s`;
+  return fmtRate(mbps * 1e6, settings.speed_unit === "mbps");
 }
+// ---- end speed formatting ----
 function fmtETA(sec) {
   if (!sec || sec <= 0) return "--";
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
@@ -1339,6 +1354,7 @@ function renderTransfersPage(force) {
         (t.peer_name ? ` \u00b7 ${t.direction === "push" ? "to " : "from "}${t.peer_name}` : "") +
         (t.finished_at ? ` \u00b7 ${fmtWhen(t.finished_at)}` : "");
       row.appendChild(meta);
+      if (t.note) row.appendChild(el("div", "meta", t.note));
       if (t.error) row.appendChild(el("div", "msg err", t.error));
       const acts = el("div", "actions");
       if (t.direction === "receive") {

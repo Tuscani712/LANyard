@@ -198,6 +198,8 @@ func (m *Manager) pushBatch(ctx context.Context, job *Job, files []*FileJob) err
 	job.mu.Lock()
 	job.State = StateTransferring
 	job.Note = ""
+	// Remember the receiver's push id so a cancel can ask the peer to stop it.
+	job.pushIDs = append(job.pushIDs, offer.PushID)
 	job.mu.Unlock()
 	m.onChange()
 
@@ -400,6 +402,7 @@ func (m *Manager) pushOne(ctx context.Context, job *Job, pushID string, f *FileJ
 	f.State = FileDone
 	job.UpdatedAt = time.Now()
 	m.bumpSpeed(job)
+	m.noteFileDone(job)
 	job.mu.Unlock()
 	m.onChange()
 	return nil
@@ -490,6 +493,7 @@ func (m *Manager) pushSmall(ctx context.Context, job *Job, pushID string, f *Fil
 	job.UpdatedAt = time.Now()
 	job.lastProgress = time.Now()
 	m.bumpSpeed(job)
+	m.noteFileDone(job)
 	job.mu.Unlock()
 	m.onChange()
 	return nil

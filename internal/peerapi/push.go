@@ -335,6 +335,26 @@ func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
 	_ = a
 }
 
+// handlePushCancel lets the sender (the owner of the push) ask the receiver to
+// stop a push it is still receiving. It is idempotent and harmless: a known id
+// owned by the caller is cancelled, and an unknown id (or one owned by another
+// peer) is a no-op answered 200, so the route is safe to retry and a peer can
+// never cancel someone else's push. The push leaves the Receiving/Finishing
+// list immediately and partial files/spool are freed through the normal cancel
+// path.
+func (s *Server) handlePushCancel(w http.ResponseWriter, r *http.Request) {
+	_, ok := s.pushAccess(w, r, xferlog.StepCancel)
+	if !ok {
+		return
+	}
+	id := r.PathValue("id")
+	fp := PeerID(r.Context())
+	if s.inbox != nil {
+		s.inbox.CancelBy(id, fp, "Cancelled by the sender")
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
 func (s *Server) handlePushComplete(w http.ResponseWriter, r *http.Request) {
 	a, ok := s.pushAccess(w, r, xferlog.StepComplete)
 	if !ok {
