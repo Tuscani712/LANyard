@@ -219,6 +219,7 @@ Release builds are produced by `build.ps1 -Release` on Windows into `dist\releas
 | `lanyard-mac-arm64`, `lanyard-mac-x64` | macOS (Apple silicon / Intel) |
 | `lanyard-linux-x64` | Linux with its own window (needs GTK 3 and `libwebkit2gtk-4.1-0`; Ubuntu 22.04+ / Debian 12+) |
 | `lanyard-linux-x64-static`, `lanyard-linux-arm64-static` | Linux, no extra libraries; opens in the browser |
+| `lanyard-android-<version>.apk` | Android 8.0 and later (see *Android*) |
 
 Building needs Go (the version in `go.mod`, currently 1.27) and nothing else: `.\build.ps1` makes the development build
 `dist\lanyard.exe` (no console window) and `dist\lanyard-console.exe` (console, for the CLI and the `dist\itest*.ps1`
