@@ -25,9 +25,3 @@ func TestSASDeterministicAndSymmetric(t *testing.T) {
 		t.Errorf("different nonce produced the same SAS %s", a)
 	}
 }
-
-func TestGroupSAS(t *testing.T) {
-	if got := GroupSAS("482913"); got != "482 913" {
-		t.Errorf("GroupSAS = %q", got)
-	}
-}

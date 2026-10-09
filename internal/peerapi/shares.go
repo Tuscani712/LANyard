@@ -340,8 +340,8 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.xferPull(xferlog.LevelInfo, "serve", fp, r.RemoteAddr, class, "range complete", n, startOff, info.Size(), time.Since(start), nil)
-	// Note: a partial body is not trailer-hashed; whole-file verification on
-	// resume lands with the M3 hash state.
+	// A partial body is not trailer-hashed; after a resume the client verifies
+	// the whole file through /hash.
 }
 
 // ctxReader stops a copy as soon as its context is cancelled.

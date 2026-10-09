@@ -94,7 +94,7 @@ func TestAppJSRenderSignatureSkipsUnchanged(t *testing.T) {
 	if ci < 0 {
 		t.Fatalf("clear(box) not found after the shares gate")
 	}
-	if strings.Index(js[gi:gi+ci], "return false;") < 0 {
+	if !strings.Contains(js[gi:gi+ci], "return false;") {
 		t.Error("shares no-change path must return before clear(box)")
 	}
 }

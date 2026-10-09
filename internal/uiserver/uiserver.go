@@ -83,12 +83,12 @@ type Deps struct {
 	AddPeer   func(ctx context.Context, host string, port int, expectedFP string) (*discovery.Peer, error)
 	Log       *slog.Logger
 
-	// M2: local shares, remote pull, and transfer jobs.
+	// Local shares, remote pull, and transfer jobs.
 	Shares    *shares.Manager
 	Transfers *transfer.Manager
 	Client    *peerapi.Client
 
-	// M4: trust store, pairing/connect sessions.
+	// Trust store and pairing/connect sessions.
 	Trust  *trust.Store
 	SelfFP string
 
@@ -106,7 +106,7 @@ type Deps struct {
 	// diagnostics panel and copied by "Copy log".
 	XferLog *xferlog.Recorder
 
-	// M6: settings.
+	// Settings.
 	Cfg           *config.Store
 	ApplySettings func(config.Settings)
 	// SetStartOnLogin registers/removes the OS sign-in entry; StartOnLoginEnabled

@@ -1,6 +1,6 @@
 // Package peerapi is the network-facing HTTPS service: mutual TLS 1.3 with
-// self-signed certificates identified by fingerprint. Authorization (trust
-// store, sessions) is layered on in later milestones; in M1 only /hello exists.
+// self-signed certificates identified by fingerprint. Every request is
+// authorized against the trust store or a live Connect session.
 package peerapi
 
 import (

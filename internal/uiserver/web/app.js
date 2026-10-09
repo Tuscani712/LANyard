@@ -374,7 +374,6 @@ function devKind(os) {
   return "desktop";
 }
 function devKindName(k) { return k === "phone" ? "Phone" : k === "laptop" ? "Laptop" : "Desktop"; }
-function devIconFor(os, size) { return I[devKind(os)] ? svg(I[devKind(os)].replace(/<\/?svg[^>]*>/g, ""), size) : I.monitor; }
 function smallDeviceIcon(os, size) {
   const k = devKind(os);
   const inner = { desktop: '<rect x="3" y="4.5" width="18" height="12" rx="2"/><path d="M9 20h6M12 16.5V20"/>', laptop: '<rect x="4" y="5" width="16" height="10.5" rx="1.6"/><path d="M2.5 18.5h19"/>', phone: '<rect x="7" y="3" width="10" height="18" rx="2.2"/>' }[k];
@@ -418,7 +417,6 @@ const S = {
 };
 const place = () => S.ex.hist[S.ex.hi];
 function navigate(p) { S.ex.hist.splice(S.ex.hi + 1); S.ex.hist.push(p); S.ex.hi = S.ex.hist.length - 1; renderExplorer(); }
-function placePath(k) { return k === "folder" ? "f:" + (place().path || "") : k === "device" ? "d:" + place().device : k === "remote" ? "r:" + place().device + "/" + place().share + "/" + (place().path || "") : "home"; }
 
 function pairedEntry(fp) { return trustList.find((e) => e.cert_fingerprint === fp || e.device_id === fp) || null; }
 // Only a Connect-mode accepted/active session grants live access (see the
@@ -1460,8 +1458,7 @@ function renderTransfersPage(force) {
     row.appendChild(acts);
     stack.appendChild(row);
   }
-  // Finished jobs (Done and Failed). These used to be computed but never shown,
-  // so completed and failed transfers were invisible on this page.
+  // Finished jobs (Done and Failed).
   if (history.length) {
     const hf = S.historyFilter || "all";
     stack.appendChild(el("div", "section-title", "History"));
@@ -1719,7 +1716,6 @@ function selectEl(options, value, id) {
 function textInput(value, id) { const i = el("input"); i.value = value || ""; i.id = id; return i; }
 function numberInput(value, id) { const i = el("input"); i.type = "number"; i.min = "0"; i.value = value; i.id = id; return i; }
 function checkInput(checked, id) { const i = el("input"); i.type = "checkbox"; i.checked = !!checked; i.id = id; return i; }
-function checkRow(label, checked) { const w = el("label", "toggle"); w.appendChild(checkInput(checked)); w.appendChild(el("span", null, label)); return w; }
 function numberRow(label, value) { const w = el("label", "toggle"); w.appendChild(el("span", null, label)); const i = el("input"); i.type = "number"; i.min = "0"; i.value = value; w.appendChild(i); return w; }
 
 // permSelect is a tri-state control for one action: Allow / Ask / Never.
