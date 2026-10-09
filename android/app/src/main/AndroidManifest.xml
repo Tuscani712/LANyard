@@ -11,6 +11,7 @@
     <!-- Held only while a transfer is active, so the CPU and the Wi-Fi radio
          do not sleep in the middle of a long send, pull or receive. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CAMERA" />
 

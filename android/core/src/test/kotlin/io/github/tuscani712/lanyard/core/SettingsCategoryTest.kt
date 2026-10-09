@@ -56,6 +56,7 @@ class SettingsCategoryTest {
         assertEquals(SettingsCategory.GENERAL, categoryFor("speedUnit"))
         assertEquals(SettingsCategory.RECEIVING, categoryFor("downloadFolder"))
         assertEquals(SettingsCategory.RECEIVING, categoryFor("bandwidthLimitMBps"))
+        assertEquals(SettingsCategory.RECEIVING, categoryFor("keepScreenOn"))
         assertEquals(SettingsCategory.NETWORK_DISCOVERY, categoryFor("preferredPort"))
         assertEquals(SettingsCategory.NETWORK_DISCOVERY, categoryFor("wifiOnly"))
         assertEquals(SettingsCategory.NOTIFICATIONS, categoryFor("notifications"))

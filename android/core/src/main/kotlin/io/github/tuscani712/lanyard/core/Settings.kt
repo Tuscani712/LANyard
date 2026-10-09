@@ -21,6 +21,11 @@ data class AppSettings(
     val soundOnComplete: Boolean = false,
     /** Refuse transfers on a metered or mobile connection. */
     val wifiOnly: Boolean = true,
+    /**
+     * Hold the screen awake while any transfer is live, so a long send, pull or
+     * receive is not interrupted by the display turning off. Default on.
+     */
+    val keepScreenOn: Boolean = true,
     /** Persisted SAF tree URI for downloads, or null to ask each time. */
     val downloadFolder: String? = null,
     /** Bandwidth cap in MB/s; 0 means unlimited. */

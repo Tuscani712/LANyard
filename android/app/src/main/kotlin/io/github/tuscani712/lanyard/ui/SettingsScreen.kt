@@ -8,6 +8,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -321,6 +322,15 @@ private fun ReceivingTab(
     BandwidthRow(settings.bandwidthLimitMBps) { mbps ->
         onSettings { it.copy(bandwidthLimitMBps = mbps) }
     }
+
+    SectionLabel("During transfers")
+    SwitchRow(
+        title = "Keep screen on during transfers",
+        subtitle = "Keep the display awake while a transfer is active",
+        checked = settings.keepScreenOn,
+        onCheckedChange = { on -> onSettings { it.copy(keepScreenOn = on) } },
+    )
+    BatteryOptimizationRow()
 
     SectionLabel("Transfer history")
     Text(
@@ -647,6 +657,39 @@ private fun NotificationPermissionRow() {
 }
 
 @Composable
+private fun BatteryOptimizationRow() {
+    val context = LocalContext.current
+    var ignoring by remember { mutableStateOf(isIgnoringBatteryOptimizations(context)) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    // Refresh when the person comes back from the system battery screen.
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) ignoring = isIgnoringBatteryOptimizations(context)
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text("Allow background activity", style = MaterialTheme.typography.bodyLarge)
+            Text(
+                if (ignoring) "Allowed" else "Not allowed",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        OutlinedButton(
+            onClick = { requestIgnoreBatteryOptimizations(context) },
+            enabled = !ignoring,
+        ) { Text(if (ignoring) "Allowed" else "Allow") }
+    }
+}
+
+@Composable
 private fun PairedSettingRow(status: PairedStatus, onUnpair: () -> Unit) {
     val peer = status.peer
     Row(
@@ -709,6 +752,32 @@ private fun openNotificationSettings(context: Context) {
         .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
         .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
     runCatching { context.startActivity(intent) }
+}
+
+/** True when Android will not pause this app's background work. */
+private fun isIgnoringBatteryOptimizations(context: Context): Boolean {
+    val power = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return true
+    return power.isIgnoringBatteryOptimizations(context.packageName)
+}
+
+/**
+ * Asks the system to exempt this app from battery optimization, falling back to
+ * the battery-optimization settings screen when the direct request intent cannot
+ * be handled (some OEM builds do not export it).
+ */
+private fun requestIgnoreBatteryOptimizations(context: Context) {
+    val request = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+        .setData(Uri.parse("package:${context.packageName}"))
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    val opened = runCatching {
+        context.startActivity(request)
+        true
+    }.getOrDefault(false)
+    if (!opened) {
+        val fallback = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { context.startActivity(fallback) }
+    }
 }
 
 private fun copyToClipboard(context: Context, label: String, value: String) {

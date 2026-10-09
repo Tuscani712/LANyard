@@ -30,6 +30,7 @@ val SETTINGS_CATEGORIES: Map<String, SettingsCategory> = mapOf(
     "notifications" to SettingsCategory.NOTIFICATIONS,
     "soundOnComplete" to SettingsCategory.NOTIFICATIONS,
     "wifiOnly" to SettingsCategory.NETWORK_DISCOVERY,
+    "keepScreenOn" to SettingsCategory.RECEIVING,
     "downloadFolder" to SettingsCategory.RECEIVING,
     "bandwidthLimitMBps" to SettingsCategory.RECEIVING,
     "preferredPort" to SettingsCategory.NETWORK_DISCOVERY,
