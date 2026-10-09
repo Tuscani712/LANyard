@@ -20,7 +20,7 @@ class PairedPeerMigrationTest {
         assertEquals(0L, p.askOver)
         assertEquals(Permission.ALLOW, p.push)
         assertEquals(Permission.ALLOW, p.browse)
-        // Text had no field before G1; it inherits the push grant.
+        // Text had no field before tri-state permissions; it inherits the push grant.
         assertEquals(Permission.ALLOW, p.text)
     }
 
@@ -38,10 +38,10 @@ class PairedPeerMigrationTest {
     }
 
     /**
-     * Before G1 text had no field and was allowed exactly when push was. A
+     * Before tri-state permissions text had no field and was allowed exactly when push was. A
      * legacy entry must therefore inherit the migrated push grant: push=true
      * stays Allow (a device that could send text does not suddenly start
-     * prompting), push=false becomes Ask (never Never, the pre-G1 false rule).
+     * prompting), push=false becomes Ask (never Never, the old false rule).
      * This is the "not always Ask" migration rule.
      */
     @Test

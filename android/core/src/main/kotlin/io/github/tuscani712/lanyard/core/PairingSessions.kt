@@ -26,7 +26,7 @@ data class SessionView(
     val granted: Permissions,
     val sas: String,
     val error: String = "",
-    // Whether the initiator negotiated tri-state permissions (G1); when false,
+    // Whether the initiator negotiated tri-state permissions; when false,
     // the status poll must not carry `*_mode` fields.
     val triAware: Boolean = false,
 )
@@ -208,7 +208,7 @@ class PairingSessions(
     fun accept(id: String, granted: Permissions): Boolean {
         val sess = sessions[id] ?: return false
         if (sess.status != STATUS_PENDING) return false
-        // G1: an old caller gets booleans only, where an Ask (which it cannot
+        // An old caller gets booleans only, where an Ask (which it cannot
         // answer) degrades to deny. The tri-state modes are always kept
         // internally; only a tri-aware caller ever has them put on the wire.
         val triAware = sess.triAware

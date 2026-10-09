@@ -7,7 +7,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 /**
- * G1: the tri-state permission, its store migration and its wire encoding.
+ * The tri-state permission, its store migration and its wire encoding.
  *
  * Store migration and wire fallback are deliberately different:
  *  - store: an old `false` becomes Ask (never silently Never);

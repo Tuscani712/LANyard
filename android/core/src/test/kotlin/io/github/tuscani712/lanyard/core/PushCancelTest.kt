@@ -15,7 +15,7 @@ import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
 
 /**
- * Sender-side cancel propagation (Item D5): the sender asks the receiver to
+ * Sender-side cancel propagation: the sender asks the receiver to
  * cancel via `POST /api/v1/push/{id}/cancel`; the receiver ends the push as
  * Cancelled ("Cancelled by the sender"), frees its spool and leaves
  * Receiving/Finishing at once — all within the one request.
@@ -221,7 +221,7 @@ class PushCancelTest {
     }
 
     /**
-     * F1 (receiver cancel): once the phone's receiving person cancels the push,
+     * Receiver cancel: once the phone's receiving person cancels the push,
      * the next file `PUT` is answered HTTP 410 with the "cancelled by the
      * receiver" body, so the sender ends Cancelled rather than Failed.
      */
@@ -246,7 +246,7 @@ class PushCancelTest {
     }
 
     /**
-     * F1 (receiver cancel): the receiver's own contract for an in-flight body is
+     * Receiver cancel: the receiver's own contract for an in-flight body is
      * a 410, not a generic error, so the server can map it to the wire 410.
      */
     @Test
@@ -267,7 +267,7 @@ class PushCancelTest {
     }
 
     /**
-     * F1 (sender side): a phone pushing to a peer that answers 410 for the file
+     * Sender side: a phone pushing to a peer that answers 410 for the file
      * body maps the response to [PushResult.CancelledByReceiver], never a generic
      * failure.
      */
@@ -285,7 +285,7 @@ class PushCancelTest {
     }
 
     /**
-     * F1 (sender side, complete step): a peer that answers 410 Gone for the
+     * Sender side, complete step: a peer that answers 410 Gone for the
      * final `/complete` (after a good file body) must also map to
      * CancelledByReceiver, not a generic failure.
      */

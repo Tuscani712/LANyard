@@ -10,7 +10,7 @@ import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
 
 /**
- * F3: the local alias is never sent on the wire. A recording peer captures every
+ * The local alias is never sent on the wire. A recording peer captures every
  * request line, header and body of a representative client session while a
  * paired peer carries a distinctive alias; none of it may contain the alias, so
  * the broadcast name is the only device name that ever leaves the phone.

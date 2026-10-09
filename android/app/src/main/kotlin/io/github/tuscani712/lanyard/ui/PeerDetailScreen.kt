@@ -134,7 +134,7 @@ fun PeerDetailScreen(padding: PaddingValues, vm: DevicesViewModel) {
 }
 
 /**
- * The device page (F2), one scrolling column with sections in canonical order:
+ * The device page, one scrolling column with sections in canonical order:
  * header, Send, Their shares, Permissions, Manage.
  */
 @Composable
@@ -319,7 +319,7 @@ private fun SendSection(detail: PeerDetail, vm: DevicesViewModel, onSendFolder: 
 }
 
 /**
- * The Permissions section (F2/G1): the editable "They can" tri-state rows (the
+ * The Permissions section: the editable "They can" tri-state rows (the
  * same store as the Settings trust editor) and the read-only "They allow me".
  */
 @Composable

@@ -44,7 +44,7 @@ data class PeerHello(
     // conservative limits (see [PushBatching]).
     val maxOfferBytes: Long = 0,
     val maxOfferFiles: Int = 0,
-    // The peer's advertised capabilities (G1). A peer that lists
+    // The peer's advertised capabilities. A peer that lists
     // [Permission.CAPABILITY] understands tri-state `*_mode` fields; one that
     // does not is sent booleans only.
     val caps: List<String> = emptyList(),
@@ -432,7 +432,7 @@ class PeerClient(
 
 /**
  * Permissions one side allows the other; mirrors `trust.Permissions` and adds
- * the G1 tri-state modes. The `browse`/`push` booleans are always present (an
+ * the tri-state modes. The `browse`/`push` booleans are always present (an
  * old peer reads only them); the `*_mode` strings are present only when
  * [toJson] is asked for the tri-state form, i.e. the peer advertised
  * [Permission.CAPABILITY]. A null mode means "not negotiated — fall back to the
@@ -443,10 +443,10 @@ data class Permissions(
     val push: Boolean = false,
     val pushMaxBytes: Long = 0,
     val askOver: Long = 0,
-    // Text (snippets) is its own action in G1; an old peer only ever had the
+    // Text (snippets) is its own action; an old peer only ever had the
     // push permission, so [text] defaults to `false` and is carried separately.
     val text: Boolean = false,
-    // Tri-state view of the same fields (G1). Null until negotiated.
+    // Tri-state view of the same fields. Null until negotiated.
     val browseMode: Permission? = null,
     val pushMode: Permission? = null,
     val textMode: Permission? = null,

@@ -2,7 +2,7 @@ package io.github.tuscani712.lanyard.core
 
 /**
  * One action on the device page. The order of [DevicePage.ACTIONS] is the single
- * canonical order the UI renders on both platforms (F2).
+ * canonical order the UI renders on both platforms.
  */
 enum class DeviceAction {
     SEND_FILES,
@@ -13,7 +13,7 @@ enum class DeviceAction {
     UNPAIR,
 }
 
-/** One editable permission row in the device page's "They can" block (G1/F2). */
+/** One editable permission row in the device page's "They can" block. */
 enum class PermissionAction {
     BROWSE,
     PUSH,
@@ -56,7 +56,7 @@ object DevicePage {
         DeviceAction.UNPAIR,
     )
 
-    /** The canonical label for [action] (F2). */
+    /** The canonical label for [action]. */
     fun label(action: DeviceAction): String = when (action) {
         DeviceAction.SEND_FILES -> "Send files…"
         DeviceAction.SEND_FOLDER -> "Send folder…"
@@ -196,7 +196,7 @@ object DevicePage {
 
     /**
      * The header's status line: Online/Offline with the reason when offline, the
-     * last-seen phrase, the `address:port`, and the short ID (F2).
+     * last-seen phrase, the `address:port`, and the short ID.
      */
     fun header(
         online: Boolean,
@@ -221,7 +221,7 @@ object DevicePage {
         return Header(status = status, lastSeen = seen, address = addr, shortId = Display.shortFp(fingerprint))
     }
 
-    /** The pieces of the device-page header (F2). */
+    /** The pieces of the device-page header. */
     data class Header(
         val status: String,
         val lastSeen: String,

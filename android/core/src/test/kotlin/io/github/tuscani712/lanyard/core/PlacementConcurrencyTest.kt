@@ -11,7 +11,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
- * De-serialized placement (Item D1): placing files into the destination used to
+ * De-serialized placement: placing files into the destination used to
  * be guarded by a single global lock, so every verified file waited behind the
  * one being copied. Placement is now guarded only by the file's own lock, so
  * many tiny files can be finalized at the same time.

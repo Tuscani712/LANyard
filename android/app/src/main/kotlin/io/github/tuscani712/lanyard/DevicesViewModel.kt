@@ -546,7 +546,7 @@ class DevicesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * Edits one tri-state permission in the device page's "They can" block (G1).
+     * Edits one tri-state permission in the device page's "They can" block.
      * The value is the same store the Settings trust editor writes, so a change
      * here is what the receiving server enforces on the next request.
      */

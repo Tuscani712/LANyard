@@ -28,7 +28,7 @@ class PeerErrorsTest {
 
     @Test
     fun permissionAndGeneric403sNeverAutoUnpairAndHaveTheirOwnWording() {
-        // G3: each exact refusal maps to its own line and never to "Not paired".
+        // Each exact refusal maps to its own line and never to "Not paired".
         // None may trigger a local removal (the phone can deny pull/push without
         // unparing).
         val expected = mapOf(

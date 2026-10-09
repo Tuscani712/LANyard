@@ -6,7 +6,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 /**
- * F2: the device page's pure rules — the canonical action order/labels, the
+ * The device page's pure rules — the canonical action order/labels, the
  * enabled/disabled decision, the permissions block and the status block.
  */
 class DevicePageTest {

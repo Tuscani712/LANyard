@@ -775,7 +775,7 @@ private fun PairedSettingRow(
             }
             TextButton(onClick = onUnpair) { Text("Unpair") }
         }
-        // The editable tri-state trust editor (G1): the same store the device
+        // The editable tri-state trust editor: the same store the device
         // page's Permissions section writes.
         Spacer(Modifier.height(4.dp))
         io.github.tuscani712.lanyard.core.DevicePage.theyCan(peer).forEach { row ->

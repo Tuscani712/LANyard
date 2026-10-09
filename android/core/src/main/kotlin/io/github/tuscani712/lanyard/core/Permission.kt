@@ -1,7 +1,7 @@
 package io.github.tuscani712.lanyard.core
 
 /**
- * A tri-state permission for one action (G1). It is the *local* policy for the
+ * A tri-state permission for one action. It is the *local* policy for the
  * incoming direction — what this phone allows the peer to do to it — and is the
  * single value the trust store and the device page's "They can" editor hold.
  *

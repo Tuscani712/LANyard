@@ -72,7 +72,7 @@ data class PushApprovalRequest(
 )
 
 /**
- * A peer that wants to browse this phone's shares (G2). Shown once per browse
+ * A peer that wants to browse this phone's shares. Shown once per browse
  * session; an unanswered prompt (the app's timeout) is a denial.
  */
 data class BrowseApprovalRequest(
@@ -80,7 +80,7 @@ data class BrowseApprovalRequest(
     val peerName: String,
 )
 
-/** How long the browse prompt waits for a person before it denies (G2). */
+/** How long the browse prompt waits for a person before it denies. */
 private const val BROWSE_APPROVAL_TIMEOUT_MS = 60_000L
 
 /**
@@ -94,8 +94,8 @@ data class PeerReachable(val shortId: String, val host: String?, val port: Int?)
  * The app-scoped home of the phone-side peer server and the shared trust store.
  *
  * Lifetime: [start] while the app is foregrounded (any screen), [stop] when it is
- * backgrounded. It owns the `/hello` responder, pairing (C1) and the receive
- * side of pushes (C2a), plus the one-time QR invites and the pending prompts.
+ * backgrounded. It owns the `/hello` responder, pairing and the receive
+ * side of pushes, plus the one-time QR invites and the pending prompts.
  */
 object PeerService {
     private var initialized = false
@@ -194,7 +194,7 @@ object PeerService {
     private val approvalLock = Any()
     private var approvalWaiter: CompletableDeferred<Boolean>? = null
 
-    // The browse-session prompt (G2) reuses the same one-at-a-time gate as a
+    // The browse-session prompt reuses the same one-at-a-time gate as a
     // push approval, so a person never sees two prompts at once.
     private val browseLock = Any()
     private var browseWaiter: CompletableDeferred<Boolean>? = null
@@ -664,7 +664,7 @@ object PeerService {
 
     /**
      * Asks the person once per browse session before a paired peer may browse
-     * the shares (G2). An unanswered prompt times out after
+     * the shares. An unanswered prompt times out after
      * [BROWSE_APPROVAL_TIMEOUT_MS] and counts as a denial, so a browse is never
      * left hanging. Shares the one-prompt-at-a-time gate with [pushApproval].
      */
@@ -710,7 +710,7 @@ object PeerService {
         // offer instead of guessing (and tripping a 413). See PushProtocol.
         addProperty("max_offer_bytes", PushProtocol.MAX_OFFER_BODY_BYTES)
         addProperty("max_offer_files", PushProtocol.MAX_OFFER_FILES)
-        // G1: advertise tri-state permission support so a new peer sends
+        // Advertise tri-state permission support so a new peer sends
         // `*_mode` fields; an older peer ignores this and stays on booleans.
         add("caps", com.google.gson.JsonArray().apply { add(Permission.CAPABILITY) })
     }

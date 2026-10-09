@@ -177,7 +177,7 @@ private fun IncomingPairDialog(
     onDecline: () -> Unit,
 ) {
     val pairing = request.mode == PairingSessions.MODE_PAIR
-    // G1: a checked box is "Allow"; an unchecked box is the new "Ask" default.
+    // A checked box is "Allow"; an unchecked box is the new "Ask" default.
     // Never is only reachable from the device page or Settings.
     var browse by remember(request.id) { mutableStateOf(false) }
     var push by remember(request.id) { mutableStateOf(false) }

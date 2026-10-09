@@ -19,11 +19,11 @@ import java.nio.file.StandardCopyOption
  * A peer this device has paired with.
  *
  * The tri-state fields ([browse], [push], [text]) are what **this** device
- * allows the peer to do to it — the editable "They can" direction (G1). The
+ * allows the peer to do to it — the editable "They can" direction. The
  * `allow*` booleans are what the peer allows **this** device to do — the
  * read-only "They allow me" direction, learned at pairing.
  *
- * For peers written before G1, the historic `browse`/`push` booleans migrate
+ * For peers written before tri-state permissions, the historic `browse`/`push` booleans migrate
  * through [Permission.fromStoredBool]: `true -> ALLOW`, `false -> ASK`. The
  * [text] grant did not exist then and was governed by push, so a legacy entry
  * with no `text` field inherits its (migrated) push grant rather than defaulting
@@ -46,7 +46,7 @@ data class PairedPeer(
     // ask", which is the safe, non-surprising default for an old entry.
     val pushMaxBytes: Long = 0,
     val askOver: Long = 0,
-    // A local, person-chosen name for this device (F3). It is stored only here
+    // A local, person-chosen name for this device. It is stored only here
     // and never sent on the wire; [name] (the broadcast name) stays the wire
     // value and the fallback whenever the alias is blank. Defaults to "" for
     // peers.json written before this field existed.
@@ -55,8 +55,8 @@ data class PairedPeer(
     // read-only on this device. Kept as a boolean because a peer's "ask" cannot
     // be answered here — it is decided on the peer. Defaults to true: when the
     // peer's grant is genuinely unknown (this device was the pairing responder,
-    // or an entry predates G1) an outgoing action stays available and the peer
-    // enforces its own Ask/Never on arrival. An initiator overwrites this with
+    // or an entry predates tri-state permissions) an outgoing action stays
+    // available and the peer enforces its own Ask/Never on arrival. An initiator overwrites this with
     // the responder's explicit grant at pairing.
     val allowBrowse: Boolean = true,
     val allowPush: Boolean = true,
@@ -77,8 +77,8 @@ data class PairedPeer(
         pairedAt: Long,
         pushMaxBytes: Long = 0,
         askOver: Long = 0,
-        // Text predicates on push when not given, matching the pre-G1 behavior
-        // where snippets used the push permission.
+        // Text predicates on push when not given, matching the behavior before
+        // tri-state permissions, where snippets used the push permission.
         text: Boolean = push,
         alias: String = "",
         allowBrowse: Boolean = true,
@@ -146,7 +146,7 @@ class PairedPeerAdapter : JsonSerializer<PairedPeer>, JsonDeserializer<PairedPee
             port = o.int("port"),
             browse = o.permission("browse"),
             push = push,
-            // Before G1 text had no field and was governed by push; an entry
+            // Before tri-state permissions text had no field and was governed by push; an entry
             // without it inherits the push grant rather than defaulting to Ask.
             text = if (o.has("text")) o.permission("text") else push,
             pairedAt = o.long("pairedAt"),

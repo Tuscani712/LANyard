@@ -405,7 +405,7 @@ object PairingFlow {
         return RemoteGrant(
             browse = allowed("browse_mode", "browse", true),
             push = allowed("push_mode", "push", false),
-            // Text had no wire field before G1; fall back to the push allowance.
+            // Text had no wire field before tri-state permissions; fall back to the push allowance.
             text = allowed("text_mode", "text", bool("push", false)),
         )
     }

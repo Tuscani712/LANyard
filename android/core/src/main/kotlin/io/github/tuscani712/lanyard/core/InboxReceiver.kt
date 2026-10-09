@@ -454,8 +454,8 @@ class InboxReceiver(
      * Finishes a push (the job-level "all done"). A push the receiver cancelled
      * answers 410 Gone with [RECEIVER_CANCELLED_BODY] — the same signal the
      * in-flight file `PUT` gives — so a sender whose final `complete` step lands
-     * after the cancel ends its row as Cancelled "Cancelled by the receiver"
-     * (F1), not a silent success.
+     * after the cancel ends its row as Cancelled "Cancelled by the receiver",
+     * not a silent success.
      */
     @Synchronized
     fun finish(id: String, peerFp: String): Boolean {

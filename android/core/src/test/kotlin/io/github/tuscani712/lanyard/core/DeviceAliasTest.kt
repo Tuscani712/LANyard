@@ -8,7 +8,7 @@ import java.io.File
 import java.nio.file.Files
 
 /**
- * F3: a local device alias lives only in the trust store, is never sent on the
+ * A local device alias lives only in the trust store, is never sent on the
  * wire, never overwrites the broadcast name, and is forgotten on unpair (a
  * re-pair starts fresh).
  */

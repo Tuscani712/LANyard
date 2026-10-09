@@ -36,7 +36,7 @@ fun interface PushApproval {
 
 /**
  * Asks the phone's person, once per browse session, whether a peer may browse
- * the shared folders (G2). The app reuses the push-approval prompt. Must answer
+ * the shared folders. The app reuses the push-approval prompt. Must answer
  * quickly; [ApprovalOutcome.UNAVAILABLE]/[ApprovalOutcome.BUSY] refuse at once,
  * and the app's own wait timeout answers [ApprovalOutcome.DECLINED], so a
  * browse that is never answered is denied rather than left hanging.
@@ -46,10 +46,10 @@ fun interface BrowseApproval {
 }
 
 /**
- * The phone-side peer API over mutual TLS 1.3: discovery, pairing (C1) and
- * receiving pushes (C2a).
+ * The phone-side peer API over mutual TLS 1.3: discovery, pairing and
+ * receiving pushes.
  *
- * Hardening, and how it differs from C1:
+ * Hardening:
  *  - **Keep-alive:** one TLS connection serves many HTTP/1.1 requests (up to
  *    [maxRequestsPerConnection]), so 1 000 small files are one handshake.
  *  - **Split timeouts:** [headerTimeoutMillis] covers the request line, headers
@@ -70,7 +70,7 @@ class PeerServer(
     private val metered: () -> Boolean = { false },
     private val wifiOnly: () -> Boolean = { true },
     private val approval: PushApproval? = null,
-    // The browse-session approval (G2). Null (core tests) means an Ask browses
+    // The browse-session approval. Null (core tests) means an Ask browses
     // cannot be confirmed, so it is refused.
     private val browseApproval: BrowseApproval? = null,
     // How long one accepted browse approval is remembered for subsequent share
@@ -609,7 +609,7 @@ class PeerServer(
     }
 
     /**
-     * Whether [peer] may browse (pull) the shares right now (G2). Allow passes;
+     * Whether [peer] may browse (pull) the shares right now. Allow passes;
      * Never is refused; Ask prompts the phone's person once and remembers the
      * answer for a browse session ([browseSessionTtlMillis]). A prompt that is
      * never answered (the app times out) comes back as a refusal, so a browse
@@ -637,7 +637,7 @@ class PeerServer(
     }
 
     /**
-     * The text snippet gate (G1): a paired peer whose text permission is not
+     * The text snippet gate: a paired peer whose text permission is not
      * Never. An Ask is allowed through here and enforced with the push-approval
      * prompt below. The desktop refuses an unpaired caller with `not permitted`
      * and a paired caller without the permission with `text not permitted`;
@@ -655,7 +655,7 @@ class PeerServer(
         val json = parseObject(body)
         val text = json.str("text")
         SnippetProtocol.validate(text)?.let { throw PeerHttpException(400, it) }
-        // G2: text reuses the existing push-approval prompt/notification.
+        // Text reuses the existing push-approval prompt/notification.
         if (p.text == Permission.ASK) {
             val bytes = text.toByteArray(Charsets.UTF_8).size.toLong()
             val outcome = approval?.ask(p.fingerprint, p.name, 1, bytes, emptyList())
@@ -687,7 +687,7 @@ class PeerServer(
         // Validate here (caps, names, free space) before asking, so a refusal is
         // for a real reason and no spool is created for a rejected offer.
         val probe = receiver.offer(p.fingerprint, p.name, reqs, total, p.pushMaxBytes)
-        // Ask permission (G1) or ask_over (size threshold): a person must accept.
+        // Ask permission or ask_over (size threshold): a person must accept.
         val realTotal = if (total > 0) total else reqs.sumOf { it.size }
         if (p.push == Permission.ASK || (p.askOver > 0 && realTotal > p.askOver)) {
             val names = reqs.take(5).map { Display.safeName(it.relPath) }
@@ -1130,8 +1130,8 @@ class PeerServer(
         append(""","text":""").append(p.text)
         if (p.pushMaxBytes > 0) append(""","push_max_bytes":""").append(p.pushMaxBytes)
         if (p.askOver > 0) append(""","ask_over":""").append(p.askOver)
-        // The `*_mode` keys are emitted only when the peer negotiated tri-state
-        // (G1), so an old peer sees the same body it always did.
+        // The `*_mode` keys are emitted only when the peer negotiated tri-state,
+        // so an old peer sees the same body it always did.
         if (tristate) {
             p.browseMode?.let { append(""","browse_mode":""").append(it.wire).append('"') }
             p.pushMode?.let { append(""","push_mode":""").append(it.wire).append('"') }
@@ -1256,7 +1256,7 @@ class PeerServer(
 
         /**
          * How long one accepted browse approval is remembered, i.e. the length
-         * of a "browse session" (G2). Five minutes covers a person browsing a
+         * of a "browse session". Five minutes covers a person browsing a
          * folder and pulling several files without a second prompt.
          */
         const val BROWSE_SESSION_TTL_MS = 5 * 60 * 1000L
