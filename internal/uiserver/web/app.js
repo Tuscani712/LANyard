@@ -35,6 +35,170 @@ function el(tag, cls, text) {
 
 function clear(node) { node.replaceChildren(); }
 
+// ---- render-signature helpers (see render_churn_static_test.go) ----
+// A page is rebuilt only when the data behind it actually changed. Before this,
+// whole pages were replaced on timers and on every SSE frame (the server emits
+// snapshots on any peer/change event), which tore the element under the cursor
+// out of the DOM between mousedown and mouseup, so a click could land on
+// nothing and the button appeared to need several tries.
+const _renderSig = new Map();
+// sigValue produces a stable signature for a value: object keys are sorted at
+// every level, so two snapshots that differ only in the order their producer
+// serialised the keys compare equal. Arrays keep their order, because a
+// reordered transfer/share list is itself a visible change.
+function sigValue(v) {
+  if (v === undefined) return "undefined";
+  try {
+    return JSON.stringify(v, function (k, val) {
+      if (val && typeof val === "object" && !Array.isArray(val)) {
+        const out = {};
+        for (const key of Object.keys(val).sort()) out[key] = val[key];
+        return out;
+      }
+      return val;
+    });
+  } catch (e) { return String(v); }
+}
+// sigUnchanged reports whether `value`'s signature equals the last one seen for
+// `key`, updating the stored signature. A no-change refresh returns true and the
+// caller must skip the rebuild entirely.
+function sigUnchanged(key, value) {
+  const s = sigValue(value);
+  if (_renderSig.get(key) === s) return true;
+  _renderSig.set(key, s);
+  return false;
+}
+// isTextEntry reports whether elm is a focusable thing whose rebuild would lose
+// state the user cares about: a text field with a caret, a textarea, a native
+// <select> with its picker open, or a contenteditable host.
+function isTextEntry(elm) {
+  if (!elm) return false;
+  const t = elm.tagName;
+  return t === "INPUT" || t === "TEXTAREA" || t === "SELECT" || elm.isContentEditable === true;
+}
+// interactionActive reports whether rebuilding `container` right now would pull
+// the element the user is interacting with out from under them: the container
+// holds the focused text entry, or a dialog / context menu that is not part of
+// the container is on screen. A "signature-driven rebuild" is deferred while
+// this is true (see renderDecision), so focus, caret and scroll are kept.
+function interactionActive(container) {
+  const ae = document.activeElement;
+  if (ae && isTextEntry(ae) && container && container.contains(ae)) return true;
+  const ov = document.querySelector(".overlay:not([hidden])");
+  if (ov && !(container && ov.contains(container))) return true;
+  const menu = document.querySelector("#ctx-root .ctx");
+  if (menu && !(container && container.contains(menu))) return true;
+  return false;
+}
+// renderDecision is the single gate a signature-driven page calls. It returns
+// "rebuild" (replace the nodes), "unchanged" (identical data — skip), or
+// "defer" (the data changed, but the user is mid-interaction: leave the stored
+// signature untouched and record that the view is owed a rebuild). The deferred
+// view is flushed by initRebuildFlush once the interaction ends.
+const _pendingRebuilds = new Set();
+function renderDecision(key, value, container) {
+  if (interactionActive(container)) {
+    // Only a real change is worth remembering; identical data stays a no-op.
+    if (_renderSig.get(key) !== sigValue(value)) { _pendingRebuilds.add(key); return "defer"; }
+    return "unchanged";
+  }
+  return sigUnchanged(key, value) ? "unchanged" : "rebuild";
+}
+// deferRebuild is the boolean form for pages that only care whether to rebuild.
+function deferRebuild(key, value, container) {
+  return renderDecision(key, value, container) !== "rebuild";
+}
+// flushPendingRebuilds re-runs the current view for each view that was owed a
+// rebuild while the user was interacting. It is a no-op when nothing is pending
+// or while an interaction is still open.
+function flushPendingRebuilds() {
+  if (!_pendingRebuilds.size || interactionActive(null)) return;
+  _pendingRebuilds.clear();
+  renderNav();
+  if (S.view === "devices") renderExplorer();
+  else if (S.view === "paired") renderPairedPage();
+  else if (S.view === "shares") renderSharesPage();
+  else if (S.view === "transfers") renderTransfersPage();
+}
+// initRebuildFlush wires the end-of-interaction events to the flush. It is kept
+// out of the extracted helper block's execution path so the node harness can
+// evaluate the block without a full document.
+function initRebuildFlush() {
+  const flush = () => setTimeout(flushPendingRebuilds, 0);
+  document.addEventListener("focusout", flush);
+  document.addEventListener("change", flush);
+  document.addEventListener("click", flush);
+}
+// Real rebuild counts (a skipped render does not count). Used by the idle
+// render measurement harness and asserted by the static tests.
+const renderCounts = { shares: 0, paired: 0, devices: 0, explorer: 0, side: 0, body: 0, transfers: 0, nav: 0, toolbar: 0 };
+// Per-share functions that refresh only the time-sensitive lifetime text, so
+// the periodic Shares tick updates the countdown without rebuilding the row.
+const _shareTickEls = new Map();
+// ---- end render-signature helpers ----
+
+// ---- render signatures (extracted verbatim by render_churn_static_test.go) ----
+// This block is deliberately free of DOM access: the node harness in
+// render_churn_static_test.go evaluates it directly. Every field a page can
+// display must be listed by that page's signature, or a change would be missed.
+function navSig() {
+  const terminal = (t) => t.state === "Done" || t.state === "Failed" || t.state === "Cancelled";
+  return {
+    view: S.view,
+    actionable: S.actionable,
+    live: transfersList.filter((t) => !terminal(t)).length + incomingList.length + snippetsList.length,
+  };
+}
+function exSideSig() {
+  return {
+    peers: peers.filter((p) => p.verified).map((p) => [p.device_id, p.name, p.os]),
+    trust: trustList.map((e) => [e.cert_fingerprint || e.device_id, e.name, e.os]),
+    roots: S.ex.roots,
+    place: S.ex.hist[S.ex.hi],
+  };
+}
+function toolbarSig() {
+  return {
+    place: S.ex.hist[S.ex.hi],
+    hi: S.ex.hi,
+    histLen: S.ex.hist.length,
+    mode: S.mode,
+    peers: peers.filter((p) => p.verified).map((p) => [p.device_id, p.os]),
+    trust: trustList.map((e) => [e.cert_fingerprint || e.device_id, e.os]),
+  };
+}
+function bodySig() {
+  return {
+    place: S.ex.hist[S.ex.hi],
+    search: S.search,
+    mode: S.mode,
+    peers: peers.filter((x) => x.verified).map((x) => [x.device_id, x.name, x.os]),
+    trust: trustList.map((e) => [e.cert_fingerprint || e.device_id, e.name, e.os, e.permissions, e.peer_permissions]),
+    sessions: sessions.map((s) => [s.id, s.status, s.peer_fp, s.mode]),
+  };
+}
+function pairedSig() {
+  return {
+    // Only the fields the page actually reads: a refreshed session can bump its
+    // UpdatedAt without changing anything the UI shows, and that must not force
+    // a rebuild. `online` is the device ids currently reachable, so an
+    // online/offline flip (which changes the dot and the "last seen" text)
+    // always rebuilds.
+    sessions: sessions.map((s) => [s.id, s.status, s.mode, s.incoming, s.peer_name, s.peer_fp, s.peer_device]),
+    trust: trustList.map((e) => [e.cert_fingerprint || e.device_id, e.name, e.os, e.permissions, e.peer_permissions]),
+    online: peers.filter((p) => p.verified).map((p) => p.device_id),
+  };
+}
+function sharesSig() { return sharesList; }
+function transfersSig() {
+  // The whole transfer/incoming/snippet rows: progress, speed, ETA, state,
+  // files and errors all live on these objects, so any visible change rebuilds.
+  return { transfers: transfersList, incoming: incomingList, snippets: snippetsList, filter: S.historyFilter || "all" };
+}
+// The four first-class pages, for the both-directions test.
+const PAGE_SIGNATURES = { shares: sharesSig, paired: pairedSig, devices: exSideSig, transfers: transfersSig };
+// ---- end render signatures ----
+
 function fmtBytes(n) {
   if (!n && n !== 0) return "";
   const u = ["B", "KB", "MB", "GB", "TB"];
@@ -231,7 +395,9 @@ const NAV = [
   { id: "transfers", label: "Transfers", icon: "transfers" },
   { id: "settings", label: "Settings", icon: "gear" },
 ];
-function renderNav() {
+function renderNav(force) {
+  if (!force && deferRebuild("nav", navSig(), $("nav"))) return false;
+  renderCounts.nav++;
   const nav = $("nav");
   clear(nav);
   for (const n of NAV) {
@@ -249,6 +415,7 @@ function renderNav() {
     item.addEventListener("click", () => showView(n.id));
     nav.appendChild(item);
   }
+  return true;
 }
 function showView(id) {
   S.view = id;
@@ -419,12 +586,16 @@ document.addEventListener("contextmenu", (e) => { if (!e.target.closest(".file-i
 window.addEventListener("blur", closeMenus);
 
 // ---------- explorer ----------
-function renderExplorer() {
-  renderExSide();
-  renderToolbar();
-  renderBody();
+function renderExplorer(force) {
+  const side = renderExSide(force);
+  const toolbar = renderToolbar(force);
+  const body = renderBody(force);
+  if (side || toolbar || body) { renderCounts.explorer++; renderCounts.devices++; }
+  return side || toolbar || body;
 }
-function renderExSide() {
+function renderExSide(force) {
+  if (!force && deferRebuild("exSide", exSideSig(), $("ex-side"))) return false;
+  renderCounts.side++;
   const box = $("ex-side");
   clear(box);
   const p = place();
@@ -466,8 +637,11 @@ function renderExSide() {
     it.addEventListener("contextmenu", (e) => { e.preventDefault(); showMenu(e.clientX, e.clientY, peerMenu(peer)); });
     box.appendChild(it);
   }
+  return true;
 }
-function renderToolbar() {
+function renderToolbar(force) {
+  if (!force && deferRebuild("toolbar", toolbarSig(), $("crumbs"))) return false;
+  renderCounts.toolbar++;
   const p = place();
   $("nav-back").disabled = S.ex.hi <= 0;
   $("nav-fwd").disabled = S.ex.hi >= S.ex.hist.length - 1;
@@ -475,6 +649,7 @@ function renderToolbar() {
   const vm = $("view-mode");
   vm.innerHTML = S.mode === "grid" ? I.list : I.grid;
   renderCrumbs();
+  return true;
 }
 function canGoUp(p) { return p.kind === "folder" || p.kind === "remote" || p.kind === "device" || p.kind === "shared" ? true : false; }
 function renderCrumbs() {
@@ -529,15 +704,20 @@ function renderCrumbs() {
 }
 function peerOS(fp) { const x = peers.find((p) => p.device_id === fp) || trustList.find((e) => e.cert_fingerprint === fp); return x ? (x.os || "") : "windows"; }
 
-function renderBody() {
+function renderBody(force) {
   const body = $("ex-body");
+  if (!force && deferRebuild("body", bodySig(), body)) return false;
+  renderCounts.body++;
+  const scrollTop = body.scrollTop;
   clear(body);
   const p = place();
-  if (p.kind === "home") return renderHome(body);
-  if (p.kind === "folder") return renderFolder(body, p);
-  if (p.kind === "device") return renderDevice(body, p);
-  if (p.kind === "shared") return renderShared(body);
-  if (p.kind === "remote") return renderRemote(body, p);
+  if (p.kind === "home") renderHome(body);
+  else if (p.kind === "folder") renderFolder(body, p);
+  else if (p.kind === "device") renderDevice(body, p);
+  else if (p.kind === "shared") renderShared(body);
+  else if (p.kind === "remote") renderRemote(body, p);
+  body.scrollTop = scrollTop;
+  return true;
 }
 
 // -- home: device cards --
@@ -888,8 +1068,11 @@ function copyText(t) {
 }
 
 // ---------- paired page ----------
-function renderPairedPage() {
+function renderPairedPage(force) {
   const box = $("paired-body");
+  if (!force && deferRebuild("paired", pairedSig(), box)) return false;
+  renderCounts.paired++;
+  const scrollTop = box.scrollTop;
   clear(box);
   // A finished pairing lives in "Paired devices" below; only requests still in
   // progress and open Connect sessions are listed here.
@@ -947,11 +1130,28 @@ function renderPairedPage() {
     stack.appendChild(row);
   }
   box.appendChild(stack);
+  box.scrollTop = scrollTop;
+  return true;
 }
 
 // ---------- shares page ----------
-function renderSharesPage() {
+function renderSharesPage(force) {
   const box = $("shares-body");
+  if (!force) {
+    const decision = renderDecision("shares", sharesSig(), box);
+    if (decision === "unchanged") {
+      // Data is unchanged: refresh only the lifetime countdown text in place so
+      // the 1 s tick never tears down rows (and never disturbs a hovered button).
+      for (const tick of _shareTickEls.values()) tick();
+      return false;
+    }
+    // Changed but the user is mid-interaction: defer, leaving the signature
+    // untouched so the next tick/toggle rebuilds once it ends.
+    if (decision === "defer") return false;
+  }
+  renderCounts.shares++;
+  _shareTickEls.clear();
+  const scrollTop = box.scrollTop;
   clear(box);
   const stack = el("div", "stack");
   if (!sharesList.length) stack.appendChild(el("div", "empty", "No shares yet. Share a file or folder from the explorer."));
@@ -960,16 +1160,22 @@ function renderSharesPage() {
     const row = el("div", "row");
     const m = el("div", "grow");
     m.appendChild(el("div", "name", s.label || s.path));
-    const bits = [s.kind || ""];
-    if (s.visibility === "specific") bits.push("specific device");
-    if (finishing) {
-      bits.push("Ended");
-      if (s.active_transfers) bits.push(`finishing ${s.active_transfers}`);
-    } else {
-      bits.push(shareLifetimeText(s));
-      if (s.active_transfers > 0) bits.push(`${s.active_transfers} transferring`);
-    }
-    m.appendChild(el("div", "meta", bits.filter(Boolean).join(" \u00b7 ")));
+    const meta = el("div", "meta");
+    const renderMeta = () => {
+      const bits = [s.kind || ""];
+      if (s.visibility === "specific") bits.push("specific device");
+      if (finishing) {
+        bits.push("Ended");
+        if (s.active_transfers) bits.push(`finishing ${s.active_transfers}`);
+      } else {
+        bits.push(shareLifetimeText(s));
+        if (s.active_transfers > 0) bits.push(`${s.active_transfers} transferring`);
+      }
+      meta.textContent = bits.filter(Boolean).join(" \u00b7 ");
+    };
+    renderMeta();
+    m.appendChild(meta);
+    if (s.share_id) _shareTickEls.set(s.share_id, renderMeta);
     m.appendChild(el("div", "meta", s.path));
     row.appendChild(m);
     if (finishing) row.appendChild(el("span", "badge warn", "Finishing"));
@@ -982,6 +1188,8 @@ function renderSharesPage() {
     stack.appendChild(row);
   }
   box.appendChild(stack);
+  box.scrollTop = scrollTop;
+  return true;
 }
 function shareLifetimeText(s) {
   const lt = s.lifetime || {};
@@ -994,8 +1202,11 @@ function shareLifetimeText(s) {
 }
 
 // ---------- transfers page ----------
-function renderTransfersPage() {
+function renderTransfersPage(force) {
   const box = $("transfers-body");
+  if (!force && deferRebuild("transfers", transfersSig(), box)) return false;
+  renderCounts.transfers++;
+  const scrollTop = box.scrollTop;
   clear(box);
   const isDone = (t) => t.state === "Done" || t.state === "Failed" || t.state === "Cancelled";
   const history = transfersList.filter(isDone);
@@ -1147,6 +1358,8 @@ function renderTransfersPage() {
     }
   }
   box.appendChild(stack);
+  box.scrollTop = scrollTop;
+  return true;
 }
 function stateClass(state) {
   switch (state) { case "Done": return "ok"; case "Failed": case "Waiting for peer": return "warn"; default: return ""; }
@@ -1462,11 +1675,12 @@ function openSession(id) {
 function closePair() { pairView = null; $("pair").hidden = true; }
 function sasText(sas) { return sas && sas.length === 6 ? `${sas.slice(0, 3)} ${sas.slice(3)}` : (sas || ""); }
 
-function renderPair() {
+function renderPair(force) {
+  if (!force && deferRebuild("pair", { view: pairView, perms: pairPerms }, $("pair-body"))) return false;
   const body = $("pair-body"); clear(body);
-  if (!pairView) return;
+  if (!pairView) return true;
   const v = pairView;
-  if (v.qr) { $("pair-title").textContent = "Pair with a QR code"; renderQRPanel(body); return; }
+  if (v.qr) { $("pair-title").textContent = "Pair with a QR code"; renderQRPanel(body); return true; }
   const who = whoOf(v);
   $("pair-title").textContent = (v.mode === "pair" ? "Pair with " : "Connect to ") + who;
   if (v.setup) {
@@ -1475,7 +1689,7 @@ function renderPair() {
     body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push));
     if (v.error) body.appendChild(el("div", "msg err", v.error));
     body.appendChild(el("div", "actions", "")).appendChild(btn("Send request", () => sendPairRequest(v.peer_fp, who, v.mode)));
-    return;
+    return true;
   }
   if (v.via_qr) {
     const box = el("div", "sasbox");
@@ -1756,6 +1970,10 @@ function handleSessions(list) {
     const fresh = list.find((s) => s.id === pairView.id);
     if (fresh) { pairView = fresh; renderPair(); } else { closePair(); }
   }
+  // Only touch the chrome when the session list actually changed. The 1.5 s
+  // poll refetches whether or not anything moved; without this guard it would
+  // replace the page (and the button under the cursor) on every tick.
+  if (!changed) return;
   S.actionable = list.filter((s) => (s.incoming && s.status === "pending") || (!s.incoming && s.status === "accepted")).length;
   document.title = (S.actionable ? `(${S.actionable}) ` : "") + "LANyard File Transfer";
   renderNav();
@@ -1854,8 +2072,9 @@ function renderApprovals(list) {
   pruneSticky("appr:", live);
   if (!list.length) approvalsOpen = false;
   box.hidden = !approvalsOpen;
-  clear(modal);
   if (!approvalsOpen) return;
+  if (deferRebuild("approvals-modal", { open: approvalsOpen, list: list }, modal)) return;
+  clear(modal);
   const head = el("div", "modal-head"); head.appendChild(el("h2", null, "Incoming files"));
   head.appendChild(btn("Decide later", () => { approvalsOpen = false; renderApprovals(approvalsList); }, "ghost"));
   modal.appendChild(head);
@@ -2131,6 +2350,7 @@ async function submitShare(confirmFlag) {
 setInterval(() => { if (S.view === "shares" && !document.hidden) renderSharesPage(); }, 1000);
 
 applyTheme("dark");
+initRebuildFlush();
 renderNav();
 initWindowChrome();
 showView("devices");

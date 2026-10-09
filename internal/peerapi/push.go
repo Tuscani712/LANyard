@@ -251,7 +251,15 @@ func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
 	p, err := s.inbox.Offer(PeerID(r.Context()), a.SessionID, req.Files, a.MaxPushBytes)
 	if err != nil {
 		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "storage") || strings.Contains(err.Error(), "exceeds") {
+		switch {
+		case errors.Is(err, inbox.ErrFilesBusy):
+			// A concurrent push from the same peer is already receiving these
+			// files. A 409 (not a 400/500) tells the sender this is a transient
+			// conflict and the readable body is shown to the person. Two live
+			// pushes must never share a .lanpart, so the newer one is refused
+			// intact rather than allowed to clobber the older one.
+			code = http.StatusConflict
+		case strings.Contains(err.Error(), "storage") || strings.Contains(err.Error(), "exceeds"):
 			code = http.StatusInsufficientStorage
 		}
 		http.Error(w, err.Error(), code)
@@ -379,6 +387,10 @@ func (s *Server) handlePushComplete(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, inbox.ErrCancelled.Error(), http.StatusGone)
 			return
 		}
+		// A failed finalize must end the push as Failed with the reason rather
+		// than leave the row "Receiving". Complete already fails it internally;
+		// this safety net covers any other error path.
+		s.inbox.Fail(id, err.Error())
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}

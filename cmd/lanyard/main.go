@@ -34,7 +34,7 @@ import (
 	"lanyard/internal/xferlog"
 )
 
-const version = "1.1.0-beta.8"
+const version = "1.1.0-beta.9"
 
 type runInfo struct {
 	PID     int    `json:"pid"`

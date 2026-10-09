@@ -779,3 +779,140 @@ func TestBodyCopyErrorRemovesPush(t *testing.T) {
 		t.Fatal("onFail was not called for the dead push")
 	}
 }
+
+// Two live pushes may never share a .lanpart. A second offer naming a file the
+// first live push already owns is refused with ErrFilesBusy, and the first push
+// still finalizes intact. Once the first finishes (or dies) its part is free
+// again, so a later offer naming the same file is allowed.
+func TestOverlappingOffersRefusedAndFirstIntact(t *testing.T) {
+	dir := t.TempDir()
+	m := New(dir, nil)
+	defer m.Close()
+
+	data := []byte("overlap body")
+	p1, err := m.Offer("peer", "paired", []FileReq{{RelPath: "a.txt", Size: int64(len(data))}}, 0)
+	if err != nil {
+		t.Fatalf("first Offer: %v", err)
+	}
+	if _, err := m.WriteChunk(p1.ID, "peer", "a.txt", 0, strings.NewReader(string(data))); err != nil {
+		t.Fatalf("WriteChunk: %v", err)
+	}
+
+	// The same file while p1 is live: the part is owned, so the second offer
+	// must be refused rather than allowed to clobber the first.
+	if _, err := m.Offer("peer", "paired", []FileReq{{RelPath: "a.txt", Size: int64(len(data))}}, 0); !errors.Is(err, ErrFilesBusy) {
+		t.Fatalf("second overlapping Offer = %v, want ErrFilesBusy", err)
+	}
+	// A different peer offering a different file is unaffected.
+	if _, err := m.Offer("other", "paired", []FileReq{{RelPath: "b.txt", Size: 3}}, 0); err != nil {
+		t.Fatalf("unrelated Offer = %v, want allowed", err)
+	}
+
+	// The first push must still complete intact despite the refused offer.
+	if _, _, err := m.Complete(p1.ID, "peer", "a.txt", sha(data)); err != nil {
+		t.Fatalf("first Complete after refusal: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "a.txt"))
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("first file after refusal = %q err=%v, want it intact", got, err)
+	}
+
+	// Finish releases the part, so the same file may be offered again.
+	if !m.Finish(p1.ID, "peer") {
+		t.Fatal("Finish returned false")
+	}
+	if _, err := m.Offer("peer", "paired", []FileReq{{RelPath: "a.txt", Size: int64(len(data))}}, 0); err != nil {
+		t.Fatalf("Offer after Finish = %v, want allowed", err)
+	}
+}
+
+// A per-file complete whose part is missing (removed by something else, or a
+// shared part cleaned under it) must end the push as Failed with the reason, not
+// leave the row "Receiving" forever.
+func TestCompleteMissingPartFailsPush(t *testing.T) {
+	dir := t.TempDir()
+	m := New(dir, nil)
+	defer m.Close()
+	failed := make(chan string, 2)
+	m.SetOnFail(func(_, reason string) { failed <- reason })
+
+	data := []byte("gone")
+	p, err := m.Offer("peer", "paired", []FileReq{{RelPath: "a.txt", Size: int64(len(data))}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.WriteChunk(p.ID, "peer", "a.txt", 0, strings.NewReader(string(data))); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the shared part being cleaned by a colliding push.
+	if err := os.Remove(filepath.Join(dir, "a.txt.lanpart")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.Complete(p.ID, "peer", "a.txt", sha(data)); err == nil {
+		t.Fatal("Complete with a missing part should fail")
+	}
+	if n := m.Count(); n != 0 {
+		t.Fatalf("a failed complete left the push Receiving: %+v", m.Incoming())
+	}
+	select {
+	case reason := <-failed:
+		if reason == "" {
+			t.Error("onFail reason is empty; the failure reason must surface")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("onFail was not called for the failed complete")
+	}
+	// A missing part must not have produced a final file.
+	if _, err := os.Stat(filepath.Join(dir, "a.txt")); err == nil {
+		t.Error("no file should be finalized when the part is missing")
+	}
+}
+
+// A push stuck between files (a part fully uploaded but no complete) is reaped
+// by the idle timeout, keeping its .lanpart for resume and freeing the part so a
+// re-offer can claim it. This is the safety net for a row that would otherwise
+// sit "Receiving" forever.
+func TestReaperReapsPushStuckBetweenFilesFreesPart(t *testing.T) {
+	dir := t.TempDir()
+	m := New(dir, nil)
+	defer m.Close()
+	m.SetStallTimeout(40 * time.Millisecond)
+	m.SetIdleTimeout(100 * time.Millisecond)
+	failed := make(chan string, 4)
+	m.SetOnFail(func(_, reason string) { failed <- reason })
+
+	data := bytes.Repeat([]byte("x"), 1024)
+	p, err := m.Offer("peer", "paired", []FileReq{{RelPath: "a.bin", Size: int64(len(data))}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// All bytes arrive, but no Complete follows: the push is stuck between files
+	// with a part already uploaded and no body in flight.
+	if _, err := m.WriteChunk(p.ID, "peer", "a.bin", 0, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	if !waitFor(func() bool { return m.Count() == 0 }, 2*time.Second) {
+		t.Fatalf("a push stuck between files was not reaped: %+v", m.Incoming())
+	}
+	select {
+	case reason := <-failed:
+		if !strings.Contains(reason, "stall") {
+			t.Errorf("onFail reason = %q, want a stall message", reason)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("onFail was not called for the stuck push")
+	}
+	// The partial is kept for resume and its ownership released, so a re-offer
+	// is allowed and resumes from the bytes already on disk.
+	if info, err := os.Stat(filepath.Join(dir, "a.bin.lanpart")); err != nil || info.Size() != int64(len(data)) {
+		t.Fatalf("stuck push should keep its full .lanpart: info=%v err=%v", info, err)
+	}
+	p2, err := m.Offer("peer", "paired", []FileReq{{RelPath: "a.bin", Size: int64(len(data))}}, 0)
+	if err != nil {
+		t.Fatalf("re-offer after reap = %v, want allowed", err)
+	}
+	offs := p2.SortedOffsets()
+	if len(offs) != 1 || offs[0].Offset != int64(len(data)) {
+		t.Fatalf("resume offsets = %+v, want one at %d", offs, len(data))
+	}
+}

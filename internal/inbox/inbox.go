@@ -206,6 +206,13 @@ func (p *Push) eta() int { return int(p.etaBits.Load()) }
 // cancelled an accepted push.
 var ErrCancelled = errors.New("cancelled by the receiver")
 
+// ErrFilesBusy is returned when an offer names one or more files whose .lanpart
+// is already owned by another live push. Two live pushes must never share a part
+// file: they would overwrite and delete each other's bytes (one push's finalize
+// renames the shared part away, the other's complete then fails with ENOENT). A
+// re-offer of a push that already died is allowed, so resume still works.
+var ErrFilesBusy = errors.New("these files are already being received")
+
 // cancelReader fails reads as soon as the push is cancelled, so a transfer in
 // flight stops within one buffer rather than at the end of the request. While
 // bytes arrive it touches the push's progress and drives the throttled
@@ -369,6 +376,7 @@ func (m *Manager) Cancel(id string) bool {
 		sort.Slice(received, func(i, j int) bool { return received[i].Rel < received[j].Rel })
 		delete(m.pushes, id)
 		p.cancelled.Store(true)
+		m.releasePartsLocked(p)
 		m.gone[id] = struct{}{}
 	}
 	m.mu.Unlock()
@@ -415,6 +423,11 @@ type Manager struct {
 	mu         sync.Mutex
 	lastNotify time.Time
 	pushes     map[string]*Push
+	// partOwners maps a .lanpart path to the ID of the live push that owns it,
+	// so two live pushes can never write one part file. Guarded by mu. A push
+	// claims its parts atomically when it registers and releases them when it
+	// finishes, is cancelled, fails or is reaped.
+	partOwners map[string]string
 	gone       map[string]struct{} // cancelled push ids
 	snippets   []*Snippet
 
@@ -506,7 +519,7 @@ func New(dir string, onChange func(), opts ...Option) *Manager {
 		onChange = func() {}
 	}
 	m := &Manager{
-		dir: dir, onChange: onChange, pushes: map[string]*Push{}, gone: map[string]struct{}{},
+		dir: dir, onChange: onChange, pushes: map[string]*Push{}, partOwners: map[string]string{}, gone: map[string]struct{}{},
 		now: time.Now, progressEvery: defaultProgressThrottle,
 		stallTimeout: defaultStallTimeout, idleTimeout: defaultIdleTimeout,
 		sweepInterval: defaultSweepInterval,
@@ -633,6 +646,7 @@ func (m *Manager) reapStalled() {
 		if now.Sub(last) > limit {
 			delete(m.pushes, id)
 			p.dead.Store(true) // abort any read still in flight
+			m.releasePartsLocked(p)
 			stalled = append(stalled, p)
 		}
 	}
@@ -649,6 +663,32 @@ func (m *Manager) reapStalled() {
 	m.onChange()
 }
 
+// releasePartsLocked drops every .lanpart ownership this push still holds, so a
+// later offer naming the same file may claim it (resume). It only clears entries
+// that still point at p, so it can never release a newer push's claim. Caller
+// holds m.mu.
+func (m *Manager) releasePartsLocked(p *Push) {
+	for _, st := range p.Files {
+		m.releasePartLocked(st.Part, p.ID)
+	}
+}
+
+// releasePartLocked drops ownership of a single .lanpart once it has been
+// renamed into place, so the part file name is free for another push even while
+// this push is still live awaiting its final Finish. It only clears an entry
+// still owned by id. Caller holds m.mu.
+func (m *Manager) releasePartLocked(part, id string) {
+	if owner, ok := m.partOwners[part]; ok && owner == id {
+		delete(m.partOwners, part)
+	}
+}
+
+// Fail ends a push as Failed with the given reason: it is removed from the
+// incoming list (so a row cannot sit "Receiving" forever) and onFail is fired
+// with the reason. The .lanpart files are kept so a re-offer can resume. It is
+// safe to call for an unknown push.
+func (m *Manager) Fail(id, reason string) bool { return m.failPush(id, reason) }
+
 // failPush removes a push whose body copy failed (a dropped or dead
 // connection), so it does not stay listed in /api/incoming forever. Like the
 // reaper it keeps the .lanpart files: the sender re-offers on every retry and
@@ -659,6 +699,7 @@ func (m *Manager) failPush(id, reason string) bool {
 	if ok {
 		delete(m.pushes, id)
 		p.dead.Store(true)
+		m.releasePartsLocked(p)
 	}
 	m.mu.Unlock()
 	if !ok {
@@ -860,6 +901,25 @@ func (m *Manager) Offer(peerFP, mode string, files []FileReq, maxBytes int64) (*
 		return nil, errors.New("insufficient storage")
 	}
 	m.mu.Lock()
+	// Refuse if any part file this offer names is already owned by another live
+	// push. The check and the claim happen under one lock, so two racing offers
+	// for the same file cannot both win: whichever registers first owns the part
+	// and the other gets ErrFilesBusy. A dead/cancelled owner has already
+	// released its parts, so a resume offer is not refused.
+	for _, st := range p.Files {
+		if owner, ok := m.partOwners[st.Part]; ok && owner != p.ID {
+			if op, live := m.pushes[owner]; live && !op.cancelled.Load() && !op.dead.Load() {
+				m.mu.Unlock()
+				return nil, ErrFilesBusy
+			}
+		}
+	}
+	if m.partOwners == nil {
+		m.partOwners = map[string]string{}
+	}
+	for _, st := range p.Files {
+		m.partOwners[st.Part] = p.ID
+	}
 	m.pushes[p.ID] = p
 	m.lastNotify = m.now()
 	m.mu.Unlock()
@@ -998,16 +1058,22 @@ func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileSt
 		return nil, false, err
 	}
 	if n != st.Size {
-		return fail(fmt.Errorf("size mismatch: have %d, expected %d", n, st.Size))
+		err := fmt.Errorf("size mismatch: have %d, expected %d", n, st.Size)
+		m.failPush(id, err.Error())
+		return fail(err)
 	}
 	if !strings.EqualFold(hex.EncodeToString(h.Sum(nil)), wantSHA) {
-		return fail(errors.New("checksum mismatch"))
+		err := errors.New("checksum mismatch")
+		m.failPush(id, err.Error())
+		return fail(err)
 	}
 	final := uniqueName(st.Final)
 	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
+		m.failPush(id, err.Error())
 		return fail(err)
 	}
 	if err := os.Rename(st.Part, final); err != nil {
+		m.failPush(id, err.Error())
 		return fail(err)
 	}
 	if !st.MTime.IsZero() {
@@ -1016,6 +1082,7 @@ func (m *Manager) Receive(id, peerFP, rel, wantSHA string, r io.Reader) (*FileSt
 	m.mu.Lock()
 	st.Final, st.Done = final, st.Size
 	st.completeDone.Store(true)
+	m.releasePartLocked(st.Part, p.ID)
 	m.mu.Unlock()
 	m.onChange()
 	return st, false, nil
@@ -1044,19 +1111,30 @@ func (m *Manager) Complete(id, peerFP, rel, wantSHA string) (*FileState, bool, e
 	}
 	gotSHA, gotSize, err := hashFile(st.Part)
 	if err != nil {
+		// A missing part (or an unreadable one) means finalize can never
+		// succeed. End the push as Failed with the reason instead of leaving a
+		// row stuck "Receiving". The part is not touched here, so a failure can
+		// never delete a partial another push might still need.
+		m.failPush(id, err.Error())
 		return nil, false, err
 	}
 	if gotSize != st.Size {
-		return nil, false, fmt.Errorf("size mismatch: have %d, expected %d", gotSize, st.Size)
+		err := fmt.Errorf("size mismatch: have %d, expected %d", gotSize, st.Size)
+		m.failPush(id, err.Error())
+		return nil, false, err
 	}
 	if wantSHA != "" && !strings.EqualFold(gotSHA, wantSHA) {
-		return nil, false, errors.New("checksum mismatch")
+		err := errors.New("checksum mismatch")
+		m.failPush(id, err.Error())
+		return nil, false, err
 	}
 	final := uniqueName(st.Final)
 	if err := os.MkdirAll(filepath.Dir(final), 0o700); err != nil {
+		m.failPush(id, err.Error())
 		return nil, false, err
 	}
 	if err := os.Rename(st.Part, final); err != nil {
+		m.failPush(id, err.Error())
 		return nil, false, err
 	}
 	if !st.MTime.IsZero() {
@@ -1064,6 +1142,9 @@ func (m *Manager) Complete(id, peerFP, rel, wantSHA string) (*FileState, bool, e
 	}
 	st.Final = final
 	st.completeDone.Store(true)
+	m.mu.Lock()
+	m.releasePartLocked(st.Part, p.ID)
+	m.mu.Unlock()
 	m.onChange()
 	return st, false, nil
 }
@@ -1084,6 +1165,7 @@ func (m *Manager) Finish(id, peerFP string) bool {
 		}
 		sort.Slice(received, func(i, j int) bool { return received[i].Rel < received[j].Rel })
 		delete(m.pushes, id)
+		m.releasePartsLocked(p)
 		done = p
 	}
 	m.mu.Unlock()
