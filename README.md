@@ -22,10 +22,15 @@ Windows SmartScreen and macOS Gatekeeper will warn the first time.
    window (Windows and Linux; on macOS, or with `--web`, it opens a browser tab instead). The window is served only
    on your own computer; nothing else can open it.
 2. If Windows asks about the firewall, choose **Private networks** and **Allow access**.
-3. Devices running LANyard on the same network appear under **View Devices** within a few seconds.
-4. On the device that has the files: **My Shares** -> type the path of a file or folder, pick how long to share
+3. On Linux, allow LANyard through `ufw` (the ports are listed under
+   [Ports, firewall](#ports-firewall-and-when-devices-do-not-appear)):
+   `sudo ufw allow 47800/tcp && sudo ufw allow 47801/udp && sudo ufw allow 5353/udp`. If TCP 47800 is already
+   taken, the peer service falls back to a random free port; open that port too, because the rules above only
+   cover the default port.
+4. Devices running LANyard on the same network appear under **View Devices** within a few seconds.
+5. On the device that has the files: **My Shares** -> type the path of a file or folder, pick how long to share
    it, **Share**.
-5. On the other device: open the device, then **Connect** (one transfer) or **Pair** (trusted) -> compare the
+6. On the other device: open the device, then **Connect** (one transfer) or **Pair** (trusted) -> compare the
    6-digit code shown on both screens (or pair with a QR code, below) -> pick the share -> **Download**.
 
 ## Connect or Pair?

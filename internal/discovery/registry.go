@@ -32,6 +32,11 @@ type Hello struct {
 	OS          string `json:"os"`
 	Version     string `json:"version"`
 	Port        int    `json:"port"`
+	// MaxOfferBytes / MaxOfferFiles advertise the receiver's own push-offer
+	// limits so a sender can batch a selection to fit. Zero means an older peer
+	// that does not advertise them; the sender then falls back to a safe floor.
+	MaxOfferBytes int64 `json:"max_offer_bytes"`
+	MaxOfferFiles int   `json:"max_offer_files"`
 }
 
 // Prober dials a peer over TLS and returns the Device ID taken from the

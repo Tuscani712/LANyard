@@ -205,7 +205,7 @@ func (s *Server) Serve(ln net.Listener) error {
 		// detect a running instance.
 		writeJSON(w, map[string]string{"app": "lanyard"})
 	})
-	mux.HandleFunc("GET /api/self", s.auth(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.d.Self()) }))
+	mux.HandleFunc("GET /api/self", s.auth(s.handleSelf))
 	mux.HandleFunc("GET /api/peers", s.auth(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.d.Peers()) }))
 	mux.HandleFunc("POST /api/peers/add", s.auth(s.handleAdd))
 	mux.HandleFunc("GET /api/fs/roots", s.auth(s.handleFSRoots))
@@ -342,6 +342,13 @@ func (s *Server) auth(h http.HandlerFunc) http.HandlerFunc {
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// handleSelf returns this device's identity and the peer service's actually
+// bound port (peer_port), which the UI uses for the firewall banner when it is
+// not the default 47800.
+func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.d.Self())
 }
 
 // peerErrorMessage maps a failure to reach or be accepted by a peer to the

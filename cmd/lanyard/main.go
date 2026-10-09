@@ -249,6 +249,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		return discovery.Hello{
 			DeviceID: label, Fingerprint: id.DeviceID, Name: cur.DeviceName, OS: runtime.GOOS,
 			Version: version, Port: peerSrv.Port(),
+			MaxOfferBytes: peerapi.MaxOfferBytes, MaxOfferFiles: peerapi.MaxOfferFiles,
 		}
 	}
 	peerSrv = peerapi.NewServer(id, hello, shMgr, trustStore, auth, log)

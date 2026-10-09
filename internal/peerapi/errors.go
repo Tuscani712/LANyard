@@ -13,6 +13,11 @@ import (
 // as "could not reach device".
 const NotPairedMessage = "Not paired with this device."
 
+// TooLargeMessage is what the desktop shows when a peer answers 413. The peer's
+// own body (a raw limit number) is not useful to a person, so the sender maps
+// it to actionable wording.
+const TooLargeMessage = "The other device can't accept a list this large; send fewer files at a time."
+
 // notPairedMsg is the exact peer body that means "I no longer have you in my
 // trust store". It is the only message that may trigger automatic local
 // unpairing; see IsNotPaired. Permission refusals deliberately use other
@@ -85,6 +90,9 @@ func UserMessage(err error) string {
 				return msg
 			}
 			return NotPairedMessage
+		}
+		if se.Code == http.StatusRequestEntityTooLarge {
+			return TooLargeMessage
 		}
 		if se.Msg != "" {
 			return se.Msg

@@ -2013,6 +2013,40 @@ function renderDiag(checks, device, transferLog) {
 function diagClass(status) { return status === "ok" ? "ok" : status === "warn" ? "warn" : status === "fail" ? "err" : ""; }
 function closeDiag() { $("diag").hidden = true; }
 
+// ---------- firewall banner ----------
+// Other devices cannot reach this computer when the peer service bound a port
+// other than the default, or when the firewall check says inbound (LAN)
+// connections are blocked. Dismissal is in-memory only (never localStorage or
+// sessionStorage), so the warning returns on the next launch instead of being
+// silenced forever.
+let firewallBannerDismissed = false;
+const FIREWALL_COPY_COMMANDS = "sudo ufw allow 47800/tcp && sudo ufw allow 47801/udp && sudo ufw allow 5353/udp";
+
+function showFirewallBanner(port) {
+  if (firewallBannerDismissed) return;
+  const box = $("firewall-banner");
+  if (!box) return;
+  $("firewall-banner-text").textContent =
+    `Other devices can't reach this computer. Your firewall is blocking TCP ${port || 47800}. Run: ${FIREWALL_COPY_COMMANDS}`;
+  box.hidden = false;
+}
+function dismissFirewallBanner() {
+  firewallBannerDismissed = true;
+  const box = $("firewall-banner");
+  if (box) box.hidden = true;
+}
+// Run the inbound-reachability check at startup (not only when Troubleshoot is
+// opened) so the banner can appear on its own, over the existing authenticated
+// /api/diagnostics status endpoint.
+async function loadFirewallBanner() {
+  try {
+    const r = await fetch("/api/diagnostics");
+    if (!r.ok) return;
+    const j = await r.json();
+    if (j.firewall_banner) showFirewallBanner(j.peer_port);
+  } catch (e) { }
+}
+
 // ---------- settings helpers ----------
 function applyTheme(theme) {
   settings.theme = theme || "dark";
@@ -2079,6 +2113,8 @@ $("diag-close").addEventListener("click", closeDiag);
 $("diag").addEventListener("click", (e) => { if (e.target === $("diag")) closeDiag(); });
 $("diag-copy").addEventListener("click", () => copyText(diagReport || ""));
 $("diag-copy-log").addEventListener("click", () => copyText(diagLog || ""));
+$("firewall-banner-copy").addEventListener("click", () => copyText(FIREWALL_COPY_COMMANDS));
+$("firewall-banner-dismiss").addEventListener("click", dismissFirewallBanner);
 
 async function submitShare(confirmFlag) {
   const lifetime = $("share-lifetime").value;
@@ -2100,3 +2136,4 @@ initWindowChrome();
 showView("devices");
 loadRoots();
 loadSelf().then(connectEvents).catch((e) => { $("self-name").textContent = e.message; });
+loadFirewallBanner();

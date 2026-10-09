@@ -126,6 +126,7 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 	device := strings.TrimSpace(r.URL.Query().Get("device"))
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
+	self := s.d.Self()
 	checks := diag.Run(ctx, diagEnv{s: s, device: device})
 	report := diag.Report(checks)
 	// The four diagnostic areas — discovery, pairing, pushing and pulling — are
@@ -146,5 +147,29 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 			report += "\n" + log
 		}
 	}
-	writeJSON(w, map[string]any{"checks": checks, "report": report, "log": log, "transfer_log": entries})
+	writeJSON(w, map[string]any{
+		"checks": checks, "report": report, "log": log, "transfer_log": entries,
+		"peer_port":       self.PeerPort,
+		"firewall_banner": firewallBannerNeeded(self, checks),
+	})
+}
+
+// defaultPeerPort is the port the peer service prefers. A firewall rule opened
+// for it does not cover the random fallback port.
+const defaultPeerPort = 47800
+
+// firewallBannerNeeded reports whether the UI should show the actionable
+// "other devices can't reach this computer" banner: the peer service bound a
+// port other than the default, or the firewall check found inbound
+// reachability blocked (warn/fail, not skipped).
+func firewallBannerNeeded(self SelfInfo, checks []diag.Check) bool {
+	if self.PeerPort > 0 && self.PeerPort != defaultPeerPort {
+		return true
+	}
+	for _, c := range checks {
+		if c.ID == "firewall" && (c.Status == diag.StatusWarn || c.Status == diag.StatusFail) {
+			return true
+		}
+	}
+	return false
 }

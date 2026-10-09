@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"lanyard/internal/discovery"
 	"lanyard/internal/identity"
 	"lanyard/internal/inbox"
 	"lanyard/internal/peerapi"
@@ -105,8 +107,72 @@ func (m *Manager) runPush(job *Job) {
 	job.mu.Unlock()
 	m.onChange()
 
-	reqs := make([]inbox.FileReq, 0, len(job.Files))
-	for _, f := range job.Files {
+	// Ask the peer what it can accept in one offer (hello advertises the
+	// receiver's caps) and split the selection into offers that fit. A failed
+	// probe is not fatal: fall back to the safe floor and let the offer itself
+	// report a real reachability problem. Each batch is offered, uploaded and
+	// finalized under its own push_id, so the receiver never sees a list it
+	// cannot parse.
+	maxBytes, maxFiles := peerapi.EffectiveOfferLimits(m.probeHello(ctx, job))
+	batches := offerBatches(job.Files, maxBytes, maxFiles)
+	if len(batches) == 0 {
+		m.pushFail(job, errors.New("nothing to push"))
+		return
+	}
+	for _, batch := range batches {
+		if err := m.pushBatch(ctx, job, batch); err != nil {
+			job.mu.Lock()
+			job.running = false
+			cancelled := errors.Is(ctx.Err(), context.Canceled)
+			switch {
+			case cancelled && job.cancelled:
+				job.State = StateCancelled
+				if job.FinishedAt.IsZero() {
+					job.FinishedAt = time.Now()
+				}
+				job.Note = ""
+			case cancelled:
+				job.State = StatePaused
+			}
+			job.mu.Unlock()
+			if !cancelled {
+				m.pushFail(job, err)
+			}
+			m.persist()
+			m.onChange()
+			return
+		}
+	}
+	job.mu.Lock()
+	job.running = false
+	job.State = StateDone
+	job.Done = job.Total
+	job.UpdatedAt = time.Now()
+	job.mu.Unlock()
+	m.persist()
+	m.onChange()
+	m.fireDone(job)
+}
+
+// probeHello reads the peer's advertised offer limits. A probe failure is not
+// fatal: the caller falls back to the floor limits and the offer itself will
+// surface any real reachability problem.
+func (m *Manager) probeHello(ctx context.Context, job *Job) *discovery.Hello {
+	if m.client == nil {
+		return nil
+	}
+	_, h, err := m.client.Probe(ctx, job.Host, job.Port)
+	if err != nil {
+		return nil
+	}
+	return h
+}
+
+// pushBatch offers, uploads and finalizes one batch of files under a single
+// push_id.
+func (m *Manager) pushBatch(ctx context.Context, job *Job, files []*FileJob) error {
+	reqs := make([]inbox.FileReq, 0, len(files))
+	for _, f := range files {
 		reqs = append(reqs, inbox.FileReq{RelPath: f.Rel, Size: f.Size, MTime: time.Unix(0, f.MTime)})
 	}
 	offerAt := time.Now()
@@ -117,8 +183,7 @@ func (m *Manager) runPush(job *Job) {
 			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
 			Elapsed: time.Since(offerAt), Error: err.Error(),
 		})
-		m.pushFail(job, err)
-		return
+		return err
 	}
 	m.xfer(xferlog.Entry{
 		Direction: xferlog.DirectionSend, Step: xferlog.StepOffer, Level: xferlog.LevelInfo,
@@ -145,7 +210,7 @@ func (m *Manager) runPush(job *Job) {
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
-	for _, f := range job.Files {
+	for _, f := range files {
 		f := f
 		select {
 		case sem <- struct{}{}:
@@ -185,27 +250,11 @@ func (m *Manager) runPush(job *Job) {
 		}()
 	}
 	wg.Wait()
-	if firstErr != nil || ctx.Err() != nil {
-		job.mu.Lock()
-		job.running = false
-		cancelled := errors.Is(ctx.Err(), context.Canceled)
-		switch {
-		case cancelled && job.cancelled:
-			job.State = StateCancelled
-			if job.FinishedAt.IsZero() {
-				job.FinishedAt = time.Now()
-			}
-			job.Note = ""
-		case cancelled:
-			job.State = StatePaused
-		}
-		job.mu.Unlock()
-		if !cancelled {
-			m.pushFail(job, firstErr)
-		}
-		m.persist()
-		m.onChange()
-		return
+	if firstErr != nil {
+		return firstErr
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
 	}
 	completeAt := time.Now()
 	if err := m.client.PushComplete(ctx, job.Host, job.Port, job.PeerID, offer.PushID, "", "", true); err != nil {
@@ -216,23 +265,65 @@ func (m *Manager) runPush(job *Job) {
 			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
 			Elapsed: time.Since(completeAt), Error: err.Error(),
 		})
-		m.pushFail(job, fmt.Errorf("could not finalize the transfer: %w", err))
-		return
+		return fmt.Errorf("could not finalize the transfer: %w", err)
 	}
 	m.xfer(xferlog.Entry{
 		Direction: xferlog.DirectionSend, Step: xferlog.StepComplete, Level: xferlog.LevelInfo,
 		Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
 		Bytes: job.Total, Elapsed: time.Since(completeAt),
 	})
-	job.mu.Lock()
-	job.running = false
-	job.State = StateDone
-	job.Done = job.Total
-	job.UpdatedAt = time.Now()
-	job.mu.Unlock()
-	m.persist()
-	m.onChange()
-	m.fireDone(job)
+	return nil
+}
+
+// offerBatches splits a selection into offers whose encoded JSON body stays
+// under maxBytes-headroom and whose file count stays under maxFiles. A file is
+// never split across batches; a single file that alone exceeds the byte budget
+// gets its own batch (the receiver's hard cap still applies).
+func offerBatches(files []*FileJob, maxBytes int64, maxFiles int) [][]*FileJob {
+	if maxBytes <= 0 {
+		maxBytes = peerapi.FallbackOfferBytes
+	}
+	if maxFiles <= 0 {
+		maxFiles = peerapi.FallbackOfferFiles
+	}
+	// Leave ~10% of the advertised budget, at least 64 KiB, so JSON overhead
+	// and a slightly different encoder on the peer cannot tip a batch over.
+	headroom := maxBytes / 10
+	if headroom < 64<<10 {
+		headroom = 64 << 10
+	}
+	if headroom > maxBytes/2 {
+		headroom = maxBytes / 2
+	}
+	limit := maxBytes - headroom
+	const envelope = 32 // {"files":[]} plus slack
+	var batches [][]*FileJob
+	var cur []*FileJob
+	var curBytes int64 = envelope
+	for _, f := range files {
+		sz := offerFileSize(f) + 1 // +1 for the separating comma
+		if len(cur) > 0 && (curBytes+sz > limit || len(cur)+1 > maxFiles) {
+			batches = append(batches, cur)
+			cur = nil
+			curBytes = envelope
+		}
+		cur = append(cur, f)
+		curBytes += sz
+	}
+	if len(cur) > 0 {
+		batches = append(batches, cur)
+	}
+	return batches
+}
+
+// offerFileSize is the encoded size of one file entry as it appears in a push
+// offer body.
+func offerFileSize(f *FileJob) int64 {
+	b, err := json.Marshal(inbox.FileReq{RelPath: f.Rel, Size: f.Size, MTime: time.Unix(0, f.MTime)})
+	if err != nil {
+		return int64(len(f.Rel)) + 64
+	}
+	return int64(len(b))
 }
 
 func (m *Manager) pushOne(ctx context.Context, job *Job, pushID string, f *FileJob, offset int64) error {

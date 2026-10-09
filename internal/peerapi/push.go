@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"lanyard/internal/approval"
+	"lanyard/internal/discovery"
 	"lanyard/internal/identity"
 	"lanyard/internal/inbox"
 	"lanyard/internal/trust"
@@ -155,10 +156,36 @@ func (s *Server) xferRecvFile(fp, step string, level xferlog.Level, peer, target
 	s.xfer(e)
 }
 
+// The desktop receiver's own caps. These are the values advertised in hello
+// (discovery.Hello.MaxOfferBytes / MaxOfferFiles). A sender that gets no
+// advertised limits from an older peer falls back to the Android-side floor.
 const (
-	maxOfferBytes = 128 << 20
-	maxOfferFiles = 500000
+	MaxOfferBytes = 128 << 20
+	MaxOfferFiles = 500000
+
+	// FallbackOfferBytes / FallbackOfferFiles are the safe floor a sender uses
+	// when a peer's hello advertises no limits (older builds). They match the
+	// Android receiver so a desktop sending to an un-updated phone still fits.
+	FallbackOfferBytes = 8 << 20
+	FallbackOfferFiles = 50000
 )
+
+// EffectiveOfferLimits returns the offer limits a sender should honour for a
+// peer. An advertised value wins; a missing (zero/negative) value or a nil
+// hello falls back to the Android-side floor.
+func EffectiveOfferLimits(h *discovery.Hello) (maxBytes int64, maxFiles int) {
+	maxBytes, maxFiles = FallbackOfferBytes, FallbackOfferFiles
+	if h == nil {
+		return maxBytes, maxFiles
+	}
+	if h.MaxOfferBytes > 0 {
+		maxBytes = h.MaxOfferBytes
+	}
+	if h.MaxOfferFiles > 0 {
+		maxFiles = h.MaxOfferFiles
+	}
+	return maxBytes, maxFiles
+}
 
 type pushFileResp struct {
 	RelPath string `json:"rel_path"`
@@ -183,7 +210,16 @@ func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
 	}
 	// A folder push lists every file in one offer (about 150 bytes each), so the
 	// body limit has to cover a large tree, not just a handful of files.
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxOfferBytes)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxOfferBytes)).Decode(&req); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			// The body was truncated mid-stream: the connection cannot be
+			// reused (the unread tail would be misparsed as the next request),
+			// so tell the sender to close it and surface a 413.
+			w.Header().Set("Connection", "close")
+			http.Error(w, "the list of files is too large for this device", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "bad request (the list of files is too large or malformed)", http.StatusBadRequest)
 		return
 	}
@@ -191,8 +227,9 @@ func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no files", http.StatusBadRequest)
 		return
 	}
-	if len(req.Files) > maxOfferFiles {
-		http.Error(w, fmt.Sprintf("too many files in one push (limit %d); send the folder in parts", maxOfferFiles), http.StatusRequestEntityTooLarge)
+	if len(req.Files) > MaxOfferFiles {
+		w.Header().Set("Connection", "close")
+		http.Error(w, fmt.Sprintf("too many files in one push (limit %d)", MaxOfferFiles), http.StatusRequestEntityTooLarge)
 		return
 	}
 	total := req.TotalBytes

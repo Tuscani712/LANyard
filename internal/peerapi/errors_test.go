@@ -85,3 +85,17 @@ func TestUserMessageJSONErrorBody(t *testing.T) {
 		t.Errorf("UserMessage(specific JSON 403) = %q, want the unwrapped reason", got)
 	}
 }
+
+// A 413 from a peer must read as actionable wording, never the raw HTTP status
+// or the peer's internal limit number.
+func TestUserMessageTooLarge(t *testing.T) {
+	for _, msg := range []string{
+		"",
+		"too many files in one push (limit 500000)",
+		`{"error":"the list of files is too large for this device"}`,
+	} {
+		if got := UserMessage(&StatusError{Code: http.StatusRequestEntityTooLarge, Status: "413 Request Entity Too Large", Msg: msg}); got != TooLargeMessage {
+			t.Errorf("UserMessage(413 %q) = %q, want %q", msg, got, TooLargeMessage)
+		}
+	}
+}
