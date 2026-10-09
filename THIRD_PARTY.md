@@ -37,3 +37,49 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
+
+## Android `android/` (Gradle/Maven dependencies)
+
+The Android modules under `android/` pull the following libraries at build time.
+Versions are pinned in `android/gradle/libs.versions.toml`.
+
+`:core` (Kotlin/JVM library):
+
+| Library | Version | License | Purpose |
+| :--- | :--- | :--- | :--- |
+| org.conscrypt:conscrypt-openjdk-uber | 2.6.3 | Apache-2.0 | TLS provider tried first (BoringSSL) |
+| org.bouncycastle:bcprov-jdk18on | 1.83 | MIT | Ed25519 key generation and primitives |
+| org.bouncycastle:bcpkix-jdk18on | 1.83 | MIT | X.509 certificate building |
+| org.bouncycastle:bctls-jdk18on | 1.83 | MIT | JSSE provider used for Ed25519 mTLS (Conscrypt could not present the client certificate) |
+| com.google.code.gson:gson | 2.11.0 | Apache-2.0 | JSON for the peer/UI APIs |
+| org.junit.jupiter:junit-jupiter | 5.11.4 | EPL-2.0 | Test framework |
+| org.junit.platform:junit-platform-launcher | 1.11.4 | EPL-2.0 | Test runtime |
+| org.jetbrains.kotlin:kotlin-test | 2.0.21 | Apache-2.0 | Test assertions |
+| org.jetbrains.kotlin:kotlin-stdlib / kotlin-gradle-plugin | 2.0.21 | Apache-2.0 | Kotlin/JVM toolchain |
+
+`:app` (Android application, Jetpack Compose):
+
+| Library | Version | License | Purpose |
+| :--- | :--- | :--- | :--- |
+| com.android.tools.build:gradle (AGP) | 8.7.3 | Apache-2.0 | Android build tooling |
+| org.jetbrains.kotlin.android / kotlin.plugin.compose | 2.0.21 | Apache-2.0 | Kotlin and Compose compiler Gradle plugins |
+| androidx.core:core-ktx | 1.15.0 | Apache-2.0 | AndroidX core |
+| androidx.activity:activity-compose | 1.9.3 | Apache-2.0 | Compose entry point / `ComponentActivity` |
+| androidx.lifecycle:lifecycle-runtime-ktx | 2.8.7 | Apache-2.0 | Lifecycle runtime |
+| androidx.lifecycle:lifecycle-runtime-compose | 2.8.7 | Apache-2.0 | `collectAsStateWithLifecycle` |
+| androidx.lifecycle:lifecycle-viewmodel-compose | 2.8.7 | Apache-2.0 | `viewModel()` in Compose |
+| org.jetbrains.kotlinx:kotlinx-coroutines-android | 1.9.0 | Apache-2.0 | Coroutine dispatchers on Android |
+| com.google.zxing:core | 3.5.3 | Apache-2.0 | QR decoding (no Play Services) |
+| androidx.camera:camera-core / camera-camera2 | 1.4.0 | Apache-2.0 | CameraX preview and capture |
+| androidx.camera:camera-lifecycle / camera-view | 1.4.0 | Apache-2.0 | Lifecycle-bound camera and `PreviewView` |
+| androidx.documentfile:documentfile | 1.0.1 | Apache-2.0 | SAF folder tree access for downloads |
+| com.google.code.gson:gson | 2.11.0 | Apache-2.0 | JSON for the peer/UI APIs |
+| androidx.compose:compose-bom | 2024.12.01 | Apache-2.0 | Aligns Compose artifact versions |
+| androidx.compose.ui:ui / ui-tooling-preview / ui-tooling | 1.7.6 (BOM) | Apache-2.0 | Compose UI and previews |
+| androidx.compose.material3:material3 | 1.3.1 (BOM) | Apache-2.0 | Material 3 components |
+| androidx.compose.material:material-icons-extended | 1.7.6 (BOM) | Apache-2.0 | Navigation-bar icons |
+
+The Android `:app` build uses `org.conscrypt:conscrypt-android` at runtime if a
+Conscrypt-based path is ever used (AAR, `minSdkVersion=21`; native libraries for
+arm64-v8a, armeabi-v7a, x86, x86_64). The current TLS path is BouncyCastle JSSE
+(`bctls`), which is pure Java.

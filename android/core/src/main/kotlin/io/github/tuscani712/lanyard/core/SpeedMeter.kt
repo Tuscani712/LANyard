@@ -1,0 +1,93 @@
+package io.github.tuscani712.lanyard.core
+
+/**
+ * A smoothed transfer rate over a sliding ~[windowMillis] window.
+ *
+ * The default window is [TransferTuning.WINDOW_MS] (5 seconds), shared with the
+ * row and the notification so neither surface can drift.
+ *
+ * [sample] is fed the cumulative bytes moved and the wall-clock time of each
+ * progress callback. It returns the average rate (bytes/second) across the
+ * window, or null when no honest rate can be shown yet:
+ *
+ *  - on the very first sample (a fresh start has no elapsed time to divide by);
+ *  - immediately after a stall: a gap of [stallAfterMillis] or more since the
+ *    last callback is treated as a resume. The window is reset and this callback
+ *    reports nothing, so a resumed transfer goes blank instead of flashing a
+ *    spike built from bytes that arrived in a burst after the pause.
+ *
+ * A counter that moves backwards (a new file in a multi-file receive, or an
+ * out-of-order callback) also re-anchors the window rather than reporting a
+ * negative or bogus rate.
+ *
+ * Pure and dependency-free, so the send and receive paths share exactly one
+ * tested implementation. Returning null is deliberate: the UI treats "no rate"
+ * as blank, which is the required behaviour when a transfer resumes.
+ */
+class SpeedMeter(
+    private val windowMillis: Long = DEFAULT_WINDOW_MS,
+    private val stallAfterMillis: Long = DEFAULT_STALL_MS,
+) {
+    private val times = ArrayDeque<Long>()
+    private val bytes = ArrayDeque<Long>()
+
+    /**
+     * Records [cumulativeBytes] moved at [nowMillis] and returns the smoothed
+     * bytes/second over the window, or null when a rate must not be shown.
+     *
+     * Synchronized: one meter is kept per transfer, and every file body of a
+     * concurrent receive samples the same instance from its own server thread.
+     * The backing `ArrayDeque`s are not thread-safe; unsynchronized use let a
+     * racing resize/clear leave a null slot, which unboxed to a
+     * `Number.longValue()` NPE and took down the receive handler.
+     */
+    @Synchronized
+    fun sample(nowMillis: Long, cumulativeBytes: Long): Double? {
+        val lastAt = times.lastOrNull()
+        if (lastAt != null) {
+            if (nowMillis - lastAt >= stallAfterMillis) {
+                // A pause long enough to be a stall. Forget the pre-pause window
+                // so the resumed bytes are judged on their own, and show nothing
+                // for this callback rather than a rate spanning the gap.
+                clear()
+            } else if (nowMillis <= lastAt || cumulativeBytes < (bytes.lastOrNull() ?: cumulativeBytes)) {
+                // Out-of-order callback, or a counter that reset (a new file):
+                // re-anchor so the rate never runs negative.
+                clear()
+            }
+        }
+        times.addLast(nowMillis)
+        bytes.addLast(cumulativeBytes)
+
+        // Keep only the samples inside the rolling window (always at least one).
+        while (times.size > 1 && nowMillis - times.first() > windowMillis) {
+            times.removeFirst()
+            bytes.removeFirst()
+        }
+        if (times.size < 2) return null
+
+        val firstTime = times.firstOrNull() ?: return null
+        val firstBytes = bytes.firstOrNull() ?: return null
+        val elapsedSeconds = (nowMillis - firstTime) / 1000.0
+        if (elapsedSeconds <= 0.0) return null
+        val moved = (cumulativeBytes - firstBytes).coerceAtLeast(0L)
+        return moved / elapsedSeconds
+    }
+
+    /** Forgets every sample; the next [sample] behaves like a fresh start. */
+    @Synchronized
+    fun reset() = clear()
+
+    private fun clear() {
+        times.clear()
+        bytes.clear()
+    }
+
+    companion object {
+        /** The rolling window, ~5 seconds as required. */
+        const val DEFAULT_WINDOW_MS = TransferTuning.WINDOW_MS
+
+        /** A gap this long is a resume; the window resets and no rate is shown. */
+        const val DEFAULT_STALL_MS = TransferTuning.STALL_AFTER_MS
+    }
+}
