@@ -1,6 +1,6 @@
 // Package peerapi is the network-facing HTTPS service: mutual TLS 1.3 with
-// self-signed certificates identified by fingerprint. Authorization (trust
-// store, sessions) is layered on in later milestones; in M1 only /hello exists.
+// self-signed certificates identified by fingerprint. Every request is
+// authorized against the trust store or a live Connect session.
 package peerapi
 
 import (
@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"lanyard/internal/approval"
@@ -21,6 +22,7 @@ import (
 	"lanyard/internal/inbox"
 	"lanyard/internal/shares"
 	"lanyard/internal/trust"
+	"lanyard/internal/xferlog"
 )
 
 // Authorizer decides what an authenticated peer certificate may do.
@@ -31,7 +33,7 @@ type Authorizer interface {
 type allowAll struct{}
 
 func (allowAll) Access(string) trust.Access {
-	return trust.Access{Paired: true, Browse: true, Push: true}
+	return trust.Access{Paired: true, Browse: trust.Allow, Push: trust.Allow, Text: trust.Allow}
 }
 
 // AllowAll bypasses the trust store. It is used only by package tests; the
@@ -59,12 +61,86 @@ type Server struct {
 	hashes    hashCache
 	rl        rateLimiter
 	log       *slog.Logger
+	xlog      *xferlog.Recorder
+	// onRevoke, when set, runs local cleanup after a peer removes itself from
+	// our trust store via /trust/revoke: the peer's mount is dropped and, if it
+	// was actually paired, it is asked to drop us too. Wired by the UI server in
+	// main; nil is a valid no-op. It is called before the trust entry is removed
+	// so the last-known address is still available for the fallback.
+	onRevoke func(fp string, wasPaired bool)
+	// onSeen, when set, runs whenever a peer proves reachable by calling us: a
+	// successful /hello or an inbound handshake from that certificate. It lets a
+	// device unpaired while offline be told to drop us as soon as it reappears.
+	// It runs off the request path and must not block; nil is a valid no-op.
+	onSeen func(fp string)
+	// mu guards srv and port, which Listen and Serve write while Shutdown and
+	// Port may read from other goroutines.
+	mu        sync.Mutex
 	srv       *http.Server
 	port      int
+	requested int  // the port Listen was asked for
+	fellBack  bool // Listen could not bind requested and used a random port
+	// fallbackNotice is the person-facing line explaining a temporary port,
+	// e.g. "Using temporary port 51234 because 47800 is in use by other".
+	fallbackNotice string
+}
+
+// portRetryWindow is how long Listen keeps trying the configured port before it
+// gives up and binds a temporary one. It is a var so tests can shorten it.
+// portRetryInterval is the pause between attempts.
+var (
+	portRetryWindow   = 5 * time.Second
+	portRetryInterval = 250 * time.Millisecond
+)
+
+// portHolderFn names the process listening on a TCP port, or "" if unknown.
+// A var so tests are deterministic.
+var portHolderFn = portHolder
+
+// TemporaryPortMessage is the line shown in the banner and Settings when the
+// configured peer port was busy and a temporary one was bound for this run.
+func TemporaryPortMessage(bound, requested int, holder string) string {
+	msg := fmt.Sprintf("Using temporary port %d because %d is in use", bound, requested)
+	if holder != "" {
+		msg += " by " + holder
+	}
+	return msg
 }
 
 func NewServer(id *identity.Identity, hello func() discovery.Hello, sh *shares.Manager, tr *trust.Store, auth Authorizer, log *slog.Logger) *Server {
 	return &Server{id: id, hello: hello, shares: sh, trust: tr, auth: auth, log: log}
+}
+
+// SetXferLog attaches the shared transfer recorder so incoming push offers,
+// per-file receipts and completions (and their failures) are written to the
+// desktop log and shown in the diagnostics report.
+func (s *Server) SetXferLog(r *xferlog.Recorder) { s.xlog = r }
+
+// SetOnRevoke registers the local cleanup that runs when a peer revokes the
+// pairing over the peer API. It must be safe to call repeatedly.
+func (s *Server) SetOnRevoke(fn func(fp string, wasPaired bool)) { s.onRevoke = fn }
+
+// SetOnPeerSeen registers a callback invoked (off the request path) whenever a
+// peer proves reachable to us — a successful /hello or an inbound handshake.
+// It is how a pending unpair is retried as soon as the device is seen.
+func (s *Server) SetOnPeerSeen(fn func(fp string)) { s.onSeen = fn }
+
+// notePeerSeen tells the host a peer just proved reachable. The callback runs in
+// its own goroutine so a slow retry cannot stall the peer's request.
+func (s *Server) notePeerSeen(fp string) {
+	if fp == "" || s.onSeen == nil {
+		return
+	}
+	go s.onSeen(fp)
+}
+
+// xfer records one transfer entry and mirrors it into the desktop log. Push
+// and pull entries default to their area at the call site.
+func (s *Server) xfer(e xferlog.Entry) {
+	if e.Area == "" {
+		e.Area = xferlog.AreaPushing
+	}
+	s.xlog.Record(s.log, e)
 }
 
 func (s *Server) tlsConfig() *tls.Config {
@@ -77,21 +153,72 @@ func (s *Server) tlsConfig() *tls.Config {
 	}
 }
 
-// Listen binds the preferred port, falling back to any free port.
+// Listen binds the preferred port, waiting briefly for it to free up. If it is
+// still busy it falls back to an ephemeral port for this run only; the caller
+// must not persist that port. RequestedPort keeps reporting the configured port
+// so the next start tries it again.
 func (s *Server) Listen(preferred int) (net.Listener, error) {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", preferred))
+	fellBack := false
+	notice := ""
 	if err != nil {
-		s.log.Info("preferred port unavailable, choosing a random one", "port", preferred, "err", err)
+		// Give a previous instance a moment to release the port before falling
+		// back; a busy port is usually a restart overlap, not a conflict.
+		deadline := time.Now().Add(portRetryWindow)
+		for time.Now().Before(deadline) {
+			time.Sleep(portRetryInterval)
+			if ln, err = net.Listen("tcp", fmt.Sprintf(":%d", preferred)); err == nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		s.log.Info("preferred port unavailable, choosing a temporary one", "port", preferred, "err", err)
 		ln, err = net.Listen("tcp", ":0")
 		if err != nil {
 			return nil, err
 		}
+		fellBack = true
+		notice = TemporaryPortMessage(ln.Addr().(*net.TCPAddr).Port, preferred, portHolderFn(preferred))
 	}
+	s.mu.Lock()
 	s.port = ln.Addr().(*net.TCPAddr).Port
+	s.requested = preferred
+	s.fellBack = fellBack
+	s.fallbackNotice = notice
+	s.mu.Unlock()
 	return ln, nil
 }
 
-func (s *Server) Port() int { return s.port }
+func (s *Server) Port() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.port
+}
+
+// RequestedPort is the port Listen was asked for (settings or --port). It may
+// differ from Port() only when PortFellBack reports true.
+func (s *Server) RequestedPort() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.requested
+}
+
+// PortFellBack reports whether the requested port was unavailable and a random
+// one was used instead.
+func (s *Server) PortFellBack() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fellBack
+}
+
+// FallbackNotice is the person-facing explanation of a temporary-port fallback,
+// or "" when the configured port was used.
+func (s *Server) FallbackNotice() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fallbackNotice
+}
 
 func (s *Server) Serve(ln net.Listener) error {
 	mux := http.NewServeMux()
@@ -102,8 +229,10 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/v1/session/{id}/close", s.handleSessionClose)
 	mux.HandleFunc("POST /api/v1/trust/revoke", s.handleTrustRevoke)
 	mux.HandleFunc("POST /api/v1/push/offer", s.handlePushOffer)
+	mux.HandleFunc("POST /api/v1/snippet", s.handleSnippet)
 	mux.HandleFunc("PUT /api/v1/push/{id}/file", s.handlePushFile)
 	mux.HandleFunc("POST /api/v1/push/{id}/complete", s.handlePushComplete)
+	mux.HandleFunc("POST /api/v1/push/{id}/cancel", s.handlePushCancel)
 	mux.HandleFunc("GET /api/v1/shares", s.handleShareList)
 	mux.HandleFunc("GET /api/v1/shares/{id}/tree", s.handleTree)
 	mux.HandleFunc("GET /api/v1/shares/{id}/manifest", s.handleManifest)
@@ -112,14 +241,17 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/v1/shares/{id}/complete", s.handleComplete)
 	mux.HandleFunc("HEAD /api/v1/shares/{id}/file", s.handleFile)
 
-	s.srv = &http.Server{
+	srv := &http.Server{
 		Handler:           s.withPeer(mux),
 		TLSConfig:         s.tlsConfig(),
 		ReadHeaderTimeout: 10 * time.Second,
 		IdleTimeout:       2 * time.Minute,
 		ErrorLog:          slog.NewLogLogger(s.log.Handler(), slog.LevelDebug),
 	}
-	err := s.srv.ServeTLS(ln, "", "")
+	s.mu.Lock()
+	s.srv = srv
+	s.mu.Unlock()
+	err := srv.ServeTLS(ln, "", "")
 	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -127,10 +259,13 @@ func (s *Server) Serve(ln net.Listener) error {
 }
 
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.srv == nil {
+	s.mu.Lock()
+	srv := s.srv
+	s.mu.Unlock()
+	if srv == nil {
 		return nil
 	}
-	return s.srv.Shutdown(ctx)
+	return srv.Shutdown(ctx)
 }
 
 // withPeer attaches the caller's certificate fingerprint to the request context.
@@ -146,6 +281,9 @@ func (s *Server) withPeer(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
+	// A peer reaching our hello endpoint is proof it is online; retry any
+	// pending unpair for it.
+	s.notePeerSeen(PeerID(r.Context()))
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(s.hello())
 }
@@ -153,12 +291,27 @@ func (s *Server) handleHello(w http.ResponseWriter, r *http.Request) {
 // handleTrustRevoke lets an authenticated peer remove itself from our trust
 // store. This is how an unpair on the other device becomes mutual: we only ever
 // drop the caller's own entry, so it needs no extra authorization and is safe to
-// repeat.
+// repeat. A repeat revoke from an already-unpaired peer still succeeds (200) and
+// still runs local cleanup/logging, but does not notify the peer back — that
+// would bounce between the two devices forever.
 func (s *Server) handleTrustRevoke(w http.ResponseWriter, r *http.Request) {
 	fp := PeerID(r.Context())
 	if fp == "" {
 		http.Error(w, "client certificate required", http.StatusUnauthorized)
 		return
+	}
+	wasPaired := false
+	if s.trust != nil {
+		_, wasPaired = s.trust.Entry(fp)
+	}
+	if s.log != nil {
+		s.log.Info("peer requested unpair over the peer API", "fp", identity.ShortID(fp), "paired", wasPaired)
+	}
+	// Cleanup runs before the entry is removed so revokeRemote can fall back to
+	// the trust-stored last-known address. It is safe on a repeat: dropMountsOf
+	// is a no-op and no notification is sent.
+	if s.onRevoke != nil {
+		s.onRevoke(fp, wasPaired)
 	}
 	if s.trust != nil {
 		s.trust.Unpair(fp)
@@ -186,8 +339,13 @@ func NewClient(id *identity.Identity) *Client {
 			MinVersion:         tls.VersionTLS13,
 			InsecureSkipVerify: true, // identity is checked by fingerprint below, not by CA
 		},
-		ForceAttemptHTTP2:   true,
-		MaxIdleConnsPerHost: 4,
+		ForceAttemptHTTP2: true,
+		// Keep enough idle connections to match the up-to-16 small-file
+		// transfers a push runs in parallel, so an HTTP/1.1 peer that closes
+		// after every request still reuses connections instead of re-handshaking
+		// for each file.
+		MaxIdleConns:        32,
+		MaxIdleConnsPerHost: 16,
 		IdleConnTimeout:     30 * time.Second,
 	}
 	return &Client{http: &http.Client{Transport: tr}}

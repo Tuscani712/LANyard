@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -772,7 +773,10 @@ func (m *Manager) persist() {
 	if err != nil {
 		return
 	}
-	_ = m.cfg.Update(func(st *config.Settings) { st.Shares = raw })
+	if err := m.cfg.Update(func(st *config.Settings) { st.Shares = raw }); err != nil {
+		// The share list could not be saved; never discard the failure.
+		slog.Warn("shares: could not persist shares", "err", err)
+	}
 }
 
 // --- read access ---
@@ -911,7 +915,10 @@ func (s *Share) Tree(rel string) ([]Entry, error) {
 	return out, nil
 }
 
-// Manifest recursively lists every file under rel (spec §7).
+// Manifest recursively lists every file under rel (spec §7). Every entry's
+// Path is relative to the share root — the same convention as Tree and what
+// OpenFile expects — even when rel names a subfolder. A file share (rootRel
+// set) reports the single file with an empty Path.
 func (s *Share) Manifest(rel string) ([]ManifestEntry, int64, error) {
 	clean, err := CleanRel(rel)
 	if err != nil {
@@ -971,14 +978,9 @@ func (s *Share) Manifest(rel string) ([]ManifestEntry, int64, error) {
 		if !info.Mode().IsRegular() {
 			return nil
 		}
-		relPath := p
-		if clean != "" {
-			relPath = strings.TrimPrefix(p, clean+"/")
-			if p == clean {
-				relPath = ""
-			}
-		}
-		out = append(out, ManifestEntry{Path: relPath, Name: name, Size: info.Size(), ModTime: info.ModTime(), ETag: Validator(info)})
+		// Keep the walk path as-is: WalkDir over the share root yields paths
+		// relative to the share root, which is the convention callers rely on.
+		out = append(out, ManifestEntry{Path: p, Name: name, Size: info.Size(), ModTime: info.ModTime(), ETag: Validator(info)})
 		total += info.Size()
 		if len(out) > ManifestCap {
 			return errors.New("manifest too large")

@@ -59,14 +59,6 @@ func SAS(fpA, fpB, nonceA, nonceB string) string {
 	return fmt.Sprintf("%06d", n)
 }
 
-// GroupSAS renders a 6-digit code as "482 913" for display.
-func GroupSAS(code string) string {
-	if len(code) == 6 {
-		return code[:3] + " " + code[3:]
-	}
-	return code
-}
-
 // ShortID is the prefix advertised in discovery records.
 func ShortID(id string) string {
 	if len(id) > 16 {

@@ -7,6 +7,7 @@
 <link rel="icon" type="image/png" href="/icon.png">
 <link rel="apple-touch-icon" href="/icon.png">
 <script src="/theme.js"></script>
+<script src="/qrcodegen.js"></script>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -27,6 +28,15 @@
     <button class="wbtn close" data-win="close" title="Close" aria-label="Close">
       <svg width="12" height="12" viewBox="0 0 12 12"><path d="M2 2l8 8M10 2l-8 8" stroke="currentColor" stroke-width="1.2"/></svg>
     </button>
+  </div>
+</div>
+
+<!-- Firewall / inbound-reachability banner -->
+<div id="firewall-banner" class="banner" hidden role="alert">
+  <div class="banner-text" id="firewall-banner-text"></div>
+  <div class="banner-actions">
+    <button class="btn ghost" id="firewall-banner-copy">Copy</button>
+    <button class="btn ghost" id="firewall-banner-dismiss">Dismiss</button>
   </div>
 </div>
 
@@ -62,6 +72,9 @@
           </label>
           <button class="icon-btn" id="refresh-btn" title="Refresh">
             <svg viewBox="0 0 24 24" fill="none"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v4h-4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+          <button class="icon-btn" id="pair-qr-btn" title="Pair with a QR code">
+            <svg viewBox="0 0 24 24" fill="none"><rect x="3.5" y="3.5" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.7"/><rect x="14.5" y="3.5" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.7"/><rect x="3.5" y="14.5" width="6" height="6" rx="1" stroke="currentColor" stroke-width="1.7"/><path d="M14.5 14.5h2.5v2.5M20.5 20.5h-3.5V18M14.5 20.5h2" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>
           </button>
         </div>
       </header>
@@ -107,8 +120,10 @@
         <div class="head-tools"><button class="btn ghost" id="stop-all">Stop all</button></div>
       </header>
       <div class="form-row">
-        <input id="share-path" placeholder="Absolute path to a file or folder" autocomplete="off" style="flex:1;min-width:280px">
-        <input id="share-label" placeholder="Label (optional)" autocomplete="off" style="width:170px">
+        <input id="share-path" placeholder="No file or folder chosen" autocomplete="off" readonly style="flex:1;min-width:220px">
+        <button class="btn ghost" id="share-browse-file">Choose file…</button>
+        <button class="btn ghost" id="share-browse-folder">Choose folder…</button>
+        <input id="share-label" placeholder="Label (optional)" autocomplete="off" style="width:150px">
         <select id="share-lifetime" aria-label="Lifetime">
           <option value="until_stopped">Until I stop</option>
           <option value="persistent">Always</option>
@@ -141,7 +156,10 @@
       <header class="view-head">
         <div><h1>Settings</h1><p class="sub">Device identity, folders, bandwidth and paired permissions.</p></div>
       </header>
-      <div id="settings-body" style="overflow:auto"></div>
+      <div class="settings-layout">
+        <div id="settings-tabs" class="settings-tabs" role="tablist" aria-label="Settings categories"></div>
+        <div id="settings-pane" class="settings-pane" style="overflow:auto"></div>
+      </div>
     </section>
   </main>
 </div>
@@ -157,6 +175,21 @@
 <!-- Incoming transfers awaiting a decision -->
 <div id="approvals" class="overlay" hidden>
   <div class="modal" id="approvals-modal"></div>
+</div>
+
+<!-- Diagnostics / troubleshoot -->
+<div id="diag" class="overlay" hidden>
+  <div class="modal">
+    <div class="modal-head">
+      <h2>Diagnostics</h2>
+      <div class="actions">
+        <button class="btn ghost" id="diag-copy">Copy report</button>
+        <button class="btn ghost" id="diag-copy-log">Copy log</button>
+        <button class="btn ghost" id="diag-close">Close</button>
+      </div>
+    </div>
+    <div id="diag-body"></div>
+  </div>
 </div>
 
 <div id="ctx-root"></div>

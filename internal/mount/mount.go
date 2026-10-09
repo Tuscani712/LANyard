@@ -286,6 +286,7 @@ func MountOS(drive, url string) error {
 		return errors.New("a drive letter like Z: is required")
 	}
 	if webClientStopped() {
+		//lint:ignore ST1005 shown to the user verbatim; starts with a proper noun
 		return errors.New("Windows' WebClient service is not running, and Windows needs it to mount web folders. " +
 			"Start it once (Services -> WebClient -> Start, or `sc start WebClient` in an administrator prompt; set it to Automatic to keep it) and try again")
 	}

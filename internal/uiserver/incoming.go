@@ -18,16 +18,20 @@ func (s *Server) incoming() []incomingView {
 		return out
 	}
 	for _, v := range s.d.Inbox.Incoming() {
+		// A local alias wins so the receiving list names the sender the way the
+		// person does; otherwise fall back to discovery's broadcast name.
 		name := ""
-		for _, p := range s.d.Peers() {
-			if p.DeviceID == v.PeerFP {
-				name = p.Name
+		if s.d.Trust != nil {
+			for _, e := range s.d.Trust.Paired() {
+				if e.Fingerprint == v.PeerFP && e.DisplayName() != "" {
+					name = e.DisplayName()
+				}
 			}
 		}
-		if name == "" && s.d.Trust != nil {
-			for _, e := range s.d.Trust.Paired() {
-				if e.Fingerprint == v.PeerFP {
-					name = e.Name
+		if name == "" {
+			for _, p := range s.d.Peers() {
+				if p.DeviceID == v.PeerFP {
+					name = p.Name
 				}
 			}
 		}

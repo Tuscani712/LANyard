@@ -12,24 +12,48 @@ import (
 )
 
 type settingsView struct {
-	DeviceName            string        `json:"device_name"`
-	DeviceIDLabel         string        `json:"device_id_label"`
-	Fingerprint           string        `json:"fingerprint"`
-	GeneratedLabel        string        `json:"generated_label"`
-	Theme                 string        `json:"theme"`
-	SpeedUnit             string        `json:"speed_unit"`
-	SoundOnComplete       bool          `json:"sound_on_complete"`
-	DefaultDownloadFolder string        `json:"default_download_folder"`
-	InboxFolder           string        `json:"inbox_folder"`
-	PeerPort              int           `json:"peer_port"`
-	BandwidthLimitMBps    int           `json:"bandwidth_limit_mbps"`
-	StartOnLogin          bool          `json:"start_on_login"`
-	MinimizeToTray        bool          `json:"minimize_to_tray"`
-	TraySupported         bool          `json:"tray_supported"`
-	Version               string        `json:"version"`
-	UpdateURL             string        `json:"update_url"`
-	AutoUpdate            bool          `json:"auto_update"`
-	Paired                []trust.Entry `json:"paired"`
+	DeviceName            string `json:"device_name"`
+	DeviceIDLabel         string `json:"device_id_label"`
+	Fingerprint           string `json:"fingerprint"`
+	GeneratedLabel        string `json:"generated_label"`
+	Theme                 string `json:"theme"`
+	SpeedUnit             string `json:"speed_unit"`
+	SoundOnComplete       bool   `json:"sound_on_complete"`
+	Notifications         bool   `json:"notifications"`
+	DefaultDownloadFolder string `json:"default_download_folder"`
+	InboxFolder           string `json:"inbox_folder"`
+	PeerPort              int    `json:"peer_port"`
+	BeaconPort            int    `json:"beacon_port"`
+	BandwidthLimitMBps    int    `json:"bandwidth_limit_mbps"`
+	// PeerPortFallbackNotice explains a temporary peer port, shown in the
+	// Network tab. Empty when the configured port was used.
+	PeerPortFallbackNotice string        `json:"peer_port_fallback_notice,omitempty"`
+	StartOnLogin           bool          `json:"start_on_login"`
+	MinimizeToTray         bool          `json:"minimize_to_tray"`
+	TraySupported          bool          `json:"tray_supported"`
+	TrayReason             string        `json:"tray_reason"`
+	Version                string        `json:"version"`
+	UpdateURL              string        `json:"update_url"`
+	AutoUpdate             bool          `json:"auto_update"`
+	Paired                 []trust.Entry `json:"paired"`
+
+	// Warning carries a non-fatal problem from a settings PUT (for example the
+	// OS sign-in entry could not be changed). Empty on success.
+	Warning string `json:"warning,omitempty"`
+}
+
+// TrayProbe is set by the native app to report whether a system tray is really
+// available (and why not). Nil falls back to a per-platform default.
+var TrayProbe func() (bool, string)
+
+func traySupported() (bool, string) {
+	if TrayProbe != nil {
+		return TrayProbe()
+	}
+	if runtime.GOOS == "windows" {
+		return true, ""
+	}
+	return false, "The system tray is not available in this mode."
 }
 
 func (s *Server) settingsView() settingsView {
@@ -43,12 +67,20 @@ func (s *Server) settingsView() settingsView {
 		DeviceName: st.DeviceName, DeviceIDLabel: st.DeviceIDLabel,
 		Fingerprint: self.DeviceID, GeneratedLabel: generated,
 		Theme: st.Theme, SpeedUnit: st.SpeedUnit, SoundOnComplete: st.SoundOnComplete,
+		Notifications:         st.NotificationsEnabled(),
 		DefaultDownloadFolder: st.DefaultDownloadFolder, InboxFolder: st.InboxFolder,
-		PeerPort: st.PeerPort, BandwidthLimitMBps: st.BandwidthLimitMBps,
+		PeerPort: st.EffectivePeerPort(), BandwidthLimitMBps: st.BandwidthLimitMBps,
 	}
+	v.BeaconPort = st.EffectiveBeaconPort()
+	v.PeerPortFallbackNotice = self.PeerPortFallbackNotice
 	v.StartOnLogin = st.StartOnLogin
 	v.MinimizeToTray = st.MinimizeToTray
-	v.TraySupported = runtime.GOOS == "windows"
+	// Show the folder pushes actually land in: the configured one, or the
+	// default (~/LANyard) the manager resolved at startup.
+	if st.InboxFolder == "" && s.d.Inbox != nil {
+		v.InboxFolder = s.d.Inbox.Dir()
+	}
+	v.TraySupported, v.TrayReason = traySupported()
 	v.Version = self.Version
 	v.UpdateURL = st.UpdateURL
 	v.AutoUpdate = st.AutoUpdate
@@ -80,9 +112,11 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		Theme                 *string `json:"theme"`
 		SpeedUnit             *string `json:"speed_unit"`
 		SoundOnComplete       *bool   `json:"sound_on_complete"`
+		Notifications         *bool   `json:"notifications"`
 		DefaultDownloadFolder *string `json:"default_download_folder"`
 		InboxFolder           *string `json:"inbox_folder"`
 		PeerPort              *int    `json:"peer_port"`
+		BeaconPort            *int    `json:"beacon_port"`
 		BandwidthLimitMBps    *int    `json:"bandwidth_limit_mbps"`
 		StartOnLogin          *bool   `json:"start_on_login"`
 		MinimizeToTray        *bool   `json:"minimize_to_tray"`
@@ -138,6 +172,9 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	if req.SoundOnComplete != nil {
 		next.SoundOnComplete = *req.SoundOnComplete
 	}
+	if req.Notifications != nil {
+		next.Notifications = req.Notifications
+	}
 	if req.DefaultDownloadFolder != nil {
 		next.DefaultDownloadFolder = cleanPath(*req.DefaultDownloadFolder)
 	}
@@ -150,6 +187,13 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		next.PeerPort = *req.PeerPort
+	}
+	if req.BeaconPort != nil {
+		if *req.BeaconPort < 1024 || *req.BeaconPort > 65535 {
+			http.Error(w, "beacon port must be 1024-65535", http.StatusBadRequest)
+			return
+		}
+		next.BeaconPort = *req.BeaconPort
 	}
 	if req.BandwidthLimitMBps != nil {
 		if *req.BandwidthLimitMBps < 0 || *req.BandwidthLimitMBps > 100000 {
@@ -173,16 +217,27 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 	if req.AutoUpdate != nil {
 		next.AutoUpdate = *req.AutoUpdate
 	}
+	warning := ""
 	if req.StartOnLogin != nil {
 		if s.d.SetStartOnLogin == nil {
 			http.Error(w, "start on login is not available here", http.StatusNotImplemented)
 			return
 		}
-		if err := s.d.SetStartOnLogin(*req.StartOnLogin); err != nil {
-			http.Error(w, "could not change start on login: "+err.Error(), http.StatusInternalServerError)
-			return
+		// Only touch the OS sign-in entry when the value actually changes, so a
+		// normal save never writes (or can fail on) the autostart files.
+		if *req.StartOnLogin != next.StartOnLogin {
+			if err := s.d.SetStartOnLogin(*req.StartOnLogin); err != nil {
+				// Non-fatal: keep every other requested setting, leave
+				// start_on_login at its previous value, and surface the failure as a
+				// warning instead of discarding the whole save. Never silent.
+				if s.d.Log != nil {
+					s.d.Log.Warn("settings: could not change start on login", "err", err, "enable", *req.StartOnLogin)
+				}
+				warning = "could not change start on login: " + err.Error()
+			} else {
+				next.StartOnLogin = *req.StartOnLogin
+			}
 		}
-		next.StartOnLogin = *req.StartOnLogin
 	}
 
 	if err := s.d.Cfg.Update(func(st *config.Settings) { *st = next }); err != nil {
@@ -193,7 +248,9 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		s.d.ApplySettings(next)
 	}
 	s.Notify()
-	writeJSON(w, s.settingsView())
+	view := s.settingsView()
+	view.Warning = warning
+	writeJSON(w, view)
 }
 
 // handleCancelAll (§11.3) is the hard stop: every share ends at once and all

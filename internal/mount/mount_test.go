@@ -33,7 +33,7 @@ func (g gate) Access(string) trust.Access {
 	if g.revoked.Load() {
 		return trust.Access{}
 	}
-	return trust.Access{Paired: true, Browse: true, Push: true}
+	return trust.Access{Paired: true, Browse: trust.Allow, Push: trust.Allow}
 }
 
 type rig struct {

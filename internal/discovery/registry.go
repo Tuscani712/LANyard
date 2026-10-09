@@ -32,12 +32,35 @@ type Hello struct {
 	OS          string `json:"os"`
 	Version     string `json:"version"`
 	Port        int    `json:"port"`
+	// MaxOfferBytes / MaxOfferFiles advertise the receiver's own push-offer
+	// limits so a sender can batch a selection to fit. Zero means an older peer
+	// that does not advertise them; the sender then falls back to a safe floor.
+	MaxOfferBytes int64 `json:"max_offer_bytes"`
+	MaxOfferFiles int   `json:"max_offer_files"`
+	// TriStatePerms advertises that this peer speaks the tri-state permission
+	// encoding (Allow/Ask/Never). Presence of the `perms` marker on a grant is
+	// what actually makes the modes authoritative; this flag lets a peer know
+	// up front that Ask is understood, so it can offer/prompt accordingly.
+	TriStatePerms bool `json:"tristate_perms,omitempty"`
 }
 
 // Prober dials a peer over TLS and returns the Device ID taken from the
 // certificate actually presented (never from the JSON body) plus its Hello.
 type Prober func(ctx context.Context, host string, port int) (certID string, h *Hello, err error)
 
+// PairedPeer is a trusted device, supplied by the trust store, with the last
+// address it was seen at. The discovery manager dials it directly when it is
+// absent from the registry, so a paired device that is not advertising is still
+// reported online rather than flatly offline.
+type PairedPeer struct {
+	Fingerprint string
+	ShortID     string
+	Name        string
+	Addrs       []string
+	Port        int
+}
+
+// Peer is a discovered or paired device.
 type Peer struct {
 	ShortID     string    `json:"short_id"`
 	DeviceID    string    `json:"device_id"` // full fingerprint, meaningful once Verified
@@ -107,8 +130,10 @@ func (r *registry) list() []Peer {
 	return out
 }
 
-// upsert records an announcement and returns a copy of the peer.
-func (r *registry) upsert(a Announcement, ips []string, source string) Peer {
+// upsert records an announcement and returns a copy of the peer plus whether
+// this announcement was new or changed something (a fresh sighting) rather than
+// a routine repeat of what we already knew.
+func (r *registry) upsert(a Announcement, ips []string, source string) (Peer, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	p, ok := r.peers[a.ShortID]
@@ -136,7 +161,7 @@ func (r *registry) upsert(a Announcement, ips []string, source string) Peer {
 	}
 	c := *p
 	c.Addrs = append([]string(nil), p.Addrs...)
-	return c
+	return c, changed
 }
 
 func (r *registry) remove(shortID string) {

@@ -86,6 +86,8 @@ func runNativeUI(opts nativeUIOptions) error {
 
 	hwnd := windows.HWND(w.Window())
 	applyShellFrame(hwnd)
+	// The layout stops being usable below this; refuse to shrink past it.
+	w.SetSize(720, 520, webview2.HintMin)
 
 	_ = w.Bind("lanWin", func(action string) string {
 		switch action {
@@ -203,3 +205,9 @@ func applyShellFrame(hwnd windows.HWND) {
 	procDwmSetWindowAttribute.Call(uintptr(hwnd), dwmwaDarkMode-1,
 		uintptr(unsafe.Pointer(&dark)), unsafe.Sizeof(dark))
 }
+
+// nativeProfileDir is the WebView2 user-data folder inside the data directory.
+const nativeProfileDir = "webview2"
+
+// nativeSupported: Windows always has a native (WebView2) window.
+func nativeSupported() bool { return true }

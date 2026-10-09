@@ -5,15 +5,23 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"lanyard/internal/discovery"
+	"lanyard/internal/identity"
 	"lanyard/internal/inbox"
+	"lanyard/internal/peerapi"
+	"lanyard/internal/xferlog"
 )
 
 // PushParams describes a push into a peer's Inbox.
@@ -75,7 +83,8 @@ func (m *Manager) Push(ctx context.Context, p PushParams) (*View, error) {
 	job := &Job{
 		ID: "j_" + randHex(6), Direction: "push",
 		PeerID: p.PeerID, PeerName: p.PeerName, Host: p.Host, Port: p.Port,
-		ShareLabel: "Inbox", Files: files, Total: total,
+		ShareLabel: "Inbox", Sources: append([]string(nil), p.Paths...),
+		Files: files, Total: total,
 		State: StateQueued, StartedAt: time.Now(),
 	}
 	m.mu.Lock()
@@ -92,22 +101,108 @@ func (m *Manager) runPush(job *Job) {
 	job.ctx, job.cancel = context.WithCancel(context.Background())
 	job.running = true
 	job.State = StateConnecting
-	job.Note = "Waiting for the other device to accept…"
+	job.Note = "Waiting for approval on " + peerDisplay(job) + "\u2026"
 	job.lastAt = time.Now()
 	job.lastBytes = job.Done
 	ctx := job.ctx
 	job.mu.Unlock()
 	m.onChange()
 
-	reqs := make([]inbox.FileReq, 0, len(job.Files))
-	for _, f := range job.Files {
-		reqs = append(reqs, inbox.FileReq{RelPath: f.Rel, Size: f.Size, MTime: time.Unix(0, f.MTime)})
-	}
-	offer, err := m.client.PushOffer(ctx, job.Host, job.Port, job.PeerID, reqs)
-	if err != nil {
-		m.pushFail(job, err)
+	// Ask the peer what it can accept in one offer (hello advertises the
+	// receiver's caps) and split the selection into offers that fit. A failed
+	// probe is not fatal: fall back to the safe floor and let the offer itself
+	// report a real reachability problem. Each batch is offered, uploaded and
+	// finalized under its own push_id, so the receiver never sees a list it
+	// cannot parse.
+	maxBytes, maxFiles := peerapi.EffectiveOfferLimits(m.probeHello(ctx, job))
+	batches := offerBatches(job.Files, maxBytes, maxFiles)
+	if len(batches) == 0 {
+		m.pushFail(job, errors.New("nothing to push"))
 		return
 	}
+	for _, batch := range batches {
+		if err := m.pushBatch(ctx, job, batch); err != nil {
+			job.mu.Lock()
+			job.running = false
+			cancelled := errors.Is(ctx.Err(), context.Canceled)
+			switch {
+			case cancelled && job.cancelled:
+				job.State = StateCancelled
+				if job.FinishedAt.IsZero() {
+					job.FinishedAt = time.Now()
+				}
+				job.Note = ""
+			case cancelled:
+				job.State = StatePaused
+			case receiverCancelled(err):
+				// The phone/other receiver stopped the push: the wire answers
+				// the in-flight file PUT with 410 Gone. That is the mirror of a
+				// sender cancel, so the row ends Cancelled with the same reason
+				// the receiver records -- never a generic Failed.
+				job.State = StateCancelled
+				job.Note = ReceiverCancelledReason
+				job.Error = ""
+				job.cancelled = true
+				if job.FinishedAt.IsZero() {
+					job.FinishedAt = time.Now()
+				}
+			}
+			job.mu.Unlock()
+			if !cancelled && !receiverCancelled(err) {
+				m.pushFail(job, err)
+			}
+			m.persist()
+			m.onChange()
+			return
+		}
+	}
+	job.mu.Lock()
+	job.running = false
+	job.State = StateDone
+	job.Done = job.Total
+	job.UpdatedAt = time.Now()
+	job.mu.Unlock()
+	m.persist()
+	m.onChange()
+	m.fireDone(job)
+}
+
+// probeHello reads the peer's advertised offer limits. A probe failure is not
+// fatal: the caller falls back to the floor limits and the offer itself will
+// surface any real reachability problem.
+func (m *Manager) probeHello(ctx context.Context, job *Job) *discovery.Hello {
+	if m.client == nil {
+		return nil
+	}
+	_, h, err := m.client.Probe(ctx, job.Host, job.Port)
+	if err != nil {
+		return nil
+	}
+	return h
+}
+
+// pushBatch offers, uploads and finalizes one batch of files under a single
+// push_id.
+func (m *Manager) pushBatch(ctx context.Context, job *Job, files []*FileJob) error {
+	reqs := make([]inbox.FileReq, 0, len(files))
+	for _, f := range files {
+		reqs = append(reqs, inbox.FileReq{RelPath: f.Rel, Size: f.Size, MTime: time.Unix(0, f.MTime)})
+	}
+	offerAt := time.Now()
+	offer, err := m.client.PushOffer(ctx, job.Host, job.Port, job.PeerID, reqs)
+	if err != nil {
+		m.xfer(xferlog.Entry{
+			Direction: xferlog.DirectionSend, Step: xferlog.StepOffer, Level: xferlog.LevelError,
+			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+			Elapsed: time.Since(offerAt), Error: err.Error(),
+		})
+		return err
+	}
+	m.xfer(xferlog.Entry{
+		Direction: xferlog.DirectionSend, Step: xferlog.StepOffer, Level: xferlog.LevelInfo,
+		Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+		Elapsed: time.Since(offerAt),
+	})
 	offsets := map[string]int64{}
 	for _, f := range offer.Files {
 		offsets[f.RelPath] = f.Offset
@@ -116,6 +211,8 @@ func (m *Manager) runPush(job *Job) {
 	job.mu.Lock()
 	job.State = StateTransferring
 	job.Note = ""
+	// Remember the receiver's push id so a cancel can ask the peer to stop it.
+	job.pushIDs = append(job.pushIDs, offer.PushID)
 	job.mu.Unlock()
 	m.onChange()
 
@@ -128,7 +225,7 @@ func (m *Manager) runPush(job *Job) {
 	var wg sync.WaitGroup
 	var errMu sync.Mutex
 	var firstErr error
-	for _, f := range job.Files {
+	for _, f := range files {
 		f := f
 		select {
 		case sem <- struct{}{}:
@@ -169,30 +266,79 @@ func (m *Manager) runPush(job *Job) {
 	}
 	wg.Wait()
 	if firstErr != nil {
-		job.mu.Lock()
-		job.running = false
-		paused := errors.Is(ctx.Err(), context.Canceled)
-		if paused {
-			job.State = StatePaused
-		}
-		job.mu.Unlock()
-		if !paused {
-			m.pushFail(job, firstErr)
-		}
-		m.persist()
-		m.onChange()
-		return
+		return firstErr
 	}
-	_ = m.client.PushComplete(ctx, job.Host, job.Port, job.PeerID, offer.PushID, "", "", true)
-	job.mu.Lock()
-	job.running = false
-	job.State = StateDone
-	job.Done = job.Total
-	job.UpdatedAt = time.Now()
-	job.mu.Unlock()
-	m.persist()
-	m.onChange()
-	m.fireDone(job)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	completeAt := time.Now()
+	if err := m.client.PushComplete(ctx, job.Host, job.Port, job.PeerID, offer.PushID, "", "", true); err != nil {
+		// The whole push is not finalized on the receiver: the job must not be
+		// marked Done. Surface it like any other transfer failure.
+		m.xfer(xferlog.Entry{
+			Direction: xferlog.DirectionSend, Step: xferlog.StepComplete, Level: xferlog.LevelError,
+			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+			Elapsed: time.Since(completeAt), Error: err.Error(),
+		})
+		return fmt.Errorf("could not finalize the transfer: %w", err)
+	}
+	m.xfer(xferlog.Entry{
+		Direction: xferlog.DirectionSend, Step: xferlog.StepComplete, Level: xferlog.LevelInfo,
+		Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+		Bytes: job.Total, Elapsed: time.Since(completeAt),
+	})
+	return nil
+}
+
+// offerBatches splits a selection into offers whose encoded JSON body stays
+// under maxBytes-headroom and whose file count stays under maxFiles. A file is
+// never split across batches; a single file that alone exceeds the byte budget
+// gets its own batch (the receiver's hard cap still applies).
+func offerBatches(files []*FileJob, maxBytes int64, maxFiles int) [][]*FileJob {
+	if maxBytes <= 0 {
+		maxBytes = peerapi.FallbackOfferBytes
+	}
+	if maxFiles <= 0 {
+		maxFiles = peerapi.FallbackOfferFiles
+	}
+	// Leave ~10% of the advertised budget, at least 64 KiB, so JSON overhead
+	// and a slightly different encoder on the peer cannot tip a batch over.
+	headroom := maxBytes / 10
+	if headroom < 64<<10 {
+		headroom = 64 << 10
+	}
+	if headroom > maxBytes/2 {
+		headroom = maxBytes / 2
+	}
+	limit := maxBytes - headroom
+	const envelope = 32 // {"files":[]} plus slack
+	var batches [][]*FileJob
+	var cur []*FileJob
+	var curBytes int64 = envelope
+	for _, f := range files {
+		sz := offerFileSize(f) + 1 // +1 for the separating comma
+		if len(cur) > 0 && (curBytes+sz > limit || len(cur)+1 > maxFiles) {
+			batches = append(batches, cur)
+			cur = nil
+			curBytes = envelope
+		}
+		cur = append(cur, f)
+		curBytes += sz
+	}
+	if len(cur) > 0 {
+		batches = append(batches, cur)
+	}
+	return batches
+}
+
+// offerFileSize is the encoded size of one file entry as it appears in a push
+// offer body.
+func offerFileSize(f *FileJob) int64 {
+	b, err := json.Marshal(inbox.FileReq{RelPath: f.Rel, Size: f.Size, MTime: time.Unix(0, f.MTime)})
+	if err != nil {
+		return int64(len(f.Rel)) + 64
+	}
+	return int64(len(b))
 }
 
 func (m *Manager) pushOne(ctx context.Context, job *Job, pushID string, f *FileJob, offset int64) error {
@@ -219,41 +365,133 @@ func (m *Manager) pushOne(ctx context.Context, job *Job, pushID string, f *FileJ
 	if mbps := m.bandwidth(); mbps > 0 {
 		body = &throttleReader{r: body, mbps: mbps, start: time.Now()}
 	}
-	written, err := m.client.PushFile(ctx, job.Host, job.Port, job.PeerID, pushID, f.Rel, offset, f.Size, body)
+	// Publish the resumed prefix before streaming so job.Done is offset (not
+	// zero) and setFileDone, which is absolute, never adds the prefix twice.
+	job.mu.Lock()
+	setFileDone(job, f, offset)
+	f.State = FilePartial
+	job.UpdatedAt = time.Now()
+	job.lastProgress = time.Now()
+	job.mu.Unlock()
+	m.onChange()
+	putAt := time.Now()
+	cr := &pushCountingReader{m: m, job: job, f: f, r: body, base: offset}
+	written, err := m.client.PushFile(ctx, job.Host, job.Port, job.PeerID, pushID, f.Rel, offset, f.Size, cr)
 	if err != nil {
+		m.xfer(xferlog.Entry{
+			Direction: xferlog.DirectionSend, Step: xferlog.StepFile, Level: xferlog.LevelError,
+			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+			File: filepath.Base(f.Rel), Bytes: cr.sent.Load(), Elapsed: time.Since(putAt), Error: err.Error(),
+		})
 		return err
 	}
+	m.xfer(xferlog.Entry{
+		Direction: xferlog.DirectionSend, Step: xferlog.StepFile, Level: xferlog.LevelInfo,
+		Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+		File: filepath.Base(f.Rel), Bytes: written, Elapsed: time.Since(putAt),
+	})
 	if offset+written < f.Size {
 		if _, err := io.Copy(h, src); err != nil {
 			return err
 		}
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
+	completeAt := time.Now()
 	if err := m.client.PushComplete(ctx, job.Host, job.Port, job.PeerID, pushID, f.Rel, sum, false); err != nil {
+		m.xfer(xferlog.Entry{
+			Direction: xferlog.DirectionSend, Step: xferlog.StepComplete, Level: xferlog.LevelError,
+			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+			File: filepath.Base(f.Rel), Elapsed: time.Since(completeAt), Error: err.Error(),
+		})
 		return err
 	}
+	m.xfer(xferlog.Entry{
+		Direction: xferlog.DirectionSend, Step: xferlog.StepComplete, Level: xferlog.LevelInfo,
+		Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+		File: filepath.Base(f.Rel), Bytes: f.Size, Elapsed: time.Since(completeAt),
+	})
 	job.mu.Lock()
+	setFileDone(job, f, f.Size)
 	f.State = FileDone
-	f.Done = f.Size
-	job.Done += f.Size - offset
 	job.UpdatedAt = time.Now()
 	m.bumpSpeed(job)
+	m.noteFileDone(job)
 	job.mu.Unlock()
 	m.onChange()
 	return nil
+}
+
+// pushCountingReader wraps an upload body and records the job's live progress
+// as bytes leave the sender, so the UI advances during a slow push instead of
+// jumping to 100% only once the whole file has been verified. base is the
+// number of bytes already on the receiver for this attempt; because
+// setFileDone sets an absolute value, a retry/resume can never double-count
+// the prefix that was already transferred.
+type pushCountingReader struct {
+	m    *Manager
+	job  *Job
+	f    *FileJob
+	r    io.Reader
+	base int64
+	sent atomic.Int64
+}
+
+func (c *pushCountingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if n > 0 {
+		c.sent.Add(int64(n))
+		c.job.mu.Lock()
+		setFileDone(c.job, c.f, c.base+c.sent.Load())
+		c.job.lastProgress = time.Now()
+		c.m.bumpSpeed(c.job)
+		c.job.mu.Unlock()
+		c.m.notifyProgress()
+	}
+	return n, err
+}
+
+// ReceiverCancelledReason is the sender-side note when the other device's
+// receiving person stops a push it is still receiving: the mirror of the
+// receiver's "Cancelled by the sender" mapping.
+const ReceiverCancelledReason = "Cancelled by the receiver"
+
+// peerDisplay names the peer for a person-facing note, falling back when the
+// push has no remembered name.
+func peerDisplay(job *Job) string {
+	if job != nil && job.PeerName != "" {
+		return job.PeerName
+	}
+	return "the other device"
+}
+
+// receiverCancelled reports whether err is the receiver's 410 Gone: the
+// receiving person stopped the push, so the sender must end the row Cancelled
+// (with ReceiverCancelledReason) instead of a generic Failed.
+func receiverCancelled(err error) bool {
+	var se *peerapi.StatusError
+	return errors.As(err, &se) && se.Code == http.StatusGone
 }
 
 func (m *Manager) pushFail(job *Job, err error) {
 	job.mu.Lock()
 	job.running = false
 	job.State = StateFailed
-	job.Error = err.Error()
+	job.Error = peerapi.UserMessage(err)
 	job.UpdatedAt = time.Now()
+	job.FinishedAt = job.UpdatedAt
 	job.mu.Unlock()
 	m.persist()
 	m.onChange()
 	m.fireFail(job)
 }
+
+// pushTarget is the host:port a push is talking to, for the transfer log.
+func pushTarget(host string, port int) string {
+	return fmt.Sprintf("%s:%d", host, port)
+}
+
+// pushFP is the peer short fingerprint for the transfer log (never the full id).
+func pushFP(job *Job) string { return identity.ShortID(job.PeerID) }
 
 // pushSmall sends a small file and its digest in one request; the receiver
 // verifies and finalizes it in the same call.
@@ -270,16 +508,27 @@ func (m *Manager) pushSmall(ctx context.Context, job *Job, pushID string, f *Fil
 	if mbps := m.bandwidth(); mbps > 0 {
 		body = &throttleReader{r: body, mbps: mbps, start: time.Now()}
 	}
+	putAt := time.Now()
 	if err := m.client.PushFileSHA(ctx, job.Host, job.Port, job.PeerID, pushID, f.Rel, body, f.Size, hex.EncodeToString(sum[:])); err != nil {
+		m.xfer(xferlog.Entry{
+			Direction: xferlog.DirectionSend, Step: xferlog.StepFile, Level: xferlog.LevelError,
+			Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+			File: filepath.Base(f.Rel), Elapsed: time.Since(putAt), Error: err.Error(),
+		})
 		return err
 	}
+	m.xfer(xferlog.Entry{
+		Direction: xferlog.DirectionSend, Step: xferlog.StepFile, Level: xferlog.LevelInfo,
+		Job: job.ID, FP: pushFP(job), Peer: job.PeerName, Target: pushTarget(job.Host, job.Port),
+		File: filepath.Base(f.Rel), Bytes: f.Size, Elapsed: time.Since(putAt),
+	})
 	job.mu.Lock()
+	setFileDone(job, f, f.Size)
 	f.State = FileDone
-	f.Done = f.Size
-	job.Done += f.Size
 	job.UpdatedAt = time.Now()
 	job.lastProgress = time.Now()
 	m.bumpSpeed(job)
+	m.noteFileDone(job)
 	job.mu.Unlock()
 	m.onChange()
 	return nil

@@ -2,16 +2,20 @@
 
 > **Protocol:** Claude Code and opencode take turns. Whoever finishes a turn **overwrites this whole file** with the current state (keep it short and accurate), and sets "Last updated by" and "Next agent". Read `p2p_file_transfer_specification_v2.md` for the design; this file is only the current state.
 
-- **Last updated by:** Claude Code, 2026-10-05
+- **Last updated by:** Claude Code (Sonnet 5.5), 2026-10-06, branch `dev` (local, not pushed; `dev` is `ubuntu` plus the free-feature work)
 - **Next agent:** opencode
-- **Milestone just finished:** two-machine test feedback: notifications, native file dialogs, receiver-side cancel, Shared with me, minimize to tray.
-- **Next:** re-test on two machines; remaining items in the lists at the bottom.
+- **Milestone just finished:** free-tier feature set on Linux: desktop notifications (`internal/notify`), QR pairing (`internal/pairlink`, `internal/lanaddr`, `trust` invites, `/api/pair/payload`), text snippets (`inbox` + `peerapi/snippet.go`), transfer history + resend (`transfer.Retry`), subfolder-pull fix (`shares.Manifest` paths are share-root-relative), Troubleshoot wizard (`internal/diag`, `/api/diagnostics`). README rewritten to match.
+- **Rules from Meatbag:** Pro/Enterprise are a SEPARATE repo: no Pro/tier/upgrade wording or gates here. Linux first; Windows pieces only staged (e.g. `internal/notify/notify_windows.go` is a stub). Nothing is pushed until Meatbag approves. License is undecided (source-available: build/use, attribution, no resale).
+- **Next:** test on a real second machine and on Windows (WebView2 window, tray, toast stub, PowerShell itests); GNOME/Wayland; then Meatbag's pick: mirror engine, drag-drop send (needs a GTK drop bridge), signed self-update, Android groundwork.
+- **Linux files:** `cmd/lanyard/nativeui_linux.go` (cgo GTK3 + webkit2gtk-4.1; window, SIGUSR2 raise, file chooser via `uiserver.PickHook`), `tray_linux.go` (pure-Go godbus SNI + dbusmenu), `nativeui_other.go`/`tray_other.go` are the fallbacks. SIGUSR1 is reserved by WebKit's JS engine; do not use it. Closing the window quits unless `minimize_to_tray` is on and a tray host registered.
+- **Tested here (Linux, KDE/X11):** two real instances over the peer API (QR pair incl. wrong fingerprint/bad/reused invite refused, snippet, subfolder pull with a comma in the name, retry, diagnostics) and screenshots of the native window. Not tested: push, mount, GNOME, Wayland, Windows, two physical machines.
+- **Traps:** `go test -race ./...` needs cgo; staticcheck must be built with the repo's Go (`GOTOOLCHAIN=go1.27.0`). `run.json` is only removed by the process that wrote it. Don't `pkill -f <path>`; kill by the pid in `run.json`.
 
 ## Environment
 - Go 1.27.0 (default install in Program Files\Go\bin; `build.ps1` finds it even if it is not on PATH. For plain `go` in a non-interactive shell: `$env:Path += ";$env:ProgramFiles\Go\bin"`).
-- Git repo: github.com/Tuscani712/LANyard (main). Module `lanyard`, entry `cmd/lanyard`, version `1.0.0`. CGO off. Working folder is still `EZ-Share`.
+- Git repo: github.com/Tuscani712/LANyard (main). Module `lanyard`, entry `cmd/lanyard`, version `1.1.0-beta.1`. CGO off for release builds; the Linux window build uses cgo. Working folder is `LANyard` (renamed from `EZ-Share`).
 - **Build:** `.\build.ps1` -> `dist\lanyard.exe` (windowless app) + `dist\lanyard-console.exe` (console, used by the `dist\itest*.ps1` scripts); `.\build.ps1 -Release` -> `dist\release\` (windowless + console Windows, mac arm64/x64, linux x64/arm64). All build clean.
-- `go vet ./...`, `gofmt -l .`, `go test ./...` clean (race detector unavailable: needs cgo).
+- `go vet ./...`, `gofmt -l .`, `go test ./...` clean (race detector needs cgo).
 - **Traps:** PowerShell alias `RI` = `Remove-Item`; Windows PowerShell 5.1 `Invoke-WebRequest` cannot send PROPFIND (use `HttpClient`, see `dist/itest_mount.ps1`); a background browser tab has `document.hidden === true`.
 
 ## What exists (all working, tested)

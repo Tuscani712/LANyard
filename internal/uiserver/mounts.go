@@ -20,6 +20,16 @@ func (s *Server) handleMounts(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.d.Mounts.List())
 }
 
+// handleDriveLetters lists the free drive letters on Windows (empty elsewhere),
+// so the UI can offer a picker instead of asking the person to type one.
+func (s *Server) handleDriveLetters(w http.ResponseWriter, r *http.Request) {
+	letters := freeDriveLetters()
+	if letters == nil {
+		letters = []string{}
+	}
+	writeJSON(w, map[string]any{"letters": letters})
+}
+
 // handleMountAdd serves a paired device as a drive and, if a drive letter was
 // given and the OS supports it, asks the OS to mount it.
 func (s *Server) handleMountAdd(w http.ResponseWriter, r *http.Request) {
@@ -109,5 +119,10 @@ func (s *Server) saveMountPrefs() {
 	for _, m := range s.d.Mounts.List() {
 		prefs = append(prefs, config.MountPref{DeviceID: m.DeviceID, Name: m.Name, Drive: m.Drive})
 	}
-	_ = s.d.Cfg.Update(func(st *config.Settings) { st.Mounts = prefs })
+	if err := s.d.Cfg.Update(func(st *config.Settings) { st.Mounts = prefs }); err != nil {
+		// A failed mount-preference save must not be silent.
+		if s.d.Log != nil {
+			s.d.Log.Warn("settings: could not persist mount preferences", "err", err)
+		}
+	}
 }

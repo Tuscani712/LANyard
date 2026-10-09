@@ -49,9 +49,19 @@ svg { display: block; }
 .brand span { color: var(--muted); }
 #tb-drag { flex: 1; }
 .win-btns { display: flex; align-items: stretch; }
+.win-btns[hidden] { display: none; }
 .wbtn { width: 46px; border: 0; background: transparent; color: #c3ccd9; display: grid; place-items: center; cursor: default; }
 .wbtn:hover { background: var(--hover); }
 .wbtn.close:hover { background: #c0392b; color: #fff; }
+
+/* ---- firewall banner ---- */
+.banner { position: fixed; top: 54px; left: 50%; transform: translateX(-50%); z-index: 250;
+  display: flex; align-items: center; gap: 12px; max-width: min(860px, calc(100% - 24px));
+  padding: 10px 12px; background: var(--panel-2); border: 1px solid var(--line-2);
+  border-left: 3px solid var(--amber); border-radius: var(--radius); box-shadow: 0 12px 28px rgba(0, 0, 0, .45); }
+.banner[hidden] { display: none; }
+.banner-text { flex: 1; min-width: 0; font-size: 13px; }
+.banner-actions { display: flex; gap: 8px; flex: 0 0 auto; }
 
 /* ---- app frame ---- */
 #app { display: flex; height: calc(100% - 44px); }
@@ -143,27 +153,39 @@ svg { display: block; }
 /* ---- cards / rows (other pages) ---- */
 .panel { border: 1px solid var(--line); border-radius: 10px; background: var(--panel); padding: 14px 16px; }
 .stack { display: flex; flex-direction: column; gap: 10px; }
-.row { display: flex; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 11px 13px; }
+.row { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 11px 13px; }
 .row.col { flex-direction: column; align-items: stretch; }
-.row .grow { flex: 1; min-width: 0; }
+.row .grow { min-width: 0; }
+/* A row keeps its info block readable: the text block gets a sensible basis so
+   it is never squeezed to a one-letter column, and the action buttons wrap
+   under it when the pane is narrow. */
+.row:not(.col) > .grow { flex: 1 1 220px; }
 .row .name { font-weight: 600; overflow-wrap: anywhere; }
 .row .meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+/* Device header: the name and status stay on one line each and the ID stays
+   together as a whole; the buttons drop below the info on narrow panes. */
+.row.device-head { align-items: flex-start; }
+.row.device-head > .grow { flex: 1 1 260px; }
+.row.device-head .name,
+.row.device-head .meta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .btn { border: 0; border-radius: 8px; padding: 8px 14px; background: var(--accent); color: #fff; cursor: pointer; }
 .btn:hover { background: var(--accent-2); }
 .btn:disabled { opacity: .5; cursor: default; }
 .btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--line-2); }
 .btn.ghost:hover { background: var(--hover); }
+.btn.ghost.active { background: var(--active); border-color: var(--accent); color: var(--accent-2); }
 .btn.danger { background: transparent; color: var(--red); border: 1px solid #6b2530; }
 .btn.danger:hover { background: #33161b; }
 .badge { font-size: 12px; padding: 2px 9px; border-radius: 999px; border: 1px solid var(--line-2); color: var(--muted); white-space: nowrap; }
 .badge.ok { color: var(--green); border-color: #1f5132; }
 .badge.warn { color: var(--amber); border-color: #5a4320; }
+.badge.err { color: var(--red); border-color: #6b2530; }
 .muted { color: var(--muted); }
 .section-title { font-size: 15px; font-weight: 600; margin: 4px 0 10px; }
 .form-row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 12px; }
-input, select { background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 8px; padding: 8px 11px; font: inherit; outline: none; }
-input:focus, select:focus { border-color: var(--accent); }
+input, select, textarea { background: var(--panel-2); color: var(--text); border: 1px solid var(--line-2); border-radius: 8px; padding: 8px 11px; font: inherit; outline: none; }
+input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 input::placeholder { color: var(--muted-2); }
 .bar { height: 7px; border-radius: 999px; background: var(--line); overflow: hidden; margin: 9px 0 5px; }
 .fill { height: 100%; background: var(--accent); transition: width .2s linear; }
@@ -175,8 +197,16 @@ input::placeholder { color: var(--muted-2); }
 .set-row { display: flex; align-items: center; gap: 12px; margin: 9px 0; }
 .set-row .set-label { flex: 0 0 250px; color: var(--muted); }
 .set-row input, .set-row select { flex: 1; min-width: 0; }
+.settings-layout { display: flex; gap: 16px; align-items: flex-start; flex: 1; min-height: 0; }
+.settings-tabs { flex: 0 0 190px; width: 190px; display: flex; flex-direction: column; gap: 4px; }
+.settings-pane { flex: 1; min-width: 0; }
+.set-tab { text-align: left; background: transparent; color: var(--text); border: 1px solid transparent; border-radius: 8px; padding: 9px 12px; font: inherit; font-size: 13px; cursor: pointer; }
+.set-tab:hover { background: var(--hover); }
+.set-tab.active { background: var(--panel-2); border-color: var(--line-2); }
 .sasbox { text-align: center; margin: 8px 0; }
 .sas { font-family: ui-monospace, Consolas, monospace; font-size: 42px; font-weight: 700; letter-spacing: 7px; margin-top: 6px; }
+.qrbox { text-align: center; margin: 10px 0; }
+.qrcanvas { width: 264px; height: 264px; border-radius: 10px; background: #fff; padding: 6px; }
 
 /* ---- overlays ---- */
 .overlay { position: fixed; inset: 0; background: rgba(3, 6, 10, .55); display: flex; align-items: flex-start; justify-content: center; padding: 48px 16px; z-index: 50; }
@@ -214,6 +244,11 @@ input::placeholder { color: var(--muted-2); }
   .ex-side { width: 190px; flex-basis: 190px; }
   .search { width: 180px; }
   .view-head h1 { font-size: 22px; }
+  .settings-layout { flex-direction: column; }
+  .settings-tabs { flex-direction: row; flex-basis: auto; width: 100%; overflow-x: auto; padding-bottom: 4px; }
+  .set-tab { flex: 0 0 auto; white-space: nowrap; }
+  .set-row { flex-wrap: wrap; }
+  .set-row .set-label { flex: 0 0 100%; }
 }
 
 /* ---- notifications that wait for a click ---- */
@@ -231,3 +266,10 @@ input::placeholder { color: var(--muted-2); }
 .device-card.offline .dc-art, .device-card.offline .dc-name, .device-card.offline .dc-sub:not(:last-child) { opacity: .5; }
 .dot.sm { width: 7px; height: 7px; margin-left: auto; flex: 0 0 auto; }
 .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+/* Native form controls follow the theme: dark popups and a themed checkbox
+   (WebKitGTK otherwise draws light selects and stretched checkboxes). */
+:root { color-scheme: dark; }
+:root[data-theme="light"] { color-scheme: light; }
+select option { background: var(--panel-2); color: var(--text); }
+input[type="checkbox"], .set-row input[type="checkbox"] { flex: 0 0 auto; width: 18px; height: 18px; min-width: 0; padding: 0; accent-color: var(--accent); }

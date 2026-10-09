@@ -1,4 +1,4 @@
-//go:build !windows
+//go:build !windows && !(linux && cgo)
 
 package main
 
@@ -15,3 +15,7 @@ func focusNativeWindow(int) bool { return false }
 
 // showNativeWindow is Windows-only.
 func showNativeWindow() bool { return false }
+
+const nativeProfileDir = "browser"
+
+func nativeSupported() bool { return false }

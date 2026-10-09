@@ -13,20 +13,77 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"lanyard/internal/approval"
+	"lanyard/internal/identity"
 	"lanyard/internal/shares"
 	"lanyard/internal/trust"
+	"lanyard/internal/xferlog"
 )
+
+// pathClass names a category for a share path so the pull log never stores the
+// real path. It is deliberately coarse: extension family, or "dir"/"other".
+func pathClass(rel string) string {
+	ext := strings.ToLower(pathExt(rel))
+	switch ext {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".svg", ".heic", ".tiff":
+		return "image"
+	case ".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".wmv":
+		return "video"
+	case ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus":
+		return "audio"
+	case ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".md", ".rtf", ".odt", ".csv":
+		return "document"
+	case ".zip", ".tar", ".gz", ".bz2", ".7z", ".rar", ".xz":
+		return "archive"
+	case ".go", ".js", ".ts", ".py", ".rs", ".java", ".c", ".cpp", ".h", ".json", ".yml", ".yaml", ".xml", ".html", ".css", ".sh":
+		return "code"
+	case ".exe", ".msi", ".dmg", ".apk", ".app", ".deb", ".rpm":
+		return "app"
+	}
+	if ext == "" {
+		return "dir"
+	}
+	return "other"
+}
+
+// pathExt is filepath.Ext without importing path/filepath into this file's hot
+// path; it returns the last-dot suffix including the dot.
+func pathExt(p string) string {
+	if i := strings.LastIndexByte(p, '.'); i >= 0 && !strings.ContainsAny(p[i:], `/\`) {
+		return p[i:]
+	}
+	return ""
+}
+
+// xferPull records one serving-side pull event. rel is reduced to a path class;
+// the target is the caller's address, and the peer to its short fingerprint.
+func (s *Server) xferPull(level xferlog.Level, outcome, fp, target, class, reason string, bytes, offset, size int64, elapsed time.Duration, err error) {
+	e := xferlog.Entry{
+		Area: xferlog.AreaPulling, Level: level, Outcome: outcome,
+		FP: identity.ShortID(fp), Target: target, File: class,
+		Bytes: bytes, Offset: offset, Size: size, Reason: reason, Elapsed: elapsed,
+	}
+	if err != nil {
+		e.Error = err.Error()
+	}
+	s.xfer(e)
+}
 
 // accessFor authorizes a data endpoint from the caller's certificate and
 // returns its access decision. A peer may list/read a share only if it is
-// paired with pull permission or holds a live Connect session.
+// paired with a browse permission that is not Never or holds a live Connect
+// session. A paired peer whose browse state is Ask is prompted once per browse
+// session (the first request blocks on a person; later requests in the same
+// session are remembered).
 func (s *Server) accessFor(w http.ResponseWriter, r *http.Request) (trust.Access, bool) {
+	fp := PeerID(r.Context())
 	if s.shares == nil {
 		http.Error(w, "shares unavailable", http.StatusForbidden)
+		s.xferPull(xferlog.LevelError, "deny", fp, r.RemoteAddr, "", "shares unavailable", 0, 0, 0, 0, errors.New("shares unavailable"))
 		return trust.Access{}, false
 	}
-	fp := PeerID(r.Context())
 	var a trust.Access
 	if s.auth != nil {
 		a = s.auth.Access(fp)
@@ -34,13 +91,48 @@ func (s *Server) accessFor(w http.ResponseWriter, r *http.Request) (trust.Access
 	session := a.SessionID != ""
 	if !a.Paired && !session {
 		http.Error(w, "not permitted", http.StatusForbidden)
+		s.xferPull(xferlog.LevelWarn, "deny", fp, r.RemoteAddr, "", "not paired", 0, 0, 0, 0, errors.New("not paired"))
 		return a, false
 	}
-	if a.Paired && !a.Browse {
+	if a.Paired && a.Browse.Denies() {
 		http.Error(w, "pull not permitted", http.StatusForbidden)
+		s.xferPull(xferlog.LevelWarn, "deny", fp, r.RemoteAddr, "", "pull not permitted", 0, 0, 0, 0, errors.New("pull not permitted"))
+		return a, false
+	}
+	if a.Paired && a.Browse.Asks() && !s.approveBrowse(w, r, a) {
 		return a, false
 	}
 	return a, true
+}
+
+// approveBrowse asks the person on this device, once per browse session, whether
+// a peer may browse the shares. The acceptance is remembered by the approval
+// manager under a per-peer browse key, so later requests in the same session do
+// not prompt again; an unanswered prompt (timeout) denies the request.
+func (s *Server) approveBrowse(w http.ResponseWriter, r *http.Request, a trust.Access) bool {
+	fp := PeerID(r.Context())
+	if s.approvals == nil {
+		http.Error(w, permissionReasonUserDenied, http.StatusForbidden)
+		s.xferPull(xferlog.LevelWarn, "deny", fp, r.RemoteAddr, "", permissionReasonUserDenied, 0, 0, 0, 0, errors.New(permissionReasonUserDenied))
+		return false
+	}
+	ok, err := s.approvals.Ask(r.Context(), approval.Request{
+		PeerFP: fp, PeerName: cleanLabel(s.peerName(fp, a)), Reason: "browse",
+	}, "browse:"+fp)
+	switch {
+	case err == nil && ok:
+		return true
+	case errors.Is(err, approval.ErrTooMany):
+		http.Error(w, "Too many requests are waiting on the other device.", http.StatusTooManyRequests)
+	case errors.Is(err, approval.ErrTimeout):
+		http.Error(w, "The other device did not answer in time.", http.StatusForbidden)
+	case err != nil:
+		// The peer hung up while waiting; nothing to answer.
+	default:
+		http.Error(w, permissionReasonUserDenied, http.StatusForbidden)
+	}
+	s.xferPull(xferlog.LevelWarn, "deny", fp, r.RemoteAddr, "", "browse "+permissionReasonUserDenied, 0, 0, 0, 0, errors.New(permissionReasonUserDenied))
+	return false
 }
 
 // visibleShare returns a share the peer is allowed to see. A share the peer
@@ -80,9 +172,11 @@ func (s *Server) transferShare(w http.ResponseWriter, r *http.Request, id string
 
 func (s *Server) denyShare(w http.ResponseWriter, id, fp string) {
 	if reason, ok := s.shares.Ended(id, fp); ok {
+		s.xferPull(xferlog.LevelWarn, "deny", fp, "", "", "share "+reason, 0, 0, 0, 0, nil)
 		http.Error(w, shareEndedMsg(reason), http.StatusGone)
 		return
 	}
+	s.xferPull(xferlog.LevelWarn, "deny", fp, "", "", "share not found", 0, 0, 0, 0, nil)
 	http.Error(w, "share not found", http.StatusNotFound)
 }
 
@@ -102,7 +196,10 @@ func (s *Server) handleShareList(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, s.shares.ListVisible(a.Paired, a.DeviceID, PeerID(r.Context()), a.Offered))
+	fp := PeerID(r.Context())
+	list := s.shares.ListVisible(a.Paired, a.DeviceID, fp, a.Offered)
+	s.xferPull(xferlog.LevelInfo, "share-list", fp, r.RemoteAddr, "", fmt.Sprintf("%d shares", len(list)), 0, 0, 0, 0, nil)
+	writeJSON(w, list)
 }
 
 func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
@@ -110,8 +207,11 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	entries, err := sh.Tree(r.URL.Query().Get("path"))
+	fp := PeerID(r.Context())
+	rel := r.URL.Query().Get("path")
+	entries, err := sh.Tree(rel)
 	if err != nil {
+		s.xferPull(xferlog.LevelWarn, "browse", fp, r.RemoteAddr, pathClass(rel), "tree failed", 0, 0, 0, 0, err)
 		if errors.Is(err, shares.ErrBadPath) {
 			http.Error(w, "bad path", http.StatusBadRequest)
 			return
@@ -119,6 +219,7 @@ func (s *Server) handleTree(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.xferPull(xferlog.LevelInfo, "browse", fp, r.RemoteAddr, pathClass(rel), fmt.Sprintf("%d entries", len(entries)), 0, 0, 0, 0, nil)
 	writeJSON(w, entries)
 }
 
@@ -127,8 +228,11 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	files, total, err := sh.Manifest(r.URL.Query().Get("path"))
+	fp := PeerID(r.Context())
+	rel := r.URL.Query().Get("path")
+	files, total, err := sh.Manifest(rel)
 	if err != nil {
+		s.xferPull(xferlog.LevelWarn, "browse", fp, r.RemoteAddr, pathClass(rel), "manifest failed", 0, 0, 0, 0, err)
 		if errors.Is(err, shares.ErrBadPath) {
 			http.Error(w, "bad path", http.StatusBadRequest)
 			return
@@ -136,6 +240,7 @@ func (s *Server) handleManifest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.xferPull(xferlog.LevelInfo, "browse", fp, r.RemoteAddr, pathClass(rel), fmt.Sprintf("manifest %d files", len(files)), total, 0, 0, 0, nil)
 	writeJSON(w, map[string]any{"files": files, "total_bytes": total, "count": len(files), "lifetime": sh.Lifetime.Type})
 }
 
@@ -149,11 +254,15 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	// Register the stream so "Stop now" / the end of the grace period can cut it.
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	release := s.shares.TrackTransfer(sh.ShareID, PeerID(r.Context()), cancel)
+	fp := PeerID(r.Context())
+	start := time.Now()
+	release := s.shares.TrackTransfer(sh.ShareID, fp, cancel)
 	defer release()
 	rel := r.URL.Query().Get("path")
+	class := pathClass(rel)
 	f, info, err := sh.OpenFile(rel)
 	if err != nil {
+		s.xferPull(xferlog.LevelWarn, "download", fp, r.RemoteAddr, class, "open failed", 0, 0, 0, time.Since(start), err)
 		if errors.Is(err, shares.ErrBadPath) {
 			http.Error(w, "bad path", http.StatusBadRequest)
 			return
@@ -167,6 +276,7 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	}
 	defer f.Close()
 	if info.IsDir() {
+		s.xferPull(xferlog.LevelWarn, "download", fp, r.RemoteAddr, class, "not a file", 0, 0, 0, time.Since(start), errNotFile)
 		http.Error(w, "not a file", http.StatusBadRequest)
 		return
 	}
@@ -185,14 +295,17 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 	if rangeHdr == "" || r.Method == http.MethodHead {
 		w.Header().Set("Content-Length", strconv.FormatInt(info.Size(), 10))
 		if r.Method == http.MethodHead {
+			s.xferPull(xferlog.LevelInfo, "download", fp, r.RemoteAddr, class, "head", 0, 0, info.Size(), time.Since(start), nil)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 		w.Header().Set("Trailer", "X-Content-SHA256")
 		w.WriteHeader(http.StatusOK)
 		h := sha256.New()
-		if _, err := io.CopyBuffer(w, &ctxReader{ctx: ctx, r: io.TeeReader(f, h)}, copyBuf()); err != nil {
+		n, err := io.CopyBuffer(w, &ctxReader{ctx: ctx, r: io.TeeReader(f, h)}, copyBuf())
+		if err != nil {
 			s.log.Debug("file stream interrupted", "err", err)
+			s.xferPull(xferlog.LevelWarn, "download", fp, r.RemoteAddr, class, "stream interrupted", n, 0, info.Size(), time.Since(start), err)
 			return
 		}
 		sum := hex.EncodeToString(h.Sum(nil))
@@ -200,28 +313,35 @@ func (s *Server) handleFile(w http.ResponseWriter, r *http.Request) {
 		// A complete pass is as good as a dedicated hash request: remember it so
 		// one-time completion does not have to re-read the file.
 		s.hashes.put(hashKey(sh.ShareID, rel, shares.Validator(info)), sum)
+		s.xferPull(xferlog.LevelInfo, "serve", fp, r.RemoteAddr, class, "complete", n, 0, info.Size(), time.Since(start), nil)
 		return
 	}
 
-	start, end, ok := parseRange(rangeHdr, info.Size())
+	startOff, end, ok := parseRange(rangeHdr, info.Size())
 	if !ok {
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", info.Size()))
+		s.xferPull(xferlog.LevelWarn, "download", fp, r.RemoteAddr, class, "range not satisfiable", 0, 0, info.Size(), time.Since(start), errors.New("range not satisfiable"))
 		http.Error(w, "range not satisfiable", http.StatusRequestedRangeNotSatisfiable)
 		return
 	}
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
+	if _, err := f.Seek(startOff, io.SeekStart); err != nil {
+		s.xferPull(xferlog.LevelError, "download", fp, r.RemoteAddr, class, "seek failed", 0, startOff, info.Size(), time.Since(start), err)
 		http.Error(w, "seek failed", http.StatusInternalServerError)
 		return
 	}
-	length := end - start + 1
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, info.Size()))
+	length := end - startOff + 1
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", startOff, end, info.Size()))
 	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
 	w.WriteHeader(http.StatusPartialContent)
-	if _, err := io.CopyBuffer(w, &ctxReader{ctx: ctx, r: io.LimitReader(f, length)}, copyBuf()); err != nil {
+	n, err := io.CopyBuffer(w, &ctxReader{ctx: ctx, r: io.LimitReader(f, length)}, copyBuf())
+	if err != nil {
 		s.log.Debug("range stream interrupted", "err", err)
+		s.xferPull(xferlog.LevelWarn, "download", fp, r.RemoteAddr, class, "range interrupted", n, startOff, info.Size(), time.Since(start), err)
+		return
 	}
-	// Note: a partial body is not trailer-hashed; whole-file verification on
-	// resume lands with the M3 hash state.
+	s.xferPull(xferlog.LevelInfo, "serve", fp, r.RemoteAddr, class, "range complete", n, startOff, info.Size(), time.Since(start), nil)
+	// A partial body is not trailer-hashed; after a resume the client verifies
+	// the whole file through /hash.
 }
 
 // ctxReader stops a copy as soon as its context is cancelled.
@@ -269,9 +389,13 @@ func (s *Server) handleHash(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	s.shares.TouchTransfer(sh.ShareID, PeerID(r.Context()))
-	sum, info, err := s.fileDigest(sh, r.URL.Query().Get("path"))
+	fp := PeerID(r.Context())
+	rel := r.URL.Query().Get("path")
+	start := time.Now()
+	s.shares.TouchTransfer(sh.ShareID, fp)
+	sum, info, err := s.fileDigest(sh, rel)
 	if err != nil {
+		s.xferPull(xferlog.LevelWarn, "hash", fp, r.RemoteAddr, pathClass(rel), "hash failed", 0, 0, 0, time.Since(start), err)
 		switch {
 		case errors.Is(err, shares.ErrBadPath):
 			http.Error(w, "bad path", http.StatusBadRequest)
@@ -284,6 +408,7 @@ func (s *Server) handleHash(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	s.xferPull(xferlog.LevelInfo, "hash", fp, r.RemoteAddr, pathClass(rel), "hash served", 0, 0, info.Size(), time.Since(start), nil)
 	writeJSON(w, map[string]any{"sha256": sum, "size": info.Size(), "etag": shares.Validator(info)})
 }
 
@@ -296,6 +421,7 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fp := PeerID(r.Context())
+	start := time.Now()
 	var req struct {
 		Files []struct {
 			Path   string `json:"path"`
@@ -303,14 +429,17 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 		} `json:"files"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32<<20)).Decode(&req); err != nil {
+		s.xferPull(xferlog.LevelWarn, "complete", fp, r.RemoteAddr, "", "bad request", 0, 0, 0, time.Since(start), err)
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
 	if sh.Lifetime.Type != shares.LifetimeOneTime {
+		s.xferPull(xferlog.LevelInfo, "complete", fp, r.RemoteAddr, "", "not one-time", 0, 0, 0, time.Since(start), nil)
 		writeJSON(w, map[string]any{"consumed": false})
 		return
 	}
 	if len(req.Files) == 0 || len(req.Files) > 500000 {
+		s.xferPull(xferlog.LevelWarn, "complete", fp, r.RemoteAddr, "", "no verified files reported", 0, 0, 0, time.Since(start), errors.New("no verified files reported"))
 		http.Error(w, "no verified files reported", http.StatusBadRequest)
 		return
 	}
@@ -318,11 +447,14 @@ func (s *Server) handleComplete(w http.ResponseWriter, r *http.Request) {
 	for _, f := range req.Files {
 		sum, _, err := s.fileDigest(sh, f.Path)
 		if err != nil || !strings.EqualFold(sum, f.SHA256) {
+			s.xferPull(xferlog.LevelWarn, "complete", fp, r.RemoteAddr, pathClass(f.Path), "reported file does not match", 0, 0, 0, time.Since(start), errors.New("reported file does not match"))
 			http.Error(w, "reported file does not match: "+f.Path, http.StatusConflict)
 			return
 		}
 	}
-	writeJSON(w, map[string]any{"consumed": s.shares.Consume(sh.ShareID, fp)})
+	consumed := s.shares.Consume(sh.ShareID, fp)
+	s.xferPull(xferlog.LevelInfo, "serve", fp, r.RemoteAddr, "", "download complete", 0, 0, 0, time.Since(start), nil)
+	writeJSON(w, map[string]any{"consumed": consumed})
 }
 
 type hashEntry struct {

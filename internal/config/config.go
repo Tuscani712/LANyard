@@ -3,21 +3,44 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
+)
+
+// WriteFileAtomic retries a rename that failed with a sharing violation (a
+// Windows process holds the destination without FILE_SHARE_DELETE) this many
+// times, waiting renameRetryDelay between attempts. They are vars so tests can
+// shorten them.
+var (
+	renameRetries    = 5
+	renameRetryDelay = 50 * time.Millisecond
 )
 
 const (
-	DefaultPeerPort = 47800
-	DefaultUIPort   = 47810
-	BeaconPort      = 47801
+	DefaultPeerPort   = 47800
+	DefaultUIPort     = 47810
+	DefaultBeaconPort = 47801
+	// MDNSPort is fixed by the mDNS standard; it is listed beside the
+	// configurable peer and beacon ports when generating firewall commands.
+	MDNSPort = 5353
 )
 
 type Settings struct {
 	DeviceName string `json:"device_name"`
-	PeerPort   int    `json:"peer_port"`
-	UIPort     int    `json:"ui_port"`
+	// PeerPort is the user-chosen peer TCP port. Zero means "not chosen yet":
+	// the app uses DefaultPeerPort and records the port it actually bound so
+	// the firewall banner and next start agree. A port the *server* had to
+	// fall back to is never written here.
+	PeerPort int `json:"peer_port"`
+	// BeaconPort is the fallback discovery UDP port (default 47801). Every
+	// device on the network must use the same value or fallback discovery
+	// between them stops working.
+	BeaconPort int `json:"beacon_port,omitempty"`
+	UIPort     int `json:"ui_port"`
 	// DeviceIDLabel is the user-facing Device ID (§11.1). It is a label; the
 	// certificate fingerprint remains the identity. Empty means "use the
 	// generated short fingerprint".
@@ -27,9 +50,12 @@ type Settings struct {
 	// SpeedUnit is "mbs" (MB/s, default) or "mbps".
 	SpeedUnit       string `json:"speed_unit,omitempty"`
 	SoundOnComplete bool   `json:"sound_on_complete,omitempty"`
+	// Notifications shows desktop notifications for an incoming pairing
+	// request and for a finished or failed transfer. Absent means on.
+	Notifications *bool `json:"notifications,omitempty"`
 	// DefaultDownloadFolder prefills the download destination.
 	DefaultDownloadFolder string `json:"default_download_folder,omitempty"`
-	// InboxFolder is where pushes land; empty means <data-dir>/Inbox.
+	// InboxFolder is where pushes land; empty means DefaultInboxDir.
 	InboxFolder string `json:"inbox_folder,omitempty"`
 	// BandwidthLimitMBps caps transfer throughput; 0 means unlimited.
 	BandwidthLimitMBps int `json:"bandwidth_limit_mbps,omitempty"`
@@ -69,6 +95,17 @@ type Store struct {
 	data Settings
 }
 
+// DefaultInboxDir is where received pushes land when no Inbox folder is
+// configured: a visible "LANyard" folder in the user's home directory, next to
+// Downloads, rather than a hidden folder under the data directory.
+func DefaultInboxDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "LANyard"), nil
+}
+
 // DefaultDir returns the per-user data directory.
 func DefaultDir() (string, error) {
 	base, err := os.UserConfigDir()
@@ -96,18 +133,21 @@ func Open(dir string) (*Store, error) {
 	if host == "" {
 		host = "lanyard-device"
 	}
-	s.data = Settings{DeviceName: host, PeerPort: DefaultPeerPort, UIPort: DefaultUIPort}
+	s.data = Settings{DeviceName: host, UIPort: DefaultUIPort}
 	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err == nil {
 		_ = json.Unmarshal(b, &s.data)
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	if s.data.PeerPort == 0 {
-		s.data.PeerPort = DefaultPeerPort
-	}
+	// PeerPort is deliberately left at 0 when unset: the server records the
+	// port it actually bound (only when the user had not chosen one) so a
+	// later start and the firewall banner use the same port.
 	if s.data.UIPort == 0 {
 		s.data.UIPort = DefaultUIPort
+	}
+	if s.data.BeaconPort == 0 {
+		s.data.BeaconPort = DefaultBeaconPort
 	}
 	if s.data.Theme == "" {
 		s.data.Theme = "system"
@@ -116,6 +156,30 @@ func Open(dir string) (*Store, error) {
 		s.data.SpeedUnit = "mbs"
 	}
 	return s, nil
+}
+
+// NotificationsEnabled reports whether desktop notifications are on. The
+// setting defaults to on when it has never been set.
+func (s Settings) NotificationsEnabled() bool {
+	return s.Notifications == nil || *s.Notifications
+}
+
+// EffectivePeerPort is the peer port this run requests: the user's choice when
+// one was made, otherwise the default. PeerPort itself may remain 0 until the
+// server records the port it actually bound.
+func (s Settings) EffectivePeerPort() int {
+	if s.PeerPort > 0 {
+		return s.PeerPort
+	}
+	return DefaultPeerPort
+}
+
+// EffectiveBeaconPort is the fallback discovery port, defaulting when unset.
+func (s Settings) EffectiveBeaconPort() int {
+	if s.BeaconPort > 0 {
+		return s.BeaconPort
+	}
+	return DefaultBeaconPort
 }
 
 func (s *Store) Dir() string { return s.dir }
@@ -138,7 +202,10 @@ func mustJSON(v any) []byte {
 	return b
 }
 
-// WriteFileAtomic writes via temp file + rename so a crash never leaves a torn file.
+// WriteFileAtomic writes via temp file + rename so a crash never leaves a torn
+// file. When the destination is held without FILE_SHARE_DELETE (Windows), the
+// rename is retried briefly; if it still cannot replace the file the error is
+// returned and logged, never discarded.
 func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
 	if err != nil {
@@ -161,8 +228,32 @@ func WriteFileAtomic(path string, data []byte, perm os.FileMode) error {
 	}
 	_ = os.Chmod(name, perm)
 	if err := os.Rename(name, path); err != nil {
+		if renameRetries > 0 && isSharingViolation(err) {
+			if rerr := retryRename(name, path); rerr == nil {
+				return nil
+			} else {
+				err = rerr
+			}
+		}
 		os.Remove(name)
-		return err
+		slog.Error("config: could not replace file", "path", path, "err", err)
+		return fmt.Errorf("replace %s: %w", path, err)
 	}
 	return nil
+}
+
+// retryRename retries a rename that failed with a sharing violation. It stops
+// early if the error changes to a non-transient one.
+func retryRename(src, dst string) error {
+	var err error
+	for i := 0; i < renameRetries; i++ {
+		time.Sleep(renameRetryDelay)
+		if err = os.Rename(src, dst); err == nil {
+			return nil
+		}
+		if !isSharingViolation(err) {
+			return err
+		}
+	}
+	return err
 }

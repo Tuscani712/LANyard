@@ -177,3 +177,85 @@ func mustMkdir(t *testing.T, path string) {
 		t.Fatal(err)
 	}
 }
+
+// Manifest must report paths relative to the share root even for a subfolder,
+// matching Tree and OpenFile, so a pull of sub/dir re-requests the right files.
+func TestManifestSubpathPathsAreShareRootRelative(t *testing.T) {
+	root := t.TempDir()
+	mustMkdir(t, filepath.Join(root, "sub", "dir", "nested"))
+	writeFile(t, filepath.Join(root, "sub", "dir", "a.txt"), "alpha")
+	writeFile(t, filepath.Join(root, "sub", "dir", "nested", "b.bin"), "bravo")
+	writeFile(t, filepath.Join(root, "other.txt"), "nope")
+
+	m := newTestManager(t, "self")
+	sh, err := m.Add(root, AddOptions{LifetimeType: LifetimeUntilStopped})
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	man, _, err := sh.Manifest("sub/dir")
+	if err != nil {
+		t.Fatalf("Manifest: %v", err)
+	}
+	got := map[string]bool{}
+	for _, e := range man {
+		got[e.Path] = true
+	}
+	for _, want := range []string{"sub/dir/a.txt", "sub/dir/nested/b.bin"} {
+		if !got[want] {
+			t.Errorf("manifest missing share-root-relative path %q; got %v", want, got)
+		}
+	}
+	for _, p := range man {
+		if _, _, err := sh.OpenFile(p.Path); err != nil {
+			t.Errorf("manifest path %q must open against the share root: %v", p.Path, err)
+		}
+	}
+}
+
+// Traversal and absolute paths are rejected on the manifest path too.
+func TestManifestRejectsBadPaths(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "x")
+	m := newTestManager(t, "self")
+	sh, err := m.Add(root, AddOptions{LifetimeType: LifetimeUntilStopped})
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	for _, bad := range []string{"../escape", "/etc/passwd", "a/../../b"} {
+		if _, _, err := sh.Manifest(bad); !errors.Is(err, ErrBadPath) {
+			t.Errorf("Manifest(%q) expected ErrBadPath, got %v", bad, err)
+		}
+	}
+}
+
+// A symlink inside the share is never followed or listed, and cannot be opened.
+func TestSymlinksAreNotFollowed(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "real.txt"), "real")
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	writeFile(t, outside, "secret")
+	if err := os.Symlink(outside, filepath.Join(root, "link.txt")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(root, "sub"), filepath.Join(root, "dirlink")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	m := newTestManager(t, "self")
+	sh, err := m.Add(root, AddOptions{LifetimeType: LifetimeUntilStopped})
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	man, _, err := sh.Manifest("")
+	if err != nil {
+		t.Fatalf("Manifest: %v", err)
+	}
+	for _, e := range man {
+		if e.Path == "link.txt" || e.Path == "dirlink" {
+			t.Errorf("symlink %q must not be listed", e.Path)
+		}
+	}
+	if _, _, err := sh.OpenFile("link.txt"); err == nil {
+		t.Fatal("opening a symlink must fail")
+	}
+}

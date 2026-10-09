@@ -30,6 +30,7 @@ import (
 	"lanyard/internal/shares"
 	"lanyard/internal/transfer"
 	"lanyard/internal/trust"
+	"lanyard/internal/xferlog"
 )
 
 //go:embed web
@@ -43,7 +44,22 @@ type SelfInfo struct {
 	DeviceLabel    string `json:"device_label"`
 	OS             string `json:"os"`
 	PeerPort       int    `json:"peer_port"`
-	Version        string `json:"version"`
+	// PeerPortRequested is the port we tried to bind; PeerPortFallback is true
+	// when it was busy and the service moved to PeerPort instead.
+	PeerPortRequested int  `json:"peer_port_requested,omitempty"`
+	PeerPortFallback  bool `json:"peer_port_fallback,omitempty"`
+	// PeerPortFallbackNotice is the person-facing line shown in the banner and
+	// Settings when a temporary peer port was bound, e.g. "Using temporary
+	// port 51234 because 47800 is in use by other".
+	PeerPortFallbackNotice string `json:"peer_port_fallback_notice,omitempty"`
+	// BeaconPort is the configured fallback discovery UDP port, used with
+	// PeerPort and the fixed mDNS port to generate the firewall commands.
+	BeaconPort int    `json:"beacon_port"`
+	Version    string `json:"version"`
+	// MountsSupported reports whether serving a paired device as a drive is
+	// available on this platform/app; the device page only offers "Mount as
+	// drive" when it is true (desktop-only).
+	MountsSupported bool `json:"mounts_supported"`
 }
 
 // Notice is a user-facing notification pushed to every open UI as an SSE
@@ -64,15 +80,15 @@ type Deps struct {
 	Self      func() SelfInfo
 	Peers     func() []discovery.Peer
 	Subscribe func() (<-chan struct{}, func())
-	AddPeer   func(ctx context.Context, host string, port int) (*discovery.Peer, error)
+	AddPeer   func(ctx context.Context, host string, port int, expectedFP string) (*discovery.Peer, error)
 	Log       *slog.Logger
 
-	// M2: local shares, remote pull, and transfer jobs.
+	// Local shares, remote pull, and transfer jobs.
 	Shares    *shares.Manager
 	Transfers *transfer.Manager
 	Client    *peerapi.Client
 
-	// M4: trust store, pairing/connect sessions.
+	// Trust store and pairing/connect sessions.
 	Trust  *trust.Store
 	SelfFP string
 
@@ -80,10 +96,17 @@ type Deps struct {
 	Approvals *approval.Manager
 	// Inbox holds pushes being received (shown with a Cancel button).
 	Inbox *inbox.Manager
+	// OpenFolder reveals a folder in the OS file manager. Nil uses the platform
+	// default (xdg-open / open / explorer).
+	OpenFolder func(path string) error
 	// Mounts serves paired devices as drives (spec §11.2).
 	Mounts *mount.Manager
 
-	// M6: settings.
+	// XferLog is the shared four-area diagnostics recorder shown in the
+	// diagnostics panel and copied by "Copy log".
+	XferLog *xferlog.Recorder
+
+	// Settings.
 	Cfg           *config.Store
 	ApplySettings func(config.Settings)
 	// SetStartOnLogin registers/removes the OS sign-in entry; StartOnLoginEnabled
@@ -193,7 +216,7 @@ func (s *Server) Serve(ln net.Listener) error {
 		// detect a running instance.
 		writeJSON(w, map[string]string{"app": "lanyard"})
 	})
-	mux.HandleFunc("GET /api/self", s.auth(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.d.Self()) }))
+	mux.HandleFunc("GET /api/self", s.auth(s.handleSelf))
 	mux.HandleFunc("GET /api/peers", s.auth(func(w http.ResponseWriter, r *http.Request) { writeJSON(w, s.d.Peers()) }))
 	mux.HandleFunc("POST /api/peers/add", s.auth(s.handleAdd))
 	mux.HandleFunc("GET /api/fs/roots", s.auth(s.handleFSRoots))
@@ -201,6 +224,9 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/fs/pick", s.auth(s.handleFSPick))
 	mux.HandleFunc("GET /api/incoming", s.auth(s.handleIncoming))
 	mux.HandleFunc("POST /api/incoming/{id}/cancel", s.auth(s.handleIncomingCancel))
+	mux.HandleFunc("GET /api/snippets", s.auth(s.handleSnippets))
+	mux.HandleFunc("POST /api/snippet", s.auth(s.handleSendSnippet))
+	mux.HandleFunc("POST /api/snippets/{id}/dismiss", s.auth(s.handleSnippetDismiss))
 	mux.HandleFunc("GET /api/shares", s.auth(s.handleShares))
 	mux.HandleFunc("POST /api/shares", s.auth(s.handleShareAdd))
 	mux.HandleFunc("POST /api/shares/stop-all", s.auth(s.handleShareStopAll))
@@ -214,6 +240,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/transfers/{id}/cancel", s.auth(s.handleTransferCancel))
 	mux.HandleFunc("POST /api/push", s.auth(s.handlePush))
 	mux.HandleFunc("GET /api/mounts", s.auth(s.handleMounts))
+	mux.HandleFunc("GET /api/mounts/letters", s.auth(s.handleDriveLetters))
 	mux.HandleFunc("POST /api/mounts", s.auth(s.handleMountAdd))
 	mux.HandleFunc("POST /api/mounts/{id}/remove", s.auth(s.handleMountRemove))
 	mux.HandleFunc("GET /api/approvals", s.auth(s.handleApprovals))
@@ -221,15 +248,20 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/approvals/{id}/reject", s.auth(s.handleApprovalDecide(false)))
 	mux.HandleFunc("GET /api/settings", s.auth(s.handleSettingsGet))
 	mux.HandleFunc("PUT /api/settings", s.auth(s.handleSettingsPut))
+	mux.HandleFunc("GET /api/diagnostics", s.auth(s.handleDiagnostics))
 	mux.HandleFunc("GET /api/update", s.auth(s.handleUpdateStatus))
 	mux.HandleFunc("POST /api/update/check", s.auth(s.handleUpdateCheck))
 	mux.HandleFunc("POST /api/update/download", s.auth(s.handleUpdateDownload))
 	mux.HandleFunc("POST /api/cancel-all", s.auth(s.handleCancelAll))
 	mux.HandleFunc("POST /api/transfers/clear-finished", s.auth(s.handleTransfersClear))
+	mux.HandleFunc("POST /api/transfers/clear-history", s.auth(s.handleTransfersClearHistory))
+	mux.HandleFunc("POST /api/transfers/{id}/retry", s.auth(s.handleTransferRetry))
 	mux.HandleFunc("GET /api/trust", s.auth(s.handleTrust))
 	mux.HandleFunc("POST /api/trust/{fp}/unpair", s.auth(s.handleUnpair))
 	mux.HandleFunc("POST /api/trust/{fp}/permissions", s.auth(s.handleTrustPermissions))
+	mux.HandleFunc("POST /api/trust/{fp}/alias", s.auth(s.handleTrustAlias))
 	mux.HandleFunc("GET /api/sessions", s.auth(s.handleSessions))
+	mux.HandleFunc("GET /api/pair/payload", s.auth(s.handlePairPayload))
 	mux.HandleFunc("POST /api/sessions/request", s.auth(s.handleSessionStart))
 	mux.HandleFunc("POST /api/sessions/{id}/accept", s.auth(s.handleSessionAccept))
 	mux.HandleFunc("POST /api/sessions/{id}/reject", s.auth(s.handleSessionReject))
@@ -238,6 +270,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("POST /api/sessions/{id}/close", s.auth(s.handleSessionClose))
 	mux.HandleFunc("POST /api/sessions/{id}/offers", s.auth(s.handleSessionOffers))
 	mux.HandleFunc("POST /api/sessions/{id}/keep", s.auth(s.handleSessionKeep))
+	mux.HandleFunc("POST /api/inbox/open", s.auth(s.handleInboxOpen))
 	mux.HandleFunc("GET /api/events", s.auth(s.handleEvents))
 	mux.Handle("GET /", http.FileServerFS(sub))
 
@@ -323,9 +356,87 @@ func writeJSON(w http.ResponseWriter, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// handleSelf returns this device's identity and the peer service's actually
+// bound port (peer_port), which the UI uses for the firewall banner when it is
+// not the default 47800.
+func (s *Server) handleSelf(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, s.d.Self())
+}
+
+// peerErrorMessage maps a failure to reach or be accepted by a peer to the
+// line the UI shows. A 403 is a pairing/permission refusal, not an unreachable
+// device, so it must never be reported as "could not reach device".
+//
+// This is the desktop-side mapping for the "not paired" wording (task c):
+// internal/uiserver/uiserver.go:peerErrorMessage, with the shared decision in
+// internal/peerapi/errors.go:peerapi.UserMessage.
+func peerErrorMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	var se *peerapi.StatusError
+	if errors.As(err, &se) && se.Code == http.StatusForbidden {
+		return peerapi.UserMessage(err)
+	}
+	return "could not reach device: " + err.Error()
+}
+
+// peerUIMessage is peerErrorMessage without the "could not reach device"
+// prefix, for handlers that already returned a bare error string. It still
+// maps a 403 to the "not paired" wording instead of passing the raw status.
+func peerUIMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	var se *peerapi.StatusError
+	if errors.As(err, &se) && se.Code == http.StatusForbidden {
+		return peerapi.UserMessage(err)
+	}
+	return err.Error()
+}
+
+// peerStatus is the HTTP status the local UI should receive for a failed peer
+// request. A 403 refusal from the peer stays a 403 so the web UI takes the
+// "not paired" branch instead of prefixing the message with "Could not reach";
+// anything else is a gateway failure.
+func peerStatus(err error) int {
+	var se *peerapi.StatusError
+	if errors.As(err, &se) && se.Code == http.StatusForbidden {
+		return http.StatusForbidden
+	}
+	return http.StatusBadGateway
+}
+
+// peerRefusedPairing reacts to a peer we believe we are paired with answering a
+// request with the exact 403 "not paired" over a certificate-pinned connection:
+// the peer has unpaired us, so the stale local pairing is removed and the
+// person is told. It reports whether a local pairing was dropped. A specific 403
+// (a permission denial) is left alone: it means the pairing is intact but the
+// action is not allowed. The removal only runs when peerapi.IsNotPaired holds,
+// which requires the peer's certificate to have been verified against its
+// pinned fingerprint; an unpinned answer can never drop a pairing.
+func (s *Server) peerRefusedPairing(fp string, err error) bool {
+	if s.d.Trust == nil || fp == "" || !peerapi.IsNotPaired(err) {
+		return false
+	}
+	e, ok := s.d.Trust.Entry(fp)
+	if !ok {
+		return false
+	}
+	s.d.Trust.Unpair(fp)
+	s.d.Trust.ClearPendingUnpair(fp)
+	s.dropMountsOf(fp)
+	if s.d.Log != nil {
+		s.d.Log.Info("peer refused a request as not paired; removed the local pairing", "fp", fp, "name", e.Name)
+	}
+	s.NotifyUser(Notice{Kind: "peer-unpaired", Peer: firstNonEmpty(e.DisplayName(), fp)})
+	return true
+}
+
 func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		Address string `json:"address"`
+		Address     string `json:"address"`
+		Fingerprint string `json:"fingerprint"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
@@ -343,9 +454,11 @@ func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
-	p, err := s.d.AddPeer(ctx, host, port)
+	fp := strings.TrimSpace(req.Fingerprint)
+	p, err := s.d.AddPeer(ctx, host, port, fp)
 	if err != nil {
-		http.Error(w, "could not reach device: "+err.Error(), http.StatusBadGateway)
+		s.peerRefusedPairing(fp, err)
+		http.Error(w, peerErrorMessage(err), peerStatus(err))
 		return
 	}
 	writeJSON(w, p)
@@ -388,6 +501,9 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		if ib, err := json.Marshal(s.incoming()); err == nil {
 			fmt.Fprintf(w, "event: incoming\ndata: %s\n\n", ib)
+		}
+		if sb, err := json.Marshal(s.snippets()); err == nil {
+			fmt.Fprintf(w, "event: snippets\ndata: %s\n\n", sb)
 		}
 		if s.d.Transfers != nil {
 			if tb, err := json.Marshal(s.d.Transfers.List()); err == nil {

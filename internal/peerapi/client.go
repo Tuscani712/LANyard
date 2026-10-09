@@ -24,6 +24,11 @@ type StatusError struct {
 	Code   int
 	Status string
 	Msg    string
+	// Pinned is true when the response arrived over a connection whose server
+	// certificate was verified against the expected fingerprint (mTLS pinning).
+	// Destructive decisions (IsNotPaired) require it so a bare self-signed
+	// answer cannot cause data loss.
+	Pinned bool
 }
 
 func (e *StatusError) Error() string { return fmt.Sprintf("%s: %s", e.Status, e.Msg) }
@@ -69,7 +74,7 @@ func (c *Client) doJSON(ctx context.Context, method, u string, body io.Reader, e
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(http.MaxBytesReader(nil, resp.Body, 4096))
-		return &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg))}
+		return &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg)), Pinned: expectedFP != ""}
 	}
 	if out == nil {
 		return nil
@@ -137,7 +142,7 @@ func (c *Client) OpenFile(ctx context.Context, host string, port int, expectedFP
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		msg, _ := io.ReadAll(http.MaxBytesReader(nil, resp.Body, 4096))
 		resp.Body.Close()
-		return nil, &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg))}
+		return nil, &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg)), Pinned: expectedFP != ""}
 	}
 	return resp, nil
 }
@@ -178,6 +183,8 @@ type SessionRequestPayload struct {
 	DeviceID  string            `json:"device_id"`
 	Nonce     string            `json:"nonce"`
 	Requested trust.Permissions `json:"requested_permissions"`
+	// Invite is a one-time QR pairing nonce (body only; never a URL).
+	Invite string `json:"invite,omitempty"`
 }
 
 // SessionResponse is what the responder returns.
@@ -257,6 +264,13 @@ func (c *Client) RevokePairing(ctx context.Context, host string, port int, expec
 	return c.doJSON(ctx, http.MethodPost, u, nil, expectedFP, nil)
 }
 
+// SendSnippet delivers a short text message to a peer's Inbox.
+func (c *Client) SendSnippet(ctx context.Context, host string, port int, expectedFP, text string) error {
+	b, _ := json.Marshal(map[string]string{"text": text})
+	u := c.base(host, port) + "/snippet"
+	return c.doJSON(ctx, http.MethodPost, u, strings.NewReader(string(b)), expectedFP, nil)
+}
+
 // --- push client ---
 
 // PushOfferResult is the responder's answer to a push offer.
@@ -306,7 +320,7 @@ func (c *Client) PushFile(ctx context.Context, host string, port int, expectedFP
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(http.MaxBytesReader(nil, resp.Body, 4096))
-		return 0, &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg))}
+		return 0, &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg)), Pinned: expectedFP != ""}
 	}
 	var out struct {
 		Written int64 `json:"written"`
@@ -342,7 +356,7 @@ func (c *Client) PushFileSHA(ctx context.Context, host string, port int, expecte
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		msg, _ := io.ReadAll(http.MaxBytesReader(nil, resp.Body, 4096))
-		return &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg))}
+		return &StatusError{Code: resp.StatusCode, Status: resp.Status, Msg: strings.TrimSpace(string(msg)), Pinned: expectedFP != ""}
 	}
 	return nil
 }
@@ -353,6 +367,14 @@ func (c *Client) PushComplete(ctx context.Context, host string, port int, expect
 	b, _ := json.Marshal(map[string]any{"rel_path": rel, "sha256": sha, "all": all})
 	u := c.base(host, port) + "/push/" + url.PathEscape(pushID) + "/complete"
 	return c.doJSON(ctx, http.MethodPost, u, strings.NewReader(string(b)), expectedFP, nil)
+}
+
+// CancelPush asks the receiver to stop an offered push. It is best-effort: an
+// older peer without the route answers 404 (a StatusError the caller ignores),
+// and the receiver treats an unknown id as a harmless success.
+func (c *Client) CancelPush(ctx context.Context, host string, port int, expectedFP, pushID string) error {
+	u := c.base(host, port) + "/push/" + url.PathEscape(pushID) + "/cancel"
+	return c.doJSON(ctx, http.MethodPost, u, nil, expectedFP, nil)
 }
 
 // VerifiedFile is one file the receiver has downloaded and hash-verified.

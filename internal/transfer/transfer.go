@@ -26,9 +26,11 @@ import (
 	"unicode"
 
 	"lanyard/internal/config"
+	"lanyard/internal/identity"
 	"lanyard/internal/inbox"
 	"lanyard/internal/peerapi"
 	"lanyard/internal/shares"
+	"lanyard/internal/xferlog"
 )
 
 // Job states (spec §8.3).
@@ -41,7 +43,15 @@ const (
 	StateWaiting      = "Waiting for peer"
 	StateDone         = "Done"
 	StateFailed       = "Failed"
+	StateCancelled    = "Cancelled"
 )
+
+// isTerminal reports whether a state is a finished history entry: it stays on
+// the Transfers history (until removed or the history is cleared) instead of
+// being an in-flight job.
+func isTerminal(state string) bool {
+	return state == StateDone || state == StateFailed || state == StateCancelled
+}
 
 // Per-file states (spec §8.2 folder resume).
 const (
@@ -52,8 +62,12 @@ const (
 )
 
 const (
-	flushBytes         = 4 << 20 // flush the sidecar every ~4 MB
-	flushEvery         = time.Second
+	flushBytes = 4 << 20 // flush the sidecar every ~4 MB
+	flushEvery = time.Second
+	// progressThrottle caps how often mid-transfer byte progress drives an
+	// onChange, so a fast LAN transfer cannot flood the UI. Roughly four
+	// updates a second, matching the receiver's inbox.
+	progressThrottle   = 250 * time.Millisecond
 	persistEvery       = 3 * time.Second
 	maxConcurrentFiles = 4 // total in-flight large-file transfers across all jobs (spec §8.4)
 	// Small files are latency-bound, not bandwidth-bound, so many may be in
@@ -69,7 +83,7 @@ const (
 	spaceMargin = 64 << 20
 	// viewWindow caps how many per-file rows a job sends to the UI.
 	viewWindow         = 200
-	historyKeep        = 20
+	historyKeep        = 500
 	maxRestartsPerFile = 3
 )
 
@@ -118,16 +132,23 @@ func (f *FileJob) localRel() string {
 
 // Job is one download (or later, push).
 type Job struct {
-	ID         string     `json:"id"`
-	Direction  string     `json:"direction"`
-	PeerID     string     `json:"peer_id"`
-	PeerName   string     `json:"peer_name"`
-	Host       string     `json:"host"`
-	Port       int        `json:"port"`
-	ShareID    string     `json:"share_id"`
-	ShareLabel string     `json:"share_label"`
-	Root       string     `json:"root"`
-	Dest       string     `json:"dest"`
+	ID         string `json:"id"`
+	Direction  string `json:"direction"`
+	PeerID     string `json:"peer_id"`
+	PeerName   string `json:"peer_name"`
+	Host       string `json:"host"`
+	Port       int    `json:"port"`
+	ShareID    string `json:"share_id"`
+	ShareLabel string `json:"share_label"`
+	Root       string `json:"root"`
+	Dest       string `json:"dest"`
+	// RemotePaths are the share-relative paths this download asked for. They are
+	// kept as a slice (not joined) because a path may contain a comma, and a
+	// retry must request exactly the same paths.
+	RemotePaths []string `json:"remote_paths,omitempty"`
+	// Sources are the local paths a push was started from, kept so a retry can
+	// re-offer the same files (or folders).
+	Sources    []string   `json:"sources,omitempty"`
 	Files      []*FileJob `json:"files"`
 	Total      int64      `json:"total"`
 	Done       int64      `json:"done"`
@@ -137,52 +158,78 @@ type Job struct {
 	StartedAt  time.Time  `json:"started_at"`
 	UpdatedAt  time.Time  `json:"updated_at"`
 	FinishedAt time.Time  `json:"finished_at,omitempty"`
+	// FilesTotalStored / FilesDoneStored are only set in the compact on-disk
+	// form of a finished or failed job, where Files is omitted to keep the
+	// saved history small. They are read back when Files is empty.
+	FilesTotalStored int `json:"files_total,omitempty"`
+	FilesDoneStored  int `json:"files_done,omitempty"`
 	// OneTime is set when the share is a one-time share: a finished, verified
 	// download is reported to the sender so it can retire the share.
 	OneTime           bool `json:"one_time,omitempty"`
 	CompletionPending bool `json:"completion_pending,omitempty"`
 	reporting         bool `json:"-"`
+	// cancelled marks a job the person stopped (as opposed to Paused): the
+	// worker keeps it as a Cancelled history entry instead of a resumable job.
+	cancelled bool `json:"-"`
 
 	mu           sync.Mutex         `json:"-"`
 	ctx          context.Context    `json:"-"`
 	cancel       context.CancelFunc `json:"-"`
-	speed        float64            `json:"-"` // bytes/sec, EMA
+	speed        float64            `json:"-"` // bytes/sec, EMA (~5 s, see inbox.RateWindow)
+	displaySpeed float64            `json:"-"` // speed last shown to the UI, gated to inbox.RateDisplayEvery
+	displayAt    time.Time          `json:"-"` // when displaySpeed was last refreshed
 	lastBytes    int64              `json:"-"`
 	lastAt       time.Time          `json:"-"`
 	lastProgress time.Time          `json:"-"`
-	retryAt      time.Time          `json:"-"`
-	attempt      int                `json:"-"`
-	running      bool               `json:"-"`
-	wake         chan struct{}      `json:"-"` // nudges a retrying worker (peer reappeared)
+	// fileDone times every file completion, backing the rolling
+	// files-per-second rate that keeps a many-small-files ETA honest. Guarded by
+	// job.mu.
+	fileDone []time.Time `json:"-"`
+	// pushIDs are the receiver push ids this job has offered so far, so a cancel
+	// can ask the peer to stop each one. Guarded by job.mu.
+	pushIDs []string      `json:"-"`
+	retryAt time.Time     `json:"-"`
+	attempt int           `json:"-"`
+	running bool          `json:"-"`
+	wake    chan struct{} `json:"-"` // nudges a retrying worker (peer reappeared)
 }
 
 // View is the JSON shape handed to the local UI.
 type View struct {
-	ID         string     `json:"id"`
-	Direction  string     `json:"direction"`
-	PeerID     string     `json:"peer_id"`
-	PeerName   string     `json:"peer_name"`
-	ShareID    string     `json:"share_id"`
-	ShareLabel string     `json:"share_label"`
-	Root       string     `json:"root"`
-	Dest       string     `json:"dest"`
-	State      string     `json:"state"`
-	Error      string     `json:"error"`
-	Note       string     `json:"note"`
-	RetryIn    int        `json:"retry_in"`
-	Attempt    int        `json:"attempt"`
-	Total      int64      `json:"total"`
-	Done       int64      `json:"done"`
-	SpeedMBps  float64    `json:"speed_mbps"`
-	ETASeconds int        `json:"eta_seconds"`
-	Files      []FileView `json:"files"`
-	CurrentIdx int        `json:"current_index"` // index into Files (the window)
-	FilesTotal int        `json:"files_total"`
-	FilesStart int        `json:"files_offset"` // position of Files[0] in the full list
-	FilesDone  int        `json:"files_done"`
-	StartedAt  time.Time  `json:"started_at"`
-	UpdatedAt  time.Time  `json:"updated_at"`
-	FinishedAt time.Time  `json:"finished_at"`
+	ID         string `json:"id"`
+	Direction  string `json:"direction"`
+	PeerID     string `json:"peer_id"`
+	PeerName   string `json:"peer_name"`
+	ShareID    string `json:"share_id"`
+	ShareLabel string `json:"share_label"`
+	Root       string `json:"root"`
+	Dest       string `json:"dest"`
+	State      string `json:"state"`
+	Error      string `json:"error"`
+	Note       string `json:"note"`
+	// Finishing is true when every byte of a push has left this device but the
+	// receiver has not yet confirmed the finalize, so the row is still
+	// Transferring at 100%. The UI shows "Finishing…" instead of a stale speed
+	// and an unexplained full bar.
+	Finishing  bool    `json:"finishing"`
+	RetryIn    int     `json:"retry_in"`
+	Attempt    int     `json:"attempt"`
+	Total      int64   `json:"total"`
+	Done       int64   `json:"done"`
+	SpeedMBps  float64 `json:"speed_mbps"`
+	ETASeconds int     `json:"eta_seconds"`
+	// AvgSpeedMBps is the average throughput over a finished job's life, shown
+	// on the history row. It is derived from the persisted start/finish times
+	// and bytes, so it survives a restart.
+	AvgSpeedMBps float64    `json:"avg_speed_mbps"`
+	Files        []FileView `json:"files"`
+	CurrentIdx   int        `json:"current_index"` // index into Files (the window)
+	FilesTotal   int        `json:"files_total"`
+	FilesStart   int        `json:"files_offset"` // position of Files[0] in the full list
+	FilesDone    int        `json:"files_done"`
+	StartedAt    time.Time  `json:"started_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	FinishedAt   time.Time  `json:"finished_at"`
 }
 
 type FileView struct {
@@ -200,6 +247,7 @@ type Manager struct {
 	cfg        *config.Store
 	client     *peerapi.Client
 	log        *slog.Logger
+	xlog       *xferlog.Recorder
 	onChange   func()
 	workers    int
 	slots      chan struct{}
@@ -215,6 +263,7 @@ type Manager struct {
 	mu            sync.Mutex
 	jobs          map[string]*Job
 	bandwidthMBps int // 0 = unlimited
+	lastNotify    time.Time
 }
 
 func (m *Manager) bandwidth() int {
@@ -242,6 +291,23 @@ func New(cfg *config.Store, client *peerapi.Client, log *slog.Logger, workers in
 	}
 }
 
+// SetXferLog attaches the shared transfer recorder so offer/file/complete
+// attempts are written to the desktop log and shown in the diagnostics report.
+// A nil recorder leaves logging to the desktop log only.
+func (m *Manager) SetXferLog(r *xferlog.Recorder) { m.xlog = r }
+
+// XferLog returns the attached recorder (may be nil).
+func (m *Manager) XferLog() *xferlog.Recorder { return m.xlog }
+
+// xfer records one transfer entry and mirrors it into the desktop log. Push
+// entries default to the pushing area; downloads set AreaPulling explicitly.
+func (m *Manager) xfer(e xferlog.Entry) {
+	if e.Area == "" {
+		e.Area = xferlog.AreaPushing
+	}
+	m.xlog.Record(m.log, e)
+}
+
 // Load restores jobs from config. Jobs the user paused stay paused and failed
 // or finished jobs keep their state; anything that was in flight becomes
 // "Waiting for peer" and resumes by itself when the peer shows up again.
@@ -258,7 +324,7 @@ func (m *Manager) Load() error {
 	defer m.mu.Unlock()
 	for _, j := range jobs {
 		switch j.State {
-		case StateDone, StatePaused, StateFailed:
+		case StateDone, StatePaused, StateFailed, StateCancelled:
 		default:
 			j.State = StateWaiting
 		}
@@ -268,30 +334,113 @@ func (m *Manager) Load() error {
 	return nil
 }
 
-func (m *Manager) persist() {
-	m.mu.Lock()
-	jobs := make([]*Job, 0, len(m.jobs))
-	var finished []*Job
-	for _, j := range m.jobs {
-		if j.State == StateDone {
-			finished = append(finished, j)
-		} else {
-			jobs = append(jobs, j)
+// jobArchive is the compact on-disk form of a finished or failed job: it keeps
+// everything the history list needs (peer, direction, state, times, sizes and
+// file counts) but drops the per-file list, which can be thousands of entries.
+// It marshals under the same JSON keys as Job so Load reads it back unchanged.
+type jobArchive struct {
+	ID          string    `json:"id"`
+	Direction   string    `json:"direction"`
+	PeerID      string    `json:"peer_id"`
+	PeerName    string    `json:"peer_name"`
+	Host        string    `json:"host"`
+	Port        int       `json:"port"`
+	ShareID     string    `json:"share_id"`
+	ShareLabel  string    `json:"share_label"`
+	Root        string    `json:"root"`
+	Dest        string    `json:"dest"`
+	RemotePaths []string  `json:"remote_paths,omitempty"`
+	Sources     []string  `json:"sources,omitempty"`
+	Total       int64     `json:"total"`
+	Done        int64     `json:"done"`
+	State       string    `json:"state"`
+	Error       string    `json:"error"`
+	StartedAt   time.Time `json:"started_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
+	FinishedAt  time.Time `json:"finished_at,omitempty"`
+	FilesTotal  int       `json:"files_total,omitempty"`
+	FilesDone   int       `json:"files_done,omitempty"`
+	OneTime     bool      `json:"one_time,omitempty"`
+}
+
+// archiveJob builds the compact form. Caller holds job.mu.
+func archiveJob(j *Job) jobArchive {
+	done := 0
+	for _, f := range j.Files {
+		if f.State == FileDone {
+			done++
 		}
 	}
-	m.mu.Unlock()
-	// Keep a short history of finished jobs (without their per-file detail).
-	sort.Slice(finished, func(a, b int) bool { return finished[a].FinishedAt.After(finished[b].FinishedAt) })
+	return jobArchive{
+		ID: j.ID, Direction: j.Direction, PeerID: j.PeerID, PeerName: j.PeerName,
+		Host: j.Host, Port: j.Port, ShareID: j.ShareID, ShareLabel: j.ShareLabel,
+		Root: j.Root, Dest: j.Dest,
+		RemotePaths: append([]string(nil), j.RemotePaths...),
+		Sources:     append([]string(nil), j.Sources...),
+		Total:       j.Total, Done: j.Done, State: j.State, Error: j.Error,
+		StartedAt: j.StartedAt, UpdatedAt: j.UpdatedAt, FinishedAt: j.FinishedAt,
+		FilesTotal: len(j.Files), FilesDone: done, OneTime: j.OneTime,
+	}
+}
+
+func (m *Manager) persist() {
+	// Snapshot each job's classification and history times under its own lock,
+	// while holding m.mu. This keeps the whole list consistent without racing a
+	// worker goroutine that is still writing job.State (the lock order here,
+	// m.mu then job.mu, matches Cancel/CancelAll/view).
+	type entry struct {
+		job        *Job
+		terminal   bool
+		finishedAt time.Time
+		updatedAt  time.Time
+	}
+	m.mu.Lock()
+	entries := make([]entry, 0, len(m.jobs))
+	for _, j := range m.jobs {
+		j.mu.Lock()
+		e := entry{job: j, terminal: isTerminal(j.State), finishedAt: j.FinishedAt, updatedAt: j.UpdatedAt}
+		j.mu.Unlock()
+		entries = append(entries, e)
+	}
+	jobs := make([]*Job, 0, len(entries))
+	var finished []entry
+	for _, e := range entries {
+		if e.terminal {
+			finished = append(finished, e)
+		} else {
+			jobs = append(jobs, e.job)
+		}
+	}
+	// Keep only the newest history entries; older ones are dropped from memory
+	// and from the saved list, so neither grows without bound.
+	sort.Slice(finished, func(a, b int) bool {
+		ta, tb := finished[a].finishedAt, finished[b].finishedAt
+		if ta.Equal(tb) {
+			return finished[a].updatedAt.After(finished[b].updatedAt)
+		}
+		return ta.After(tb)
+	})
 	if len(finished) > historyKeep {
+		for _, e := range finished[historyKeep:] {
+			delete(m.jobs, e.job.ID)
+		}
 		finished = finished[:historyKeep]
 	}
-	jobs = append(jobs, finished...)
+	m.mu.Unlock()
+
+	for _, e := range finished {
+		jobs = append(jobs, e.job)
+	}
 
 	var buf bytes.Buffer
 	buf.WriteByte('[')
 	for i, j := range jobs {
 		j.mu.Lock()
-		b, err := json.Marshal(j)
+		var payload any = j
+		if isTerminal(j.State) {
+			payload = archiveJob(j)
+		}
+		b, err := json.Marshal(payload)
 		j.mu.Unlock()
 		if err != nil {
 			continue
@@ -303,7 +452,12 @@ func (m *Manager) persist() {
 	}
 	buf.WriteByte(']')
 	raw := buf.Bytes()
-	_ = m.cfg.Update(func(s *config.Settings) { s.Transfers = raw })
+	if err := m.cfg.Update(func(s *config.Settings) { s.Transfers = raw }); err != nil {
+		// Never discard the failure: the history cannot be saved, so say so.
+		if m.log != nil {
+			m.log.Warn("transfers: could not persist history", "err", err)
+		}
+	}
 }
 
 // CreateParams describes a download request from the UI.
@@ -327,19 +481,20 @@ func (m *Manager) Create(ctx context.Context, p CreateParams) (*View, error) {
 		p.Paths = []string{""}
 	}
 	job := &Job{
-		ID:         "j_" + randHex(6),
-		Direction:  "download",
-		PeerID:     p.PeerID,
-		PeerName:   p.PeerName,
-		Host:       p.Host,
-		Port:       p.Port,
-		ShareID:    p.ShareID,
-		ShareLabel: p.ShareLabel,
-		Root:       strings.Join(p.Paths, ","),
-		Dest:       p.Dest,
-		State:      StateQueued,
-		StartedAt:  time.Now(),
-		wake:       make(chan struct{}, 1),
+		ID:          "j_" + randHex(6),
+		Direction:   "download",
+		PeerID:      p.PeerID,
+		PeerName:    p.PeerName,
+		Host:        p.Host,
+		Port:        p.Port,
+		ShareID:     p.ShareID,
+		ShareLabel:  p.ShareLabel,
+		Root:        strings.Join(p.Paths, ","),
+		RemotePaths: append([]string(nil), p.Paths...),
+		Dest:        p.Dest,
+		State:       StateQueued,
+		StartedAt:   time.Now(),
+		wake:        make(chan struct{}, 1),
 	}
 	seen := map[string]bool{}
 	for _, pth := range p.Paths {
@@ -392,6 +547,141 @@ func (m *Manager) Create(ctx context.Context, p CreateParams) (*View, error) {
 	return m.view(job), nil
 }
 
+// ReceivedFile is one file that finished landing in the Inbox.
+type ReceivedFile struct {
+	Name string
+	Size int64
+}
+
+// RecordReceived adds a finished received push to the history as a "receive"
+// entry. The inbox calls it when a push completes, so a file pushed to this
+// device shows in the Transfers history like a download or a send. It is kept
+// in memory and persisted like any other terminal job.
+func (m *Manager) RecordReceived(peerFP, peerName string, files []ReceivedFile, started time.Time) {
+	if len(files) == 0 {
+		return
+	}
+	now := time.Now()
+	if started.IsZero() {
+		started = now
+	}
+	job := &Job{
+		ID:         "r_" + randHex(6),
+		Direction:  "receive",
+		PeerID:     peerFP,
+		PeerName:   peerName,
+		StartedAt:  started,
+		UpdatedAt:  now,
+		FinishedAt: now,
+		State:      StateDone,
+		wake:       make(chan struct{}, 1),
+	}
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		job.Files = append(job.Files, &FileJob{
+			Rel: f.Name, Local: f.Name, Target: f.Name,
+			Size: f.Size, Done: f.Size, State: FileDone,
+		})
+		job.Total += f.Size
+		names = append(names, f.Name)
+	}
+	if len(files) == 1 {
+		job.ShareLabel = files[0].Name
+	} else {
+		job.ShareLabel = fmt.Sprintf("%d files", len(files))
+	}
+	// RemotePaths survives the compact on-disk form, so the names remain after
+	// a restart even though a large job's per-file list is dropped.
+	job.RemotePaths = names
+	sort.Strings(job.RemotePaths)
+
+	m.mu.Lock()
+	m.jobs[job.ID] = job
+	m.mu.Unlock()
+	m.persist()
+	m.onChange()
+}
+
+// RecordReceiveFailed records a push that failed before any file landed (a
+// dropped or stalled connection) as a failed "receive" entry, so the Transfers
+// history reflects it instead of silently dropping it.
+func (m *Manager) RecordReceiveFailed(peerFP, peerName, reason string) {
+	now := time.Now()
+	job := &Job{
+		ID:         "r_" + randHex(6),
+		Direction:  "receive",
+		PeerID:     peerFP,
+		PeerName:   peerName,
+		ShareLabel: "Inbox",
+		StartedAt:  now,
+		UpdatedAt:  now,
+		FinishedAt: now,
+		State:      StateFailed,
+		Error:      reason,
+		wake:       make(chan struct{}, 1),
+	}
+	m.mu.Lock()
+	m.jobs[job.ID] = job
+	m.mu.Unlock()
+	m.persist()
+	m.onChange()
+}
+
+// RecordReceiveCancelled records a push the receiving person stopped as a
+// Cancelled "receive" history entry, so it stays visible and correctly labelled
+// like a finished or failed receive. Files that had already landed are kept and
+// listed; partial files are not.
+func (m *Manager) RecordReceiveCancelled(peerFP, peerName string, files []ReceivedFile, started time.Time) {
+	m.RecordReceiveCancelledReason(peerFP, peerName, "", files, started)
+}
+
+// RecordReceiveCancelledReason is RecordReceiveCancelled with a visible reason
+// (for example "Cancelled by the sender"), carried on the history row's note.
+func (m *Manager) RecordReceiveCancelledReason(peerFP, peerName, reason string, files []ReceivedFile, started time.Time) {
+	now := time.Now()
+	if started.IsZero() {
+		started = now
+	}
+	job := &Job{
+		ID:         "r_" + randHex(6),
+		Direction:  "receive",
+		PeerID:     peerFP,
+		PeerName:   peerName,
+		Note:       reason,
+		StartedAt:  started,
+		UpdatedAt:  now,
+		FinishedAt: now,
+		State:      StateCancelled,
+		wake:       make(chan struct{}, 1),
+	}
+	names := make([]string, 0, len(files))
+	for _, f := range files {
+		job.Files = append(job.Files, &FileJob{
+			Rel: f.Name, Local: f.Name, Target: f.Name,
+			Size: f.Size, Done: f.Size, State: FileDone,
+		})
+		job.Total += f.Size
+		names = append(names, f.Name)
+	}
+	switch len(files) {
+	case 0:
+		job.ShareLabel = "Inbox"
+	case 1:
+		job.ShareLabel = files[0].Name
+	default:
+		job.ShareLabel = fmt.Sprintf("%d files", len(files))
+	}
+	if len(names) > 0 {
+		sort.Strings(names)
+		job.RemotePaths = names
+	}
+	m.mu.Lock()
+	m.jobs[job.ID] = job
+	m.mu.Unlock()
+	m.persist()
+	m.onChange()
+}
+
 // Resume restarts a paused/failed/waiting job.
 func (m *Manager) Resume(id string) error {
 	m.mu.Lock()
@@ -409,6 +699,8 @@ func (m *Manager) Resume(id string) error {
 	job.State = StateQueued
 	job.Error = ""
 	job.Note = ""
+	job.cancelled = false
+	job.FinishedAt = time.Time{}
 	job.mu.Unlock()
 	m.onChange()
 	m.start(job)
@@ -446,31 +738,56 @@ func (m *Manager) Pause(id string) error {
 	return nil
 }
 
-// Cancel stops a job, optionally deleting its partial files, and forgets it.
+// Cancel stops an in-flight job, marking it Cancelled in the history, or
+// removes a job that already finished (the row's Remove/Dismiss action).
+// A cancelled download is terminal, so its partial `.lanpart`/`.lanstate` files
+// are always deleted: nothing normal-looking and no orphaned partial is left
+// behind. A Failed pull keeps its partial so Resume can continue it.
 func (m *Manager) Cancel(id string, deletePartials bool) error {
 	m.mu.Lock()
 	job, ok := m.jobs[id]
-	if ok {
-		delete(m.jobs, id)
-	}
-	m.mu.Unlock()
 	if !ok {
+		m.mu.Unlock()
 		return errors.New("no such job")
 	}
 	job.mu.Lock()
+	if isTerminal(job.State) {
+		// A finished row: Remove forgets it entirely.
+		job.mu.Unlock()
+		delete(m.jobs, id)
+		m.mu.Unlock()
+		m.persist()
+		m.onChange()
+		return nil
+	}
+	// An in-flight job: stop it and keep it as a Cancelled history entry.
+	job.cancelled = true
+	job.State = StateCancelled
+	job.Note = ""
+	job.Error = ""
+	job.FinishedAt = time.Now()
+	job.UpdatedAt = job.FinishedAt
 	if job.cancel != nil {
 		job.cancel()
 	}
 	dest := job.Dest
+	direction := job.Direction
+	host, port, peerID := job.Host, job.Port, job.PeerID
+	pushIDs := append([]string(nil), job.pushIDs...)
 	files := append([]*FileJob(nil), job.Files...)
 	job.mu.Unlock()
-	if deletePartials {
-		if job.Direction != "push" {
-			for _, f := range files {
-				final := filepath.Join(dest, filepath.FromSlash(f.localRel()))
-				_ = os.Remove(final + ".lanpart")
-				_ = os.Remove(final + ".lanstate")
-			}
+	m.mu.Unlock()
+	// Tell the receiver to stop each offered push before we finish tearing down.
+	// Best-effort: a peer without the route answers 404 and is ignored.
+	if direction == "push" {
+		m.cancelPeerPushes(host, port, peerID, pushIDs)
+	}
+	_ = deletePartials // kept for callers; a cancelled download always drops its partial
+	if direction != "push" {
+		for _, f := range files {
+			final := filepath.Join(dest, filepath.FromSlash(f.localRel()))
+			_ = os.Remove(final + ".lanpart")
+			_ = os.Remove(final + ".lanstate")
 		}
 	}
 	m.persist()
@@ -478,33 +795,69 @@ func (m *Manager) Cancel(id string, deletePartials bool) error {
 	return nil
 }
 
-// CancelAll cancels every unfinished job (both directions) and forgets it.
-// Partial files are kept. Used by Cancel all shares (§11.3).
-func (m *Manager) CancelAll() int {
-	m.mu.Lock()
-	var victims []*Job
-	for id, j := range m.jobs {
-		j.mu.Lock()
-		done := j.State == StateDone
-		j.mu.Unlock()
-		if !done {
-			victims = append(victims, j)
-			delete(m.jobs, id)
+// cancelPeerPushes asks the receiver to cancel each of a job's offered pushes,
+// best-effort with a short timeout so a hung or older peer can never delay a
+// local cancel. A 404 (an older peer with no cancel route) is ignored; any
+// other failure is logged at debug level and otherwise dropped, because the
+// local job is already Cancelled and the receiver's own stall timeout will
+// eventually reap it.
+func (m *Manager) cancelPeerPushes(host string, port int, peerID string, pushIDs []string) {
+	if m.client == nil || len(pushIDs) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	for _, id := range pushIDs {
+		err := m.client.CancelPush(ctx, host, port, peerID, id)
+		var se *peerapi.StatusError
+		if errors.As(err, &se) && se.Code == http.StatusNotFound {
+			continue // older peer: nothing to do
 		}
+		if err != nil && m.log != nil {
+			m.log.Debug("transfers: peer cancel not delivered", "push", id, "err", err)
+		}
+	}
+}
+
+// CancelAll cancels every unfinished job (both directions), keeping each as a
+// Cancelled history entry. Partial files are kept. Used by Cancel all shares
+// (§11.3).
+func (m *Manager) CancelAll() int {
+	type peerPush struct {
+		host, peerID string
+		port         int
+		ids          []string
+	}
+	var notify []peerPush
+	m.mu.Lock()
+	n := 0
+	for _, j := range m.jobs {
+		j.mu.Lock()
+		if !isTerminal(j.State) {
+			j.cancelled = true
+			j.State = StateCancelled
+			j.Note = ""
+			j.FinishedAt = time.Now()
+			j.UpdatedAt = j.FinishedAt
+			if j.cancel != nil {
+				j.cancel()
+			}
+			if j.Direction == "push" && len(j.pushIDs) > 0 {
+				notify = append(notify, peerPush{host: j.Host, port: j.Port, peerID: j.PeerID, ids: append([]string(nil), j.pushIDs...)})
+			}
+			n++
+		}
+		j.mu.Unlock()
 	}
 	m.mu.Unlock()
-	for _, j := range victims {
-		j.mu.Lock()
-		if j.cancel != nil {
-			j.cancel()
-		}
-		j.mu.Unlock()
+	for _, p := range notify {
+		m.cancelPeerPushes(p.host, p.port, p.peerID, p.ids)
 	}
-	if len(victims) > 0 {
+	if n > 0 {
 		m.persist()
 		m.onChange()
 	}
-	return len(victims)
+	return n
 }
 
 // SetBandwidthLimit sets the throughput cap in MB/s (0 = unlimited).
@@ -514,15 +867,39 @@ func (m *Manager) SetBandwidthLimit(mbps int) {
 	m.mu.Unlock()
 }
 
-// ClearFinished forgets completed jobs (the history list).
+// notifyProgress drives onChange at most once per progressThrottle while bytes
+// are moving. Completion and error paths call onChange directly, unthrottled.
+func (m *Manager) notifyProgress() {
+	now := time.Now()
+	m.mu.Lock()
+	if now.Sub(m.lastNotify) < progressThrottle {
+		m.mu.Unlock()
+		return
+	}
+	m.lastNotify = now
+	m.mu.Unlock()
+	m.onChange()
+}
+
+// ClearFinished forgets every finished row (Done, Failed and Cancelled) — the
+// whole history list — and leaves in-flight jobs alone.
 func (m *Manager) ClearFinished() int {
+	return m.clearTerminal()
+}
+
+// ClearHistory is the same history wipe, kept for the older endpoint name.
+func (m *Manager) ClearHistory() int {
+	return m.clearTerminal()
+}
+
+func (m *Manager) clearTerminal() int {
 	m.mu.Lock()
 	n := 0
 	for id, j := range m.jobs {
 		j.mu.Lock()
-		done := j.State == StateDone
+		terminal := isTerminal(j.State)
 		j.mu.Unlock()
-		if done {
+		if terminal {
 			delete(m.jobs, id)
 			n++
 		}
@@ -533,6 +910,81 @@ func (m *Manager) ClearFinished() int {
 		m.onChange()
 	}
 	return n
+}
+
+// Retry re-creates a failed or finished job with the same peer, sources and
+// destination, and returns the new job. The old job is left untouched. A retry
+// fails cleanly when a push source is gone or the peer's share cannot be read.
+func (m *Manager) Retry(ctx context.Context, id string) (*View, error) {
+	m.mu.Lock()
+	old, ok := m.jobs[id]
+	m.mu.Unlock()
+	if !ok {
+		return nil, errors.New("no such job")
+	}
+	old.mu.Lock()
+	if old.State != StateDone && old.State != StateFailed {
+		old.mu.Unlock()
+		return nil, errors.New("only finished or failed transfers can be resent")
+	}
+	direction := old.Direction
+	dl := CreateParams{
+		PeerID: old.PeerID, PeerName: old.PeerName, Host: old.Host, Port: old.Port,
+		ShareID: old.ShareID, ShareLabel: old.ShareLabel, Dest: old.Dest,
+	}
+	pu := PushParams{PeerID: old.PeerID, PeerName: old.PeerName, Host: old.Host, Port: old.Port}
+	if len(old.Sources) > 0 {
+		pu.Paths = append([]string(nil), old.Sources...)
+	} else {
+		for _, f := range old.Files {
+			pu.Paths = append(pu.Paths, f.Local)
+		}
+	}
+	root := old.Root
+	remotePaths := append([]string(nil), old.RemotePaths...)
+	old.mu.Unlock()
+
+	switch direction {
+	case "push":
+		return m.Push(ctx, pu)
+	case "download":
+		switch {
+		case len(remotePaths) > 0:
+			dl.Paths = remotePaths
+		case root == "":
+			dl.Paths = []string{""}
+		default:
+			// Older saved jobs predate RemotePaths; fall back to splitting Root.
+			dl.Paths = strings.Split(root, ",")
+		}
+		return m.Create(ctx, dl)
+	default:
+		return nil, errors.New("this transfer cannot be resent")
+	}
+}
+
+// ActiveTransfer reports whether a non-terminal, in-flight transfer is using
+// the peer identified by fingerprint (or its short ID, the first 16 hex
+// characters). Discovery uses it so a busy peer is not evicted on transient
+// probe misses. Paused and "waiting for peer" jobs do not count: no bytes are
+// moving then.
+func (m *Manager) ActiveTransfer(peerID string) bool {
+	if peerID == "" {
+		return false
+	}
+	short := identity.ShortID(peerID)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, j := range m.jobs {
+		if j.PeerID != peerID && identity.ShortID(j.PeerID) != short {
+			continue
+		}
+		switch j.State {
+		case StateQueued, StateConnecting, StateTransferring, StateVerifying:
+			return true
+		}
+	}
+	return false
 }
 
 // PeerAvailable is called when discovery sees a verified peer. It refreshes
@@ -612,20 +1064,53 @@ func (m *Manager) view(j *Job) *View {
 		ShareID: j.ShareID, ShareLabel: j.ShareLabel, Root: j.Root, Dest: j.Dest,
 		State: j.State, Error: j.Error, Note: j.Note, Attempt: j.attempt,
 		Total: j.Total, Done: j.Done,
-		SpeedMBps: j.speed / 1e6, StartedAt: j.StartedAt, UpdatedAt: j.UpdatedAt, FinishedAt: j.FinishedAt,
+		SpeedMBps: j.displaySpeed / 1e6, StartedAt: j.StartedAt, UpdatedAt: j.UpdatedAt, FinishedAt: j.FinishedAt,
 	}
 	if !j.retryAt.IsZero() && time.Now().Before(j.retryAt) {
 		v.RetryIn = int(time.Until(j.retryAt).Seconds()) + 1
 	}
 	if j.State == StateTransferring {
-		v.SpeedMBps = j.speed / 1e6
+		v.SpeedMBps = j.displaySpeed / 1e6
 	} else {
 		v.SpeedMBps = 0
 	}
-	remaining := j.Total - j.Done
-	if j.speed > 1 && remaining > 0 && j.State == StateTransferring {
-		v.ETASeconds = int(float64(remaining) / j.speed)
+	// A finished row reports the average throughput over its whole life, from
+	// the persisted times and byte count, so the history still shows how fast
+	// the transfer actually went after a restart.
+	if isTerminal(j.State) && j.Done > 0 && j.FinishedAt.After(j.StartedAt) {
+		if secs := j.FinishedAt.Sub(j.StartedAt).Seconds(); secs > 0 {
+			v.AvgSpeedMBps = float64(j.Done) / secs / 1e6
+		}
 	}
+	// ETA comes from the same displayed smoothed speed, never from an
+	// instantaneous sample, so a burst after a pause cannot make it jump. A
+	// many-small-files push is latency-bound, so the byte rate alone can swing
+	// the estimate between hours; the rolling files-per-second rate keeps it
+	// honest and MaxETA takes the conservative (later) of the two.
+	remaining := j.Total - j.Done
+	byteETA := 0
+	if j.displaySpeed > 1 && remaining > 0 && j.State == StateTransferring {
+		byteETA = int(float64(remaining) / j.displaySpeed)
+	}
+	fileETA := 0
+	if j.State == StateTransferring {
+		fileRemaining, fileTotal := 0, 0
+		for _, f := range j.Files {
+			fileTotal++
+			if f.State != FileDone {
+				fileRemaining++
+			}
+		}
+		if fileTotal == 0 {
+			fileRemaining = j.FilesTotalStored - j.FilesDoneStored
+		}
+		if fileRemaining > 0 {
+			if fr := inbox.RollingCountPerSecond(j.fileDone, time.Now(), inbox.RateWindow); fr > 0 {
+				fileETA = int(float64(fileRemaining) / fr)
+			}
+		}
+	}
+	v.ETASeconds = inbox.MaxETA(byteETA, fileETA)
 	firstOpen, firstPartial := -1, -1
 	downloading, verifying := 0, 0
 	for i, f := range j.Files {
@@ -671,9 +1156,22 @@ func (m *Manager) view(j *Job) *View {
 	for _, f := range j.Files[start:end] {
 		v.Files = append(v.Files, FileView{Rel: f.Rel, Local: f.localRel(), Size: f.Size, Done: f.Done, State: f.State})
 	}
-	v.CurrentIdx, v.FilesStart, v.FilesTotal = cur-start, start, len(j.Files)
+	// A compactly persisted terminal job carries counts but no per-file list.
+	filesTotal, filesDone := len(j.Files), v.FilesDone
+	if filesTotal == 0 {
+		filesTotal, filesDone = j.FilesTotalStored, j.FilesDoneStored
+	}
+	v.CurrentIdx, v.FilesStart, v.FilesTotal = cur-start, start, filesTotal
+	v.FilesDone = filesDone
 	if j.State == StateTransferring && verifying > 0 && downloading == 0 {
 		v.State = StateVerifying
+	}
+	// Every byte has left this device but the job is still Transferring: the
+	// receiver is hashing and renaming (or the whole-push PushComplete is in
+	// flight). Surface that as Finishing so the row does not sit at 100% with
+	// a stale speed. Push only: a download's finalize is already StateVerifying.
+	if j.Direction == "push" && j.State == StateTransferring && j.Total > 0 && j.Done >= j.Total {
+		v.Finishing = true
 	}
 	return v
 }
@@ -699,6 +1197,8 @@ func (m *Manager) run(job *Job) {
 	job.lastBytes = job.Done
 	job.lastProgress = time.Now()
 	job.speed = 0
+	job.displaySpeed = 0
+	job.displayAt = time.Time{}
 	ctx := job.ctx
 	job.mu.Unlock()
 	m.onChange()
@@ -830,7 +1330,13 @@ func (m *Manager) run(job *Job) {
 	job.retryAt = time.Time{}
 	switch {
 	case canceled:
-		if job.State != StatePaused {
+		if job.cancelled {
+			// Stopped on purpose: a terminal history entry, not a resumable job.
+			job.State = StateCancelled
+			if job.FinishedAt.IsZero() {
+				job.FinishedAt = time.Now()
+			}
+		} else if job.State != StatePaused {
 			job.State = StatePaused
 		}
 		job.Note = ""
@@ -839,7 +1345,7 @@ func (m *Manager) run(job *Job) {
 		job.Note = "Peer unreachable. Will resume automatically when it comes back, or press Resume."
 	case firstErr != nil:
 		job.State = StateFailed
-		job.Error = firstErr.Error()
+		job.Error = peerapi.UserMessage(firstErr)
 		job.Note = ""
 	default:
 		job.State = StateDone
@@ -960,6 +1466,7 @@ func (m *Manager) fail(job *Job, msg string) {
 	job.State = StateFailed
 	job.Error = msg
 	job.UpdatedAt = time.Now()
+	job.FinishedAt = job.UpdatedAt
 	job.mu.Unlock()
 	m.persist()
 	m.onChange()
@@ -1005,6 +1512,7 @@ func (m *Manager) transferWithRetry(ctx context.Context, job *Job, f *FileJob) e
 		case isShareEnded(err):
 			var se *peerapi.StatusError
 			errors.As(err, &se)
+			//lint:ignore ST1005 shown to the user verbatim as a full sentence
 			return fmt.Errorf("%s Files already downloaded are kept, and so are partial files.", se.Msg)
 		case !retryable(err):
 			return err
@@ -1140,6 +1648,7 @@ func (m *Manager) downloadFile(ctx context.Context, job *Job, f *FileJob) error 
 		job.mu.Lock()
 		f.State = FileDone
 		setFileDone(job, f, f.Size)
+		m.noteFileDone(job)
 		job.mu.Unlock()
 		_ = os.Remove(part)
 		_ = os.Remove(statePath)
@@ -1327,6 +1836,7 @@ func (m *Manager) downloadFile(ctx context.Context, job *Job, f *FileJob) error 
 	job.mu.Lock()
 	f.State = FileDone
 	setFileDone(job, f, f.Size)
+	m.noteFileDone(job)
 	job.mu.Unlock()
 	m.onChange()
 	return nil
@@ -1443,7 +1953,24 @@ func contentRangeStart(h string) (int64, bool) {
 	return v, err == nil
 }
 
-// bumpSpeed updates the exponentially smoothed speed. Caller holds job.mu.
+// noteFileDone records a completed file for the rolling files-per-second rate,
+// pruning entries older than inbox.RateWindow. Caller holds job.mu.
+func (m *Manager) noteFileDone(job *Job) {
+	now := time.Now()
+	job.fileDone = append(job.fileDone, now)
+	cutoff := now.Add(-inbox.RateWindow)
+	drop := 0
+	for drop < len(job.fileDone) && job.fileDone[drop].Before(cutoff) {
+		drop++
+	}
+	if drop > 0 {
+		job.fileDone = append(job.fileDone[:0], job.fileDone[drop:]...)
+	}
+}
+
+// bumpSpeed updates the exponentially smoothed speed. Caller holds job.mu. The
+// EMA samples every 250 ms; the value shown to the UI is republished at most
+// once per inbox.RateDisplayEvery so the speed/ETA text cannot flicker.
 func (m *Manager) bumpSpeed(job *Job) {
 	now := time.Now()
 	dt := now.Sub(job.lastAt).Seconds()
@@ -1463,6 +1990,10 @@ func (m *Manager) bumpSpeed(job *Job) {
 	job.lastBytes = job.Done
 	job.lastAt = now
 	job.UpdatedAt = now
+	if job.displayAt.IsZero() || now.Sub(job.displayAt) >= inbox.RateDisplayEvery {
+		job.displayAt = now
+		job.displaySpeed = job.speed
+	}
 }
 
 func (m *Manager) writeSidecar(path string, job *Job, f *FileJob, committed int64) {
@@ -1470,7 +2001,12 @@ func (m *Manager) writeSidecar(path string, job *Job, f *FileJob, committed int6
 		ShareID: job.ShareID, PeerID: job.PeerID, RemotePath: f.Rel,
 		Size: f.Size, ETag: f.ETag, BytesCommitted: committed,
 	}
-	_ = writeSidecar(path, sc)
+	if err := writeSidecar(path, sc); err != nil {
+		// The resume state could not be saved; surface it instead of dropping it.
+		if m.log != nil {
+			m.log.Warn("transfers: could not persist resume state", "file", f.Rel, "err", err)
+		}
+	}
 }
 
 func writeSidecar(path string, sc sidecar) error {

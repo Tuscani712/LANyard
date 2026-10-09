@@ -6,7 +6,7 @@ import (
 	"net"
 	"time"
 
-	"lanyard/internal/config"
+	"lanyard/internal/xferlog"
 )
 
 // The beacon is the fallback for networks that block mDNS: a small JSON
@@ -19,10 +19,12 @@ type beaconMsg struct {
 }
 
 func (m *Manager) startBeacon(ctx context.Context) {
+	port := m.BeaconPort()
 	lc := net.ListenConfig{Control: reusePort}
-	pc, err := lc.ListenPacket(ctx, "udp4", hostPort("0.0.0.0", config.BeaconPort))
+	pc, err := lc.ListenPacket(ctx, "udp4", hostPort("0.0.0.0", port))
 	if err != nil {
 		m.log.Warn("beacon listener unavailable (port busy); mDNS and manual connect still work", "err", err)
+		m.xfer(xferlog.Entry{Outcome: "browse", Level: xferlog.LevelWarn, Reason: "beacon listener unavailable", Error: err.Error()})
 		return
 	}
 	conn := pc.(*net.UDPConn)
@@ -33,10 +35,13 @@ func (m *Manager) startBeacon(ctx context.Context) {
 			_, _ = conn.WriteToUDP(b, to)
 			return
 		}
-		for _, dst := range broadcastTargets() {
+		for _, dst := range m.broadcastTargets() {
 			_, _ = conn.WriteToUDP(b, dst)
 		}
 	}
+	m.selfMu.Lock()
+	m.beaconProbe = func() { send("probe", nil) }
+	m.selfMu.Unlock()
 
 	m.wg.Add(2)
 	go func() { // receiver
@@ -84,9 +89,9 @@ func (m *Manager) startBeacon(ctx context.Context) {
 }
 
 // broadcastTargets returns the limited broadcast address plus each local
-// IPv4 subnet's directed broadcast address.
-func broadcastTargets() []*net.UDPAddr {
-	port := config.BeaconPort
+// IPv4 subnet's directed broadcast address, on the beacon's configured port.
+func (m *Manager) broadcastTargets() []*net.UDPAddr {
+	port := m.BeaconPort()
 	out := []*net.UDPAddr{{IP: net.IPv4bcast, Port: port}}
 	ifs, err := net.Interfaces()
 	if err != nil {

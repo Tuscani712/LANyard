@@ -45,6 +45,9 @@ type sessionRequestBody struct {
 	DeviceID  string            `json:"device_id"`
 	Nonce     string            `json:"nonce"`
 	Requested trust.Permissions `json:"requested_permissions"`
+	// Invite carries a one-time QR pairing nonce. It is optional: when absent
+	// the normal SAS flow is used.
+	Invite string `json:"invite,omitempty"`
 }
 
 type sessionRequestResp struct {
@@ -70,6 +73,9 @@ func (s *Server) handleSessionRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	fp := PeerID(r.Context())
+	// An inbound handshake proves the peer is online; retry any pending unpair
+	// for it even before the handshake is validated or accepted.
+	s.notePeerSeen(fp)
 	if !s.rl.allow("session:"+fp, 10, time.Minute) {
 		http.Error(w, "too many requests", http.StatusTooManyRequests)
 		return
@@ -87,13 +93,51 @@ func (s *Server) handleSessionRequest(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nonce required", http.StatusBadRequest)
 		return
 	}
+	// A supplied device_id must be the caller's own certificate fingerprint.
+	// The certificate is the identity (spec §3.3); a body that claims a
+	// different one is refused rather than trusted as a label.
+	if req.DeviceID != "" && !strings.EqualFold(req.DeviceID, fp) {
+		http.Error(w, "device id does not match the certificate", http.StatusBadRequest)
+		return
+	}
+	viaQR, code := s.acceptPairInvite(req.Mode, fp, req.Invite)
+	if code != 0 {
+		// A bad invite is a hard reject: never fall back to the SAS path, or an
+		// attacker could downgrade to it by sending a bogus invite.
+		http.Error(w, http.StatusText(code), code)
+		return
+	}
 	sess, err := s.trust.CreateIncoming(req.Mode, fp, cleanLabel(req.Name), cleanLabel(req.DeviceID), req.Nonce, req.Requested)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
+	if viaQR {
+		s.trust.MarkViaQR(sess.ID)
+	}
 	self, _ := s.trust.SelfNonce(sess.ID)
 	writeJSON(w, sessionRequestResp{SessionID: sess.ID, Nonce: self, Status: sess.Status})
+}
+
+// acceptPairInvite validates an optional QR pairing invite. An empty invite
+// means the caller is using the SAS path (returns false, 0). A non-empty invite
+// must be a valid, unused, unexpired token or a non-zero HTTP status is
+// returned; it is never downgraded to SAS. The token is consumed on the first
+// attempt and the failure rate is capped per peer.
+func (s *Server) acceptPairInvite(mode, fp, invite string) (bool, int) {
+	if invite == "" {
+		return false, 0
+	}
+	if mode != trust.ModePair {
+		return false, http.StatusBadRequest
+	}
+	if !s.rl.allow("pairinvite:"+fp, 10, time.Minute) {
+		return false, http.StatusTooManyRequests
+	}
+	if !s.trust.ConsumePairInvite(invite) {
+		return false, http.StatusForbidden
+	}
+	return true, 0
 }
 
 // handleSessionStatus lets the requester poll for the responder's nonce and

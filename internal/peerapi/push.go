@@ -7,13 +7,18 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"lanyard/internal/approval"
+	"lanyard/internal/discovery"
+	"lanyard/internal/identity"
 	"lanyard/internal/inbox"
 	"lanyard/internal/trust"
+	"lanyard/internal/xferlog"
 )
 
 // SetInbox attaches the Inbox receiver. Kept as a setter so the constructor
@@ -29,6 +34,8 @@ func needsApproval(a trust.Access, total int64) string {
 	switch {
 	case !a.Paired && a.SessionID != "":
 		return "connect"
+	case a.Paired && a.Push.Asks():
+		return "push"
 	case a.Paired && a.AskOver > 0 && total > a.AskOver:
 		return "large"
 	}
@@ -43,8 +50,8 @@ func (s *Server) peerName(fp string, a trust.Access) string {
 				return sess.PeerName
 			}
 		}
-		if e, ok := s.trust.Entry(fp); ok && e.Name != "" {
-			return e.Name
+		if e, ok := s.trust.Entry(fp); ok && e.DisplayName() != "" {
+			return e.DisplayName()
 		}
 	}
 	return "A device"
@@ -75,10 +82,16 @@ func (s *Server) askToAccept(w http.ResponseWriter, r *http.Request, a trust.Acc
 	for _, f := range files {
 		shown = append(shown, approval.File{Path: cleanLabel(f.RelPath), Size: f.Size})
 	}
+	// A resumed push of the same files shares a key so it is not asked twice;
+	// a request with no files (text) has no such identity and asks every time.
+	key := ""
+	if len(files) > 0 {
+		key = approvalKey(fp, files)
+	}
 	ok, err := s.approvals.Ask(r.Context(), approval.Request{
 		PeerFP: fp, PeerName: cleanLabel(s.peerName(fp, a)), Reason: reason,
 		Files: shown, Count: len(files), Total: total,
-	}, approvalKey(fp, files))
+	}, key)
 	switch {
 	case err == nil && ok:
 		return true
@@ -89,40 +102,150 @@ func (s *Server) askToAccept(w http.ResponseWriter, r *http.Request, a trust.Acc
 	case err != nil:
 		// The sender hung up while waiting; nothing to answer.
 	default:
-		http.Error(w, "The other device declined the transfer.", http.StatusForbidden)
+		// A person actively declined. This exact reason gets its own wording
+		// on the sender (see peerapi.UserMessage) and must never be mistaken
+		// for "not paired".
+		http.Error(w, permissionReasonUserDenied, http.StatusForbidden)
 	}
 	return false
 }
 
-// pushAccess authorizes a push endpoint: a paired peer with push permission, or
-// any live Connect session.
-func (s *Server) pushAccess(w http.ResponseWriter, r *http.Request) (trust.Access, bool) {
+// permissionReasonUserDenied is the 403 body written when the person on this
+// device declines an Ask prompt. It is the mirror wording for "denied by the
+// user" (see UserMessage).
+const permissionReasonUserDenied = "denied by the user"
+
+// pushAccess authorizes a push endpoint: a paired peer whose push permission
+// is not Never, or any live Connect session. The Ask state is authorized here
+// and prompted once at the offer (see needsApproval); the later file/complete
+// steps run only after that offer was accepted, so they must not prompt again.
+// step names the stage being authorized, for the transfer log when the request
+// is refused.
+func (s *Server) pushAccess(w http.ResponseWriter, r *http.Request, step string) (trust.Access, bool) {
+	fp := PeerID(r.Context())
 	if s.inbox == nil {
 		http.Error(w, "inbox unavailable", http.StatusServiceUnavailable)
+		s.xferRecv(fp, step, xferlog.LevelError, s.peerName(fp, trust.Access{}), r.RemoteAddr, "", 0, 0, errors.New("inbox unavailable"))
 		return trust.Access{}, false
 	}
 	var a trust.Access
 	if s.auth != nil {
-		a = s.auth.Access(PeerID(r.Context()))
+		a = s.auth.Access(fp)
 	}
-	if a.Paired && a.Push {
+	if a.Paired && !a.Push.Denies() {
 		return a, true
 	}
 	if a.SessionID != "" {
 		return a, true
 	}
+	reason := "not permitted"
 	if a.Paired {
-		http.Error(w, "push not permitted", http.StatusForbidden)
-		return a, false
+		reason = "push not permitted"
 	}
-	http.Error(w, "not permitted", http.StatusForbidden)
+	http.Error(w, reason, http.StatusForbidden)
+	s.xferRecv(fp, step, xferlog.LevelWarn, s.peerName(fp, a), r.RemoteAddr, "", 0, 0, errors.New(reason))
 	return a, false
 }
 
+// textAccess authorizes a short-text snippet. A paired peer's text permission
+// is tri-state: Allow delivers silently, Ask reuses the approval prompt, Never
+// refuses. A live Connect session also asks (reusing the "connect" reason), so
+// a stranger's text cannot land unnoticed.
+func (s *Server) textAccess(w http.ResponseWriter, r *http.Request) (trust.Access, bool) {
+	fp := PeerID(r.Context())
+	var a trust.Access
+	if s.auth != nil {
+		a = s.auth.Access(fp)
+	}
+	if a.Paired && a.Text.Allows() {
+		return a, true
+	}
+	if a.Paired && a.Text.Asks() {
+		if s.approvals == nil {
+			http.Error(w, permissionReasonUserDenied, http.StatusForbidden)
+			s.xferRecv(fp, xferlog.StepSnippet, xferlog.LevelWarn, s.peerName(fp, a), r.RemoteAddr, "", 0, 0, errors.New(permissionReasonUserDenied))
+			return a, false
+		}
+		if !s.askToAccept(w, r, a, "text", nil, 0) {
+			return a, false
+		}
+		return a, true
+	}
+	if a.SessionID != "" {
+		if s.approvals != nil {
+			if !s.askToAccept(w, r, a, "connect", nil, 0) {
+				return a, false
+			}
+		}
+		return a, true
+	}
+	reason := "not permitted"
+	if a.Paired {
+		reason = "text not permitted"
+	}
+	http.Error(w, reason, http.StatusForbidden)
+	s.xferRecv(fp, xferlog.StepSnippet, xferlog.LevelWarn, s.peerName(fp, a), r.RemoteAddr, "", 0, 0, errors.New(reason))
+	return a, false
+}
+
+// xferRecv records one receiving-side transfer entry. It never stores a full
+// file path: callers pass a base name. The peer identity is reduced to its
+// short fingerprint.
+func (s *Server) xferRecv(fp, step string, level xferlog.Level, peer, target, file string, bytes int64, elapsed time.Duration, err error) {
+	e := xferlog.Entry{
+		Area: xferlog.AreaPushing, Direction: xferlog.DirectionReceive, Step: step, Level: level,
+		FP: identity.ShortID(fp), Peer: peer, Target: target, File: file, Bytes: bytes, Elapsed: elapsed,
+	}
+	if err != nil {
+		e.Error = err.Error()
+	}
+	s.xfer(e)
+}
+
+// xferRecvFile records a per-file receipt with its offset and size, which is
+// what tells resume apart from a fresh write.
+func (s *Server) xferRecvFile(fp, step string, level xferlog.Level, peer, target, class string, offset, size, bytes int64, elapsed time.Duration, err error) {
+	e := xferlog.Entry{
+		Area: xferlog.AreaPushing, Direction: xferlog.DirectionReceive, Step: step, Level: level,
+		FP: identity.ShortID(fp), Peer: peer, Target: target, File: class,
+		Offset: offset, Size: size, Bytes: bytes, Elapsed: elapsed,
+	}
+	if err != nil {
+		e.Error = err.Error()
+	}
+	s.xfer(e)
+}
+
+// The desktop receiver's own caps. These are the values advertised in hello
+// (discovery.Hello.MaxOfferBytes / MaxOfferFiles). A sender that gets no
+// advertised limits from an older peer falls back to the Android-side floor.
 const (
-	maxOfferBytes = 128 << 20
-	maxOfferFiles = 500000
+	MaxOfferBytes = 128 << 20
+	MaxOfferFiles = 500000
+
+	// FallbackOfferBytes / FallbackOfferFiles are the safe floor a sender uses
+	// when a peer's hello advertises no limits (older builds). They match the
+	// Android receiver so a desktop sending to an un-updated phone still fits.
+	FallbackOfferBytes = 8 << 20
+	FallbackOfferFiles = 50000
 )
+
+// EffectiveOfferLimits returns the offer limits a sender should honour for a
+// peer. An advertised value wins; a missing (zero/negative) value or a nil
+// hello falls back to the Android-side floor.
+func EffectiveOfferLimits(h *discovery.Hello) (maxBytes int64, maxFiles int) {
+	maxBytes, maxFiles = FallbackOfferBytes, FallbackOfferFiles
+	if h == nil {
+		return maxBytes, maxFiles
+	}
+	if h.MaxOfferBytes > 0 {
+		maxBytes = h.MaxOfferBytes
+	}
+	if h.MaxOfferFiles > 0 {
+		maxFiles = h.MaxOfferFiles
+	}
+	return maxBytes, maxFiles
+}
 
 type pushFileResp struct {
 	RelPath string `json:"rel_path"`
@@ -137,7 +260,7 @@ type pushOfferResp struct {
 }
 
 func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
-	a, ok := s.pushAccess(w, r)
+	a, ok := s.pushAccess(w, r, xferlog.StepOffer)
 	if !ok {
 		return
 	}
@@ -147,7 +270,16 @@ func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
 	}
 	// A folder push lists every file in one offer (about 150 bytes each), so the
 	// body limit has to cover a large tree, not just a handful of files.
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxOfferBytes)).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxOfferBytes)).Decode(&req); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			// The body was truncated mid-stream: the connection cannot be
+			// reused (the unread tail would be misparsed as the next request),
+			// so tell the sender to close it and surface a 413.
+			w.Header().Set("Connection", "close")
+			http.Error(w, "the list of files is too large for this device", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "bad request (the list of files is too large or malformed)", http.StatusBadRequest)
 		return
 	}
@@ -155,8 +287,9 @@ func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "no files", http.StatusBadRequest)
 		return
 	}
-	if len(req.Files) > maxOfferFiles {
-		http.Error(w, fmt.Sprintf("too many files in one push (limit %d); send the folder in parts", maxOfferFiles), http.StatusRequestEntityTooLarge)
+	if len(req.Files) > MaxOfferFiles {
+		w.Header().Set("Connection", "close")
+		http.Error(w, fmt.Sprintf("too many files in one push (limit %d)", MaxOfferFiles), http.StatusRequestEntityTooLarge)
 		return
 	}
 	total := req.TotalBytes
@@ -165,23 +298,43 @@ func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
 			total += f.Size
 		}
 	}
+	offerAt := time.Now()
 	// A Connect session, or a paired peer above its ask-over limit, needs a
-	// person to accept (spec §4.2/§4.4). Without an approval queue (tests, the
-	// dev flag) pushes keep the old automatic behaviour.
-	if reason := needsApproval(a, total); reason != "" && s.approvals != nil {
-		if !s.askToAccept(w, r, a, reason, req.Files, total) {
+	// person to accept (spec §4.2/§4.4). A paired Ask peer with no approval
+	// queue has no one to ask, so it fails closed; Connect and large-push keep
+	// their old automatic behaviour when the queue is unavailable (tests, the
+	// dev flag).
+	if reason := needsApproval(a, total); reason != "" {
+		if s.approvals == nil {
+			if reason == "push" {
+				http.Error(w, permissionReasonUserDenied, http.StatusForbidden)
+				s.xferRecv(PeerID(r.Context()), xferlog.StepOffer, xferlog.LevelWarn, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, "", 0, time.Since(offerAt), errors.New(permissionReasonUserDenied))
+				return
+			}
+		} else if !s.askToAccept(w, r, a, reason, req.Files, total) {
+			s.xferRecv(PeerID(r.Context()), xferlog.StepOffer, xferlog.LevelWarn, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, "", 0, time.Since(offerAt), errors.New("the offer was declined or not answered"))
 			return
 		}
 	}
 	p, err := s.inbox.Offer(PeerID(r.Context()), a.SessionID, req.Files, a.MaxPushBytes)
 	if err != nil {
 		code := http.StatusBadRequest
-		if strings.Contains(err.Error(), "storage") || strings.Contains(err.Error(), "exceeds") {
+		switch {
+		case errors.Is(err, inbox.ErrFilesBusy):
+			// A concurrent push from the same peer is already receiving these
+			// files. A 409 (not a 400/500) tells the sender this is a transient
+			// conflict and the readable body is shown to the person. Two live
+			// pushes must never share a .lanpart, so the newer one is refused
+			// intact rather than allowed to clobber the older one.
+			code = http.StatusConflict
+		case strings.Contains(err.Error(), "storage") || strings.Contains(err.Error(), "exceeds"):
 			code = http.StatusInsufficientStorage
 		}
 		http.Error(w, err.Error(), code)
+		s.xferRecv(PeerID(r.Context()), xferlog.StepOffer, xferlog.LevelError, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, "", 0, time.Since(offerAt), err)
 		return
 	}
+	s.xferRecv(PeerID(r.Context()), xferlog.StepOffer, xferlog.LevelInfo, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, "", 0, time.Since(offerAt), nil)
 	resp := pushOfferResp{PushID: p.ID, Accepted: true, MaxBytes: p.MaxBytes}
 	for _, f := range p.SortedOffsets() {
 		resp.Files = append(resp.Files, pushFileResp{RelPath: f.RelPath, Offset: f.Offset})
@@ -190,7 +343,7 @@ func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
-	a, ok := s.pushAccess(w, r)
+	a, ok := s.pushAccess(w, r, xferlog.StepFile)
 	if !ok {
 		return
 	}
@@ -207,7 +360,8 @@ func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
 	// Small-file fast path: the whole file and its digest in one request, which
 	// the receiver verifies and finalizes at once (no separate "complete" call).
 	if sha := r.Header.Get("X-Lanyard-SHA256"); sha != "" && offset == 0 {
-		st, err := s.inbox.Receive(r.PathValue("id"), PeerID(r.Context()), rel, sha, r.Body)
+		fileAt := time.Now()
+		st, already, err := s.inbox.Receive(r.PathValue("id"), PeerID(r.Context()), rel, sha, r.Body)
 		if err != nil {
 			code := http.StatusBadRequest
 			switch {
@@ -220,11 +374,18 @@ func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
 				code = http.StatusConflict
 			}
 			http.Error(w, err.Error(), code)
+			s.xferRecvFile(PeerID(r.Context()), xferlog.StepFile, xferlog.LevelError, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, path.Base(rel), 0, 0, 0, time.Since(fileAt), err)
 			return
+		}
+		// A replayed whole-file request for an already-placed file is an
+		// idempotent success: report the same result without a second receipt.
+		if !already {
+			s.xferRecvFile(PeerID(r.Context()), xferlog.StepFile, xferlog.LevelInfo, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, path.Base(rel), 0, st.Size, st.Size, time.Since(fileAt), nil)
 		}
 		writeJSON(w, map[string]any{"written": st.Size, "offset": st.Size, "done": true})
 		return
 	}
+	fileAt := time.Now()
 	n, err := s.inbox.WriteChunk(r.PathValue("id"), PeerID(r.Context()), rel, offset, r.Body)
 	if err != nil {
 		code := http.StatusBadRequest
@@ -234,14 +395,37 @@ func (s *Server) handlePushFile(w http.ResponseWriter, r *http.Request) {
 			code = http.StatusNotFound
 		}
 		http.Error(w, err.Error(), code)
+		s.xferRecvFile(PeerID(r.Context()), xferlog.StepFile, xferlog.LevelError, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, path.Base(rel), offset, 0, 0, time.Since(fileAt), err)
 		return
 	}
+	s.xferRecvFile(PeerID(r.Context()), xferlog.StepFile, xferlog.LevelInfo, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, path.Base(rel), offset, 0, n, time.Since(fileAt), nil)
 	writeJSON(w, map[string]int64{"written": n, "offset": offset + n})
 	_ = a
 }
 
+// handlePushCancel lets the sender (the owner of the push) ask the receiver to
+// stop a push it is still receiving. It is idempotent and harmless: a known id
+// owned by the caller is cancelled, and an unknown id (or one owned by another
+// peer) is a no-op answered 200, so the route is safe to retry and a peer can
+// never cancel someone else's push. The push leaves the Receiving/Finishing
+// list immediately and partial files/spool are freed through the normal cancel
+// path.
+func (s *Server) handlePushCancel(w http.ResponseWriter, r *http.Request) {
+	_, ok := s.pushAccess(w, r, xferlog.StepCancel)
+	if !ok {
+		return
+	}
+	id := r.PathValue("id")
+	fp := PeerID(r.Context())
+	if s.inbox != nil {
+		s.inbox.CancelBy(id, fp, "Cancelled by the sender")
+	}
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
 func (s *Server) handlePushComplete(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.pushAccess(w, r); !ok {
+	a, ok := s.pushAccess(w, r, xferlog.StepComplete)
+	if !ok {
 		return
 	}
 	var req struct {
@@ -255,19 +439,59 @@ func (s *Server) handlePushComplete(w http.ResponseWriter, r *http.Request) {
 	}
 	id := r.PathValue("id")
 	fp := PeerID(r.Context())
+	peer := s.peerName(fp, a)
+	file := path.Base(req.RelPath)
+	completeAt := time.Now()
 	if req.All {
-		s.inbox.Finish(id, fp)
-		writeJSON(w, map[string]bool{"done": true})
-		return
-	}
-	st, err := s.inbox.Complete(id, fp, req.RelPath, req.SHA256)
-	if err != nil {
-		if s.inbox.WasCancelled(id) {
+		// A repeated final complete is an idempotent success: only the first
+		// Finish removes the push and records it, so the duplicate neither
+		// errors nor double-records. A push the receiving person stopped
+		// answers 410 Gone instead, the mirror of a sender cancel, so the
+		// sender ends its row Cancelled rather than Done.
+		if s.inbox.Finish(id, fp) {
+			s.xferRecv(PeerID(r.Context()), xferlog.StepComplete, xferlog.LevelInfo, peer, r.RemoteAddr, file, 0, time.Since(completeAt), nil)
+		} else if s.inbox.WasCancelled(id) {
+			s.xferRecv(PeerID(r.Context()), xferlog.StepComplete, xferlog.LevelWarn, peer, r.RemoteAddr, file, 0, time.Since(completeAt), inbox.ErrCancelled)
 			http.Error(w, inbox.ErrCancelled.Error(), http.StatusGone)
 			return
 		}
+		writeJSON(w, map[string]bool{"done": true})
+		return
+	}
+	st, already, err := s.inbox.Complete(id, fp, req.RelPath, req.SHA256)
+	if err != nil {
+		if s.inbox.WasCancelled(id) {
+			err = inbox.ErrCancelled
+		}
+		// A 409 conflict carries the Connect session id and its age so a
+		// resume/verify mismatch can be told apart from a stale session.
+		var age time.Duration
+		sessionID := a.SessionID
+		if sessionID != "" && s.trust != nil {
+			if sess, ok := s.trust.Snapshot(sessionID); ok {
+				age = time.Since(sess.CreatedAt)
+			}
+		}
+		s.xfer(xferlog.Entry{
+			Area: xferlog.AreaPushing, Direction: xferlog.DirectionReceive, Step: xferlog.StepComplete,
+			Level: xferlog.LevelError, FP: identity.ShortID(fp), Peer: peer, Target: r.RemoteAddr,
+			File: file, Session: sessionID, Age: age, Elapsed: time.Since(completeAt), Error: err.Error(),
+		})
+		if errors.Is(err, inbox.ErrCancelled) {
+			http.Error(w, inbox.ErrCancelled.Error(), http.StatusGone)
+			return
+		}
+		// A failed finalize must end the push as Failed with the reason rather
+		// than leave the row "Receiving". Complete already fails it internally;
+		// this safety net covers any other error path.
+		s.inbox.Fail(id, err.Error())
 		http.Error(w, err.Error(), http.StatusConflict)
 		return
+	}
+	// A replayed per-file complete for an already-placed file returns the same
+	// result without a second receipt, so it cannot double-record.
+	if !already {
+		s.xferRecv(PeerID(r.Context()), xferlog.StepComplete, xferlog.LevelInfo, peer, r.RemoteAddr, path.Base(st.RelPath), st.Size, time.Since(completeAt), nil)
 	}
 	writeJSON(w, map[string]any{"rel_path": st.RelPath, "done": true})
 }
