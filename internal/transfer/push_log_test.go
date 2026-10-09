@@ -147,9 +147,13 @@ func TestPushLogsCompleteFailure(t *testing.T) {
 		t.Errorf("complete error = %q, want the full peer error", complete.Error)
 	}
 
-	// The job itself must show the mapped wording, not the raw status line.
+	// The job itself must show the mapped permission wording, never the
+	// destructive "not paired" line.
 	got, _ := h.m.Get(v.ID)
-	if got.State != StateFailed || !strings.Contains(got.Error, "Not paired with this device") {
-		t.Errorf("job error = %q (state %s), want the mapped 'not paired' wording", got.Error, got.State)
+	if got.State != StateFailed || !strings.Contains(got.Error, peerapi.NotPermittedMessage) {
+		t.Errorf("job error = %q (state %s), want the mapped permission wording", got.Error, got.State)
+	}
+	if strings.Contains(got.Error, "Not paired") {
+		t.Errorf("a permission refusal must not read as not paired: %q", got.Error)
 	}
 }

@@ -19,7 +19,7 @@ import (
 type pairedBrowseAuth struct{}
 
 func (pairedBrowseAuth) Access(string) trust.Access {
-	return trust.Access{Paired: true, Browse: true, DeviceID: "self"}
+	return trust.Access{Paired: true, Browse: trust.Allow, DeviceID: "self"}
 }
 
 // Pulling is one of the four logged areas: a share-list request and a download

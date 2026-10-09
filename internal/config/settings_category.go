@@ -43,6 +43,7 @@ var settingsFieldCategory = map[string]SettingsCategory{
 	"inbox_folder":            CategoryReceiving,
 	"bandwidth_limit_mbps":    CategoryReceiving,
 	"peer_port":               CategoryNetworkDiscovery,
+	"beacon_port":             CategoryNetworkDiscovery,
 	"ui_port":                 CategoryNetworkDiscovery,
 	"sound_on_complete":       CategoryNotifications,
 	"notifications":           CategoryNotifications,

@@ -1,7 +1,9 @@
 package transfer
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,37 @@ import (
 	"lanyard/internal/inbox"
 	"lanyard/internal/peerapi"
 )
+
+// A receiver that stops the push between the last file and the final "all"
+// complete answers 410 Gone there. The sender must finish the row Cancelled
+// with the mirror reason, not a generic Failed: the cancel is a deliberate act
+// by the other person, symmetric with a local cancel.
+func TestReceiverCancelOnFinalCompleteMapsToCancelled(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/v1/push/offer", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"push_id": "p_final", "accepted": true, "max_bytes": 1 << 30,
+			"files": []map[string]any{{"rel_path": "small.txt", "offset": 0}},
+		})
+	})
+	mux.HandleFunc("PUT /api/v1/push/{id}/file", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := io.Copy(io.Discard, r.Body)
+		_ = json.NewEncoder(w).Encode(map[string]any{"written": n})
+	})
+	mux.HandleFunc("POST /api/v1/push/{id}/complete", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "cancelled by the receiver", http.StatusGone)
+	})
+	h := newPushLogHarness(t, mux)
+	v := h.push(t)
+
+	got := waitState(t, h.m, v.ID, StateCancelled, 15*time.Second)
+	if got.Note != ReceiverCancelledReason {
+		t.Errorf("row note = %q, want %q", got.Note, ReceiverCancelledReason)
+	}
+	if got.Error != "" {
+		t.Errorf("a receiver cancel must not read as Failed: %q", got.Error)
+	}
+}
 
 // When the sender cancels a push, its best-effort call to the receiver's cancel
 // route must end the receiver's row (Cancelled, "Cancelled by the sender")

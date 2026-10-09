@@ -83,7 +83,7 @@ func TestAppJSDisconnectAndNarrowedGrantWiring(t *testing.T) {
 		{"sessionAction treats 404 as gone", "r.status !== 404"},
 		{"disconnect tooltip says it is session-only", "Ends this temporary connection only."},
 		{"peer grant is gated for push", "peer_permissions"},
-		{"peer grant is displayed", "They allow you to:"},
+		{"peer grant is displayed", "They allow me:"},
 		{"device pane re-renders on session change", `changed && place().kind === "device"`},
 	}
 	for _, c := range checks {

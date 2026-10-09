@@ -19,16 +19,20 @@ func (s *Server) snippets() []snippetView {
 		return out
 	}
 	for _, sp := range s.d.Inbox.Snippets() {
+		// A local alias wins so the text list names the sender the way the
+		// person does; otherwise fall back to discovery's broadcast name.
 		name := ""
-		for _, p := range s.d.Peers() {
-			if p.DeviceID == sp.PeerFP {
-				name = p.Name
+		if s.d.Trust != nil {
+			for _, e := range s.d.Trust.Paired() {
+				if e.Fingerprint == sp.PeerFP && e.DisplayName() != "" {
+					name = e.DisplayName()
+				}
 			}
 		}
-		if name == "" && s.d.Trust != nil {
-			for _, e := range s.d.Trust.Paired() {
-				if e.Fingerprint == sp.PeerFP {
-					name = e.Name
+		if name == "" {
+			for _, p := range s.d.Peers() {
+				if p.DeviceID == sp.PeerFP {
+					name = p.Name
 				}
 			}
 		}

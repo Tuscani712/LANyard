@@ -21,15 +21,26 @@ var (
 )
 
 const (
-	DefaultPeerPort = 47800
-	DefaultUIPort   = 47810
-	BeaconPort      = 47801
+	DefaultPeerPort   = 47800
+	DefaultUIPort     = 47810
+	DefaultBeaconPort = 47801
+	// MDNSPort is fixed by the mDNS standard; it is listed beside the
+	// configurable peer and beacon ports when generating firewall commands.
+	MDNSPort = 5353
 )
 
 type Settings struct {
 	DeviceName string `json:"device_name"`
-	PeerPort   int    `json:"peer_port"`
-	UIPort     int    `json:"ui_port"`
+	// PeerPort is the user-chosen peer TCP port. Zero means "not chosen yet":
+	// the app uses DefaultPeerPort and records the port it actually bound so
+	// the firewall banner and next start agree. A port the *server* had to
+	// fall back to is never written here.
+	PeerPort int `json:"peer_port"`
+	// BeaconPort is the fallback discovery UDP port (default 47801). Every
+	// device on the network must use the same value or fallback discovery
+	// between them stops working.
+	BeaconPort int `json:"beacon_port,omitempty"`
+	UIPort     int `json:"ui_port"`
 	// DeviceIDLabel is the user-facing Device ID (§11.1). It is a label; the
 	// certificate fingerprint remains the identity. Empty means "use the
 	// generated short fingerprint".
@@ -122,18 +133,21 @@ func Open(dir string) (*Store, error) {
 	if host == "" {
 		host = "lanyard-device"
 	}
-	s.data = Settings{DeviceName: host, PeerPort: DefaultPeerPort, UIPort: DefaultUIPort}
+	s.data = Settings{DeviceName: host, UIPort: DefaultUIPort}
 	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err == nil {
 		_ = json.Unmarshal(b, &s.data)
 	} else if !os.IsNotExist(err) {
 		return nil, err
 	}
-	if s.data.PeerPort == 0 {
-		s.data.PeerPort = DefaultPeerPort
-	}
+	// PeerPort is deliberately left at 0 when unset: the server records the
+	// port it actually bound (only when the user had not chosen one) so a
+	// later start and the firewall banner use the same port.
 	if s.data.UIPort == 0 {
 		s.data.UIPort = DefaultUIPort
+	}
+	if s.data.BeaconPort == 0 {
+		s.data.BeaconPort = DefaultBeaconPort
 	}
 	if s.data.Theme == "" {
 		s.data.Theme = "system"
@@ -148,6 +162,24 @@ func Open(dir string) (*Store, error) {
 // setting defaults to on when it has never been set.
 func (s Settings) NotificationsEnabled() bool {
 	return s.Notifications == nil || *s.Notifications
+}
+
+// EffectivePeerPort is the peer port this run requests: the user's choice when
+// one was made, otherwise the default. PeerPort itself may remain 0 until the
+// server records the port it actually bound.
+func (s Settings) EffectivePeerPort() int {
+	if s.PeerPort > 0 {
+		return s.PeerPort
+	}
+	return DefaultPeerPort
+}
+
+// EffectiveBeaconPort is the fallback discovery port, defaulting when unset.
+func (s Settings) EffectiveBeaconPort() int {
+	if s.BeaconPort > 0 {
+		return s.BeaconPort
+	}
+	return DefaultBeaconPort
 }
 
 func (s *Store) Dir() string { return s.dir }

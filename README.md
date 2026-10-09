@@ -25,8 +25,10 @@ Windows SmartScreen and macOS Gatekeeper will warn the first time.
 3. On Linux, allow LANyard through `ufw` (the ports are listed under
    [Ports, firewall](#ports-firewall-and-when-devices-do-not-appear)):
    `sudo ufw allow 47800/tcp && sudo ufw allow 47801/udp && sudo ufw allow 5353/udp`. If TCP 47800 is already
-   taken, the peer service falls back to a random free port; open that port too, because the rules above only
-   cover the default port.
+   taken, LANyard waits briefly for it, then uses a temporary port for that run only and shows the exact
+   command to run in the banner; open the peer port it names, because the rules above only cover the defaults.
+   Change the peer port in **Settings -> Network & Discovery** and the beacon port under **Advanced** there, and
+   the banner (and its **Copy** button) generates the matching commands for your ports.
 4. Devices running LANyard on the same network appear under **View Devices** within a few seconds.
 5. On the device that has the files: **My Shares** -> type the path of a file or folder, pick how long to share
    it, **Share**.
@@ -166,10 +168,14 @@ folder, bandwidth limit, peer port, paired devices (edit what each may do, or un
 
 | Port | Use |
 | :--- | :--- |
-| TCP 47800 | other devices talk to this one (falls back to a random free port; discovery tells the others) |
-| UDP 5353 (multicast) | finding devices (mDNS) |
-| UDP 47801 | finding devices when multicast is blocked (broadcast) |
+| TCP 47800 | other devices talk to this one. Configurable under **Settings -> Network & Discovery**; if it is busy LANyard uses a temporary port for that run and names it in the banner |
+| UDP 5353 (multicast) | finding devices (mDNS); fixed by the mDNS standard |
+| UDP 47801 | finding devices when multicast is blocked (broadcast). Configurable under **Settings -> Network & Discovery -> Advanced**; every device must use the same value |
 | `127.0.0.1` only | the window and the CLI |
+
+The firewall banner and its **Copy** button generate their `ufw` commands from the ports above, so they always
+match your configuration. The default line is
+`sudo ufw allow 47800/tcp && sudo ufw allow 47801/udp && sudo ufw allow 5353/udp`.
 
 If a device does not show up: both must be on the same network (guest Wi-Fi and some routers isolate devices);
 allow LANyard through the firewall for **private** networks; on a VPN or a different subnet use **Add by

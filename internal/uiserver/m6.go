@@ -12,26 +12,30 @@ import (
 )
 
 type settingsView struct {
-	DeviceName            string        `json:"device_name"`
-	DeviceIDLabel         string        `json:"device_id_label"`
-	Fingerprint           string        `json:"fingerprint"`
-	GeneratedLabel        string        `json:"generated_label"`
-	Theme                 string        `json:"theme"`
-	SpeedUnit             string        `json:"speed_unit"`
-	SoundOnComplete       bool          `json:"sound_on_complete"`
-	Notifications         bool          `json:"notifications"`
-	DefaultDownloadFolder string        `json:"default_download_folder"`
-	InboxFolder           string        `json:"inbox_folder"`
-	PeerPort              int           `json:"peer_port"`
-	BandwidthLimitMBps    int           `json:"bandwidth_limit_mbps"`
-	StartOnLogin          bool          `json:"start_on_login"`
-	MinimizeToTray        bool          `json:"minimize_to_tray"`
-	TraySupported         bool          `json:"tray_supported"`
-	TrayReason            string        `json:"tray_reason"`
-	Version               string        `json:"version"`
-	UpdateURL             string        `json:"update_url"`
-	AutoUpdate            bool          `json:"auto_update"`
-	Paired                []trust.Entry `json:"paired"`
+	DeviceName            string `json:"device_name"`
+	DeviceIDLabel         string `json:"device_id_label"`
+	Fingerprint           string `json:"fingerprint"`
+	GeneratedLabel        string `json:"generated_label"`
+	Theme                 string `json:"theme"`
+	SpeedUnit             string `json:"speed_unit"`
+	SoundOnComplete       bool   `json:"sound_on_complete"`
+	Notifications         bool   `json:"notifications"`
+	DefaultDownloadFolder string `json:"default_download_folder"`
+	InboxFolder           string `json:"inbox_folder"`
+	PeerPort              int    `json:"peer_port"`
+	BeaconPort            int    `json:"beacon_port"`
+	BandwidthLimitMBps    int    `json:"bandwidth_limit_mbps"`
+	// PeerPortFallbackNotice explains a temporary peer port, shown in the
+	// Network tab. Empty when the configured port was used.
+	PeerPortFallbackNotice string        `json:"peer_port_fallback_notice,omitempty"`
+	StartOnLogin           bool          `json:"start_on_login"`
+	MinimizeToTray         bool          `json:"minimize_to_tray"`
+	TraySupported          bool          `json:"tray_supported"`
+	TrayReason             string        `json:"tray_reason"`
+	Version                string        `json:"version"`
+	UpdateURL              string        `json:"update_url"`
+	AutoUpdate             bool          `json:"auto_update"`
+	Paired                 []trust.Entry `json:"paired"`
 
 	// Warning carries a non-fatal problem from a settings PUT (for example the
 	// OS sign-in entry could not be changed). Empty on success.
@@ -65,8 +69,10 @@ func (s *Server) settingsView() settingsView {
 		Theme: st.Theme, SpeedUnit: st.SpeedUnit, SoundOnComplete: st.SoundOnComplete,
 		Notifications:         st.NotificationsEnabled(),
 		DefaultDownloadFolder: st.DefaultDownloadFolder, InboxFolder: st.InboxFolder,
-		PeerPort: st.PeerPort, BandwidthLimitMBps: st.BandwidthLimitMBps,
+		PeerPort: st.EffectivePeerPort(), BandwidthLimitMBps: st.BandwidthLimitMBps,
 	}
+	v.BeaconPort = st.EffectiveBeaconPort()
+	v.PeerPortFallbackNotice = self.PeerPortFallbackNotice
 	v.StartOnLogin = st.StartOnLogin
 	v.MinimizeToTray = st.MinimizeToTray
 	// Show the folder pushes actually land in: the configured one, or the
@@ -110,6 +116,7 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 		DefaultDownloadFolder *string `json:"default_download_folder"`
 		InboxFolder           *string `json:"inbox_folder"`
 		PeerPort              *int    `json:"peer_port"`
+		BeaconPort            *int    `json:"beacon_port"`
 		BandwidthLimitMBps    *int    `json:"bandwidth_limit_mbps"`
 		StartOnLogin          *bool   `json:"start_on_login"`
 		MinimizeToTray        *bool   `json:"minimize_to_tray"`
@@ -180,6 +187,13 @@ func (s *Server) handleSettingsPut(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		next.PeerPort = *req.PeerPort
+	}
+	if req.BeaconPort != nil {
+		if *req.BeaconPort < 1024 || *req.BeaconPort > 65535 {
+			http.Error(w, "beacon port must be 1024-65535", http.StatusBadRequest)
+			return
+		}
+		next.BeaconPort = *req.BeaconPort
 	}
 	if req.BandwidthLimitMBps != nil {
 		if *req.BandwidthLimitMBps < 0 || *req.BandwidthLimitMBps > 100000 {

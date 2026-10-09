@@ -34,7 +34,7 @@ import (
 	"lanyard/internal/xferlog"
 )
 
-const version = "1.1.0-beta.10"
+const version = "1.1.0-beta.11"
 
 type runInfo struct {
 	PID     int    `json:"pid"`
@@ -250,6 +250,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 			DeviceID: label, Fingerprint: id.DeviceID, Name: cur.DeviceName, OS: runtime.GOOS,
 			Version: version, Port: peerSrv.Port(),
 			MaxOfferBytes: peerapi.MaxOfferBytes, MaxOfferFiles: peerapi.MaxOfferFiles,
+			TriStatePerms: true,
 		}
 	}
 	peerSrv = peerapi.NewServer(id, hello, shMgr, trustStore, auth, log)
@@ -294,7 +295,7 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 		}
 		ui.NotifyUser(uiserver.Notice{Kind: kind, Peer: peer, Files: ji.Files, Total: ji.Total, Label: ji.Label, Error: ji.Error})
 	})
-	want := st.PeerPort
+	want := st.EffectivePeerPort()
 	if peerPortFlag != 0 {
 		want = peerPortFlag
 	}
@@ -302,18 +303,30 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	if err != nil {
 		return fmt.Errorf("peer listener: %w", err)
 	}
+	// Remember the port we actually bound only when the user had not chosen one
+	// and this was not a temporary fallback (a fallback must never be persisted;
+	// the next start tries the configured port again). A --port override is for
+	// this run only, so it is not written either.
+	if peerPortFlag == 0 {
+		writeBackBoundPeerPort(cfg, peerSrv.Port(), peerSrv.PortFellBack())
+	}
 	go func() {
 		if err := peerSrv.Serve(peerLn); err != nil {
 			log.Error("peer service stopped", "err", err)
 		}
 	}()
 	log.Info("peer service listening", "port", peerSrv.Port(), "device_id", identity.ShortID(id.DeviceID))
+	if n := peerSrv.FallbackNotice(); n != "" {
+		log.Warn("peer service on a temporary port", "detail", n)
+	}
 
 	// Discovery.
 	disc := discovery.New(discovery.Announcement{
 		Name: st.DeviceName, OS: runtime.GOOS, Port: peerSrv.Port(), DeviceLabel: st.DeviceIDLabel,
 	}, id.DeviceID, client.Probe, log)
 	disc.SetXferLog(xferLog)
+	// The fallback beacon port is a setting; every device must match it.
+	disc.SetBeaconPort(st.EffectiveBeaconPort())
 	// A peer with a transfer in flight (either direction) must not be evicted
 	// when liveness probes briefly fail; a busy link can starve the probe.
 	disc.SetActiveTransfer(func(shortID, fingerprint string) bool {
@@ -350,8 +363,8 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	// first, then discovery.
 	resolvePeer = func(fp string) string {
 		if trustStore != nil {
-			if e, ok := trustStore.Entry(fp); ok && e.Name != "" {
-				return e.Name
+			if e, ok := trustStore.Entry(fp); ok && e.DisplayName() != "" {
+				return e.DisplayName()
 			}
 		}
 		for _, p := range disc.Peers() {
@@ -445,7 +458,8 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 				}
 				seen[p.DeviceID] = true
 				// Remember the last address of a paired device so discovery
-				// can probe it directly when mDNS goes quiet.
+				// can probe it directly when mDNS goes quiet. A changed port
+				// (the field that matters after a rebind) is stored too.
 				trustStore.SetPeerAddr(p.DeviceID, p.Addrs, p.Port)
 				// A device we unpaired while it was offline still needs to be
 				// told to drop us; now that it is visible, retry the notification.
@@ -542,6 +556,9 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 				GeneratedLabel: gen, DeviceLabel: label,
 				OS: runtime.GOOS, PeerPort: peerSrv.Port(), Version: version,
 				PeerPortRequested: peerSrv.RequestedPort(), PeerPortFallback: peerSrv.PortFellBack(),
+				PeerPortFallbackNotice: peerSrv.FallbackNotice(),
+				BeaconPort:             cur.EffectiveBeaconPort(),
+				MountsSupported:        mountMgr != nil,
 			}
 		},
 		Peers:     disc.Peers,
@@ -561,6 +578,11 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 			_ = inboxMgr.EnsureDir()
 			trMgr.SetBandwidthLimit(s.BandwidthLimitMBps)
 			disc.SetIdentity(s.DeviceName, s.DeviceIDLabel) // re-announce without a restart
+			// A changed peer port takes effect now: rebind the listener and
+			// re-announce mDNS/hello at the new port.
+			if s.EffectivePeerPort() != peerSrv.RequestedPort() {
+				restartPeerListener(peerSrv, disc, s.EffectivePeerPort(), log)
+			}
 			minimizeToTray.Store(s.MinimizeToTray)
 		},
 		SetStartOnLogin:     func(enable bool) error { return setStartOnLogin(dataDir, enable) },
@@ -690,6 +712,45 @@ func run(log *slog.Logger, dataDir string, noBrowser, webUI, noTray bool, name s
 	_ = peerSrv.Shutdown(sctx)
 	disc.Stop()
 	return nil
+}
+
+// writeBackBoundPeerPort records the peer TCP port the server actually bound
+// when the person had not chosen one, so the firewall banner and the next start
+// agree. It never overwrites an explicit choice, and a temporary fallback is
+// never written (the next start must retry the configured port).
+func writeBackBoundPeerPort(cfg *config.Store, boundPort int, fellBack bool) {
+	if fellBack || boundPort <= 0 || boundPort > 65535 {
+		return
+	}
+	if cfg.Get().PeerPort > 0 {
+		return // user-set: never overwrite
+	}
+	_ = cfg.Update(func(s *config.Settings) {
+		if s.PeerPort == 0 {
+			s.PeerPort = boundPort
+		}
+	})
+}
+
+// restartPeerListener rebinds the peer service to a new port and re-announces
+// it over mDNS and the beacon. The old listener is shut down first; a failure
+// is logged and leaves discovery unchanged.
+func restartPeerListener(srv *peerapi.Server, disc *discovery.Manager, port int, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_ = srv.Shutdown(ctx)
+	cancel()
+	ln, err := srv.Listen(port)
+	if err != nil {
+		log.Error("could not restart the peer listener", "port", port, "err", err)
+		return
+	}
+	go func() {
+		if err := srv.Serve(ln); err != nil {
+			log.Error("peer service stopped", "err", err)
+		}
+	}()
+	disc.SetPort(srv.Port())
+	log.Info("peer service rebound", "port", srv.Port())
 }
 
 func readRunInfo(path string) *runInfo {

@@ -243,7 +243,7 @@ func TestPairedPushAsksOnlyAboveTheLimit(t *testing.T) {
 	r := newPushRig(t)
 	r.trR.Pair(trust.Entry{
 		DeviceID: "sender-dev", Name: "Sender PC", Fingerprint: r.sendID.DeviceID, Mode: trust.ModePair,
-		Permissions: trust.Permissions{Browse: true, Push: true, AskOver: 1000},
+		Permissions: trust.Permissions{Browse: trust.Allow, Push: trust.Allow, AskOver: 1000},
 	})
 
 	small := r.push(t, writeTemp(t, "small.bin", randBytes(63, 500)))
@@ -274,7 +274,7 @@ func TestPushOfferWithManyFiles(t *testing.T) {
 	r := newPushRig(t)
 	r.trR.Pair(trust.Entry{
 		DeviceID: "sender-dev", Name: "Sender PC", Fingerprint: r.sendID.DeviceID, Mode: trust.ModePair,
-		Permissions: trust.Permissions{Browse: true, Push: true},
+		Permissions: trust.Permissions{Browse: trust.Allow, Push: trust.Allow},
 	})
 	files := make([]inbox.FileReq, 15000)
 	for i := range files {
@@ -295,7 +295,7 @@ func TestMixedPush(t *testing.T) {
 	r := newPushRig(t)
 	r.trR.Pair(trust.Entry{
 		DeviceID: "sender-dev", Name: "Sender PC", Fingerprint: r.sendID.DeviceID, Mode: trust.ModePair,
-		Permissions: trust.Permissions{Browse: true, Push: true},
+		Permissions: trust.Permissions{Browse: trust.Allow, Push: trust.Allow},
 	})
 	dir := t.TempDir()
 	want := map[string]string{}
@@ -333,7 +333,7 @@ func TestReceiverCancelsAnAcceptedPush(t *testing.T) {
 	r := newPushRig(t)
 	r.trR.Pair(trust.Entry{
 		DeviceID: "sender-dev", Name: "Sender PC", Fingerprint: r.sendID.DeviceID, Mode: trust.ModePair,
-		Permissions: trust.Permissions{Browse: true, Push: true},
+		Permissions: trust.Permissions{Browse: trust.Allow, Push: trust.Allow},
 	})
 	r.mgr.SetBandwidthLimit(2) // 2 MB/s so the transfer is still running when we cancel
 	v := r.push(t, writeTemp(t, "big.bin", randBytes(91, 24<<20)))
@@ -345,9 +345,12 @@ func TestReceiverCancelsAnAcceptedPush(t *testing.T) {
 	if !r.inbox.Cancel(id) {
 		t.Fatal("cancel reported that the push was not running")
 	}
-	got := waitState(t, r.mgr, v.ID, StateFailed, 15*time.Second)
-	if !strings.Contains(got.Error, "cancelled by the receiver") {
-		t.Errorf("sender should be told the receiver cancelled, got %q", got.Error)
+	got := waitState(t, r.mgr, v.ID, StateCancelled, 15*time.Second)
+	if got.Note != ReceiverCancelledReason {
+		t.Errorf("sender row note = %q, want %q", got.Note, ReceiverCancelledReason)
+	}
+	if got.Error != "" {
+		t.Errorf("a receiver cancel must not read as Failed: %q", got.Error)
 	}
 	if n := len(r.inbox.Incoming()); n != 0 {
 		t.Errorf("%d pushes still listed after cancel", n)

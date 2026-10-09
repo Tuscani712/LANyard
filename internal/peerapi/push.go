@@ -34,6 +34,8 @@ func needsApproval(a trust.Access, total int64) string {
 	switch {
 	case !a.Paired && a.SessionID != "":
 		return "connect"
+	case a.Paired && a.Push.Asks():
+		return "push"
 	case a.Paired && a.AskOver > 0 && total > a.AskOver:
 		return "large"
 	}
@@ -48,8 +50,8 @@ func (s *Server) peerName(fp string, a trust.Access) string {
 				return sess.PeerName
 			}
 		}
-		if e, ok := s.trust.Entry(fp); ok && e.Name != "" {
-			return e.Name
+		if e, ok := s.trust.Entry(fp); ok && e.DisplayName() != "" {
+			return e.DisplayName()
 		}
 	}
 	return "A device"
@@ -80,10 +82,16 @@ func (s *Server) askToAccept(w http.ResponseWriter, r *http.Request, a trust.Acc
 	for _, f := range files {
 		shown = append(shown, approval.File{Path: cleanLabel(f.RelPath), Size: f.Size})
 	}
+	// A resumed push of the same files shares a key so it is not asked twice;
+	// a request with no files (text) has no such identity and asks every time.
+	key := ""
+	if len(files) > 0 {
+		key = approvalKey(fp, files)
+	}
 	ok, err := s.approvals.Ask(r.Context(), approval.Request{
 		PeerFP: fp, PeerName: cleanLabel(s.peerName(fp, a)), Reason: reason,
 		Files: shown, Count: len(files), Total: total,
-	}, approvalKey(fp, files))
+	}, key)
 	switch {
 	case err == nil && ok:
 		return true
@@ -94,26 +102,37 @@ func (s *Server) askToAccept(w http.ResponseWriter, r *http.Request, a trust.Acc
 	case err != nil:
 		// The sender hung up while waiting; nothing to answer.
 	default:
-		http.Error(w, "The other device declined the transfer.", http.StatusForbidden)
+		// A person actively declined. This exact reason gets its own wording
+		// on the sender (see peerapi.UserMessage) and must never be mistaken
+		// for "not paired".
+		http.Error(w, permissionReasonUserDenied, http.StatusForbidden)
 	}
 	return false
 }
 
-// pushAccess authorizes a push endpoint: a paired peer with push permission, or
-// any live Connect session. step names the stage being authorized, for the
-// transfer log when the request is refused.
+// permissionReasonUserDenied is the 403 body written when the person on this
+// device declines an Ask prompt. It is the mirror wording for "denied by the
+// user" (see UserMessage).
+const permissionReasonUserDenied = "denied by the user"
+
+// pushAccess authorizes a push endpoint: a paired peer whose push permission
+// is not Never, or any live Connect session. The Ask state is authorized here
+// and prompted once at the offer (see needsApproval); the later file/complete
+// steps run only after that offer was accepted, so they must not prompt again.
+// step names the stage being authorized, for the transfer log when the request
+// is refused.
 func (s *Server) pushAccess(w http.ResponseWriter, r *http.Request, step string) (trust.Access, bool) {
 	fp := PeerID(r.Context())
 	if s.inbox == nil {
 		http.Error(w, "inbox unavailable", http.StatusServiceUnavailable)
-		s.xferRecv(PeerID(r.Context()), step, xferlog.LevelError, s.peerName(fp, trust.Access{}), r.RemoteAddr, "", 0, 0, errors.New("inbox unavailable"))
+		s.xferRecv(fp, step, xferlog.LevelError, s.peerName(fp, trust.Access{}), r.RemoteAddr, "", 0, 0, errors.New("inbox unavailable"))
 		return trust.Access{}, false
 	}
 	var a trust.Access
 	if s.auth != nil {
 		a = s.auth.Access(fp)
 	}
-	if a.Paired && a.Push {
+	if a.Paired && !a.Push.Denies() {
 		return a, true
 	}
 	if a.SessionID != "" {
@@ -124,7 +143,48 @@ func (s *Server) pushAccess(w http.ResponseWriter, r *http.Request, step string)
 		reason = "push not permitted"
 	}
 	http.Error(w, reason, http.StatusForbidden)
-	s.xferRecv(PeerID(r.Context()), step, xferlog.LevelWarn, s.peerName(fp, a), r.RemoteAddr, "", 0, 0, errors.New("not paired with this device"))
+	s.xferRecv(fp, step, xferlog.LevelWarn, s.peerName(fp, a), r.RemoteAddr, "", 0, 0, errors.New(reason))
+	return a, false
+}
+
+// textAccess authorizes a short-text snippet. A paired peer's text permission
+// is tri-state: Allow delivers silently, Ask reuses the approval prompt, Never
+// refuses. A live Connect session also asks (reusing the "connect" reason), so
+// a stranger's text cannot land unnoticed.
+func (s *Server) textAccess(w http.ResponseWriter, r *http.Request) (trust.Access, bool) {
+	fp := PeerID(r.Context())
+	var a trust.Access
+	if s.auth != nil {
+		a = s.auth.Access(fp)
+	}
+	if a.Paired && a.Text.Allows() {
+		return a, true
+	}
+	if a.Paired && a.Text.Asks() {
+		if s.approvals == nil {
+			http.Error(w, permissionReasonUserDenied, http.StatusForbidden)
+			s.xferRecv(fp, xferlog.StepSnippet, xferlog.LevelWarn, s.peerName(fp, a), r.RemoteAddr, "", 0, 0, errors.New(permissionReasonUserDenied))
+			return a, false
+		}
+		if !s.askToAccept(w, r, a, "text", nil, 0) {
+			return a, false
+		}
+		return a, true
+	}
+	if a.SessionID != "" {
+		if s.approvals != nil {
+			if !s.askToAccept(w, r, a, "connect", nil, 0) {
+				return a, false
+			}
+		}
+		return a, true
+	}
+	reason := "not permitted"
+	if a.Paired {
+		reason = "text not permitted"
+	}
+	http.Error(w, reason, http.StatusForbidden)
+	s.xferRecv(fp, xferlog.StepSnippet, xferlog.LevelWarn, s.peerName(fp, a), r.RemoteAddr, "", 0, 0, errors.New(reason))
 	return a, false
 }
 
@@ -240,10 +300,18 @@ func (s *Server) handlePushOffer(w http.ResponseWriter, r *http.Request) {
 	}
 	offerAt := time.Now()
 	// A Connect session, or a paired peer above its ask-over limit, needs a
-	// person to accept (spec §4.2/§4.4). Without an approval queue (tests, the
-	// dev flag) pushes keep the old automatic behaviour.
-	if reason := needsApproval(a, total); reason != "" && s.approvals != nil {
-		if !s.askToAccept(w, r, a, reason, req.Files, total) {
+	// person to accept (spec §4.2/§4.4). A paired Ask peer with no approval
+	// queue has no one to ask, so it fails closed; Connect and large-push keep
+	// their old automatic behaviour when the queue is unavailable (tests, the
+	// dev flag).
+	if reason := needsApproval(a, total); reason != "" {
+		if s.approvals == nil {
+			if reason == "push" {
+				http.Error(w, permissionReasonUserDenied, http.StatusForbidden)
+				s.xferRecv(PeerID(r.Context()), xferlog.StepOffer, xferlog.LevelWarn, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, "", 0, time.Since(offerAt), errors.New(permissionReasonUserDenied))
+				return
+			}
+		} else if !s.askToAccept(w, r, a, reason, req.Files, total) {
 			s.xferRecv(PeerID(r.Context()), xferlog.StepOffer, xferlog.LevelWarn, s.peerName(PeerID(r.Context()), a), r.RemoteAddr, "", 0, time.Since(offerAt), errors.New("the offer was declined or not answered"))
 			return
 		}
@@ -377,9 +445,15 @@ func (s *Server) handlePushComplete(w http.ResponseWriter, r *http.Request) {
 	if req.All {
 		// A repeated final complete is an idempotent success: only the first
 		// Finish removes the push and records it, so the duplicate neither
-		// errors nor double-records.
+		// errors nor double-records. A push the receiving person stopped
+		// answers 410 Gone instead, the mirror of a sender cancel, so the
+		// sender ends its row Cancelled rather than Done.
 		if s.inbox.Finish(id, fp) {
 			s.xferRecv(PeerID(r.Context()), xferlog.StepComplete, xferlog.LevelInfo, peer, r.RemoteAddr, file, 0, time.Since(completeAt), nil)
+		} else if s.inbox.WasCancelled(id) {
+			s.xferRecv(PeerID(r.Context()), xferlog.StepComplete, xferlog.LevelWarn, peer, r.RemoteAddr, file, 0, time.Since(completeAt), inbox.ErrCancelled)
+			http.Error(w, inbox.ErrCancelled.Error(), http.StatusGone)
+			return
 		}
 		writeJSON(w, map[string]bool{"done": true})
 		return

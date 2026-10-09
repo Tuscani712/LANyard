@@ -37,6 +37,11 @@ type Hello struct {
 	// that does not advertise them; the sender then falls back to a safe floor.
 	MaxOfferBytes int64 `json:"max_offer_bytes"`
 	MaxOfferFiles int   `json:"max_offer_files"`
+	// TriStatePerms advertises that this peer speaks the tri-state permission
+	// encoding (Allow/Ask/Never). Presence of the `perms` marker on a grant is
+	// what actually makes the modes authoritative; this flag lets a peer know
+	// up front that Ask is understood, so it can offer/prompt accordingly.
+	TriStatePerms bool `json:"tristate_perms,omitempty"`
 }
 
 // Prober dials a peer over TLS and returns the Device ID taken from the

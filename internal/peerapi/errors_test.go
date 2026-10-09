@@ -30,6 +30,8 @@ func TestIsNotPairedStrict(t *testing.T) {
 		{"json pull not permitted", pinned(`{"error":"pull not permitted"}`), false},
 		{"json push not permitted", pinned(`{"error":"push not permitted"}`), false},
 		{"json not permitted", pinned(`{"error":"not permitted"}`), false},
+		{"json text not permitted", pinned(`{"error":"text not permitted"}`), false},
+		{"json denied by the user", pinned(`{"error":"denied by the user"}`), false},
 		{"json forbidden", pinned(`{"error":"forbidden"}`), false},
 		{"json empty error", pinned(`{"error":""}`), false},
 		{"json no error field", pinned(`{"ok":true}`), false},
@@ -40,6 +42,8 @@ func TestIsNotPairedStrict(t *testing.T) {
 		{"pull not permitted", pinned("pull not permitted"), false},
 		{"push not permitted", pinned("push not permitted"), false},
 		{"not permitted", pinned("not permitted"), false},
+		{"text not permitted", pinned("text not permitted"), false},
+		{"denied by the user", pinned("denied by the user"), false},
 		{"forbidden", pinned("forbidden"), false},
 		{"empty body", pinned(""), false},
 		{"odd body", pinned("<html>go away</html>"), false},
@@ -57,12 +61,22 @@ func TestIsNotPairedStrict(t *testing.T) {
 	}
 }
 
-// The wider display set still maps generic permission wording to the friendly
-// "not paired" line, while a specific explanation is preserved.
+// A permission refusal must get its own wording, never the destructive
+// "Not paired" line; only a genuinely missing pairing reads as NotPaired.
 func TestUserMessageDisplaySet(t *testing.T) {
-	for _, msg := range []string{"not paired", "not permitted", "push not permitted", "forbidden", ""} {
-		if got := UserMessage(&StatusError{Code: http.StatusForbidden, Status: "403 Forbidden", Msg: msg}); got != NotPairedMessage {
-			t.Errorf("UserMessage(%q) = %q, want %q", msg, got, NotPairedMessage)
+	cases := map[string]string{
+		"not paired":         NotPairedMessage,
+		"push not permitted": PushDeniedMessage,
+		"pull not permitted": BrowseDeniedMessage,
+		"text not permitted": TextDeniedMessage,
+		"not permitted":      NotPermittedMessage,
+		"denied by the user": UserDeniedMessage,
+		"forbidden":          NotPermittedMessage,
+		"":                   NotPermittedMessage,
+	}
+	for msg, want := range cases {
+		if got := UserMessage(&StatusError{Code: http.StatusForbidden, Status: "403 Forbidden", Msg: msg}); got != want {
+			t.Errorf("UserMessage(%q) = %q, want %q", msg, got, want)
 		}
 	}
 	specific := "The other device declined the transfer."
@@ -71,13 +85,21 @@ func TestUserMessageDisplaySet(t *testing.T) {
 	}
 }
 
-// A JSON error body is unwrapped before the display set is consulted, so a
-// generic {"error":"not permitted"} reads as the friendly "not paired" line
-// while a specific JSON reason is preserved (never shown as raw JSON).
+// A JSON error body is unwrapped before the mapping is consulted, so a generic
+// {"error":"not permitted"} still reads as a permission refusal, never "Not
+// paired", while a specific JSON reason is preserved (never shown as raw JSON).
 func TestUserMessageJSONErrorBody(t *testing.T) {
-	for _, msg := range []string{`{"error":"not paired"}`, `{"error":"not permitted"}`, `{"error":"forbidden"}`, `{"error":""}`} {
-		if got := UserMessage(&StatusError{Code: http.StatusForbidden, Status: "403 Forbidden", Msg: msg}); got != NotPairedMessage {
-			t.Errorf("UserMessage(%s) = %q, want %q", msg, got, NotPairedMessage)
+	cases := map[string]string{
+		`{"error":"not paired"}`:         NotPairedMessage,
+		`{"error":"not permitted"}`:      NotPermittedMessage,
+		`{"error":"push not permitted"}`: PushDeniedMessage,
+		`{"error":"denied by the user"}`: UserDeniedMessage,
+		`{"error":"forbidden"}`:          NotPermittedMessage,
+		`{"error":""}`:                   NotPermittedMessage,
+	}
+	for msg, want := range cases {
+		if got := UserMessage(&StatusError{Code: http.StatusForbidden, Status: "403 Forbidden", Msg: msg}); got != want {
+			t.Errorf("UserMessage(%s) = %q, want %q", msg, got, want)
 		}
 	}
 	specific := `{"error":"The other device declined the transfer."}`

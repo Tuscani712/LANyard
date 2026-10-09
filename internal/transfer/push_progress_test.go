@@ -17,7 +17,7 @@ func newPushProgressRig(t *testing.T) *pushRig {
 	r := newPushRig(t)
 	r.trR.Pair(trust.Entry{
 		DeviceID: "sender-dev", Name: "Sender PC", Fingerprint: r.sendID.DeviceID, Mode: trust.ModePair,
-		Permissions: trust.Permissions{Browse: true, Push: true},
+		Permissions: trust.Permissions{Browse: trust.Allow, Push: trust.Allow},
 	})
 	return r
 }

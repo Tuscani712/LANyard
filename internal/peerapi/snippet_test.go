@@ -25,8 +25,8 @@ func snippetRequest(t *testing.T, srv *Server, body string) *httptest.ResponseRe
 	return rr
 }
 
-// A snippet uses the same authorization as a push: unpaired or no-push peers
-// are refused.
+// A snippet uses its own tri-state text permission: unpaired peers and a
+// paired peer without text are refused.
 func TestSnippetPermissionDenied(t *testing.T) {
 	m := inbox.New(t.TempDir(), nil)
 	cases := []struct {
@@ -35,8 +35,8 @@ func TestSnippetPermissionDenied(t *testing.T) {
 		want int
 	}{
 		{"unpaired", trust.Access{}, http.StatusForbidden},
-		{"paired without push", trust.Access{Paired: true}, http.StatusForbidden},
-		{"paired with push", trust.Access{Paired: true, Push: true}, 0},
+		{"paired without text", trust.Access{Paired: true}, http.StatusForbidden},
+		{"paired with text", trust.Access{Paired: true, Text: trust.Allow}, 0},
 		{"live connect session", trust.Access{SessionID: "c_1"}, 0},
 	}
 	for _, tc := range cases {
@@ -59,7 +59,7 @@ func TestSnippetPermissionDenied(t *testing.T) {
 
 func TestSnippetRejectsTooLarge(t *testing.T) {
 	m := inbox.New(t.TempDir(), nil)
-	srv := &Server{inbox: m, auth: fakeAuth{trust.Access{Paired: true, Push: true}}}
+	srv := &Server{inbox: m, auth: fakeAuth{trust.Access{Paired: true, Text: trust.Allow}}}
 	big := strings.Repeat("x", inbox.MaxSnippetBytes+1)
 	rr := snippetRequest(t, srv, `{"text":"`+big+`"}`)
 	if rr.Code != http.StatusBadRequest {
@@ -72,7 +72,7 @@ func TestSnippetRejectsTooLarge(t *testing.T) {
 
 func TestSnippetRejectsControlCharacters(t *testing.T) {
 	m := inbox.New(t.TempDir(), nil)
-	srv := &Server{inbox: m, auth: fakeAuth{trust.Access{Paired: true, Push: true}}}
+	srv := &Server{inbox: m, auth: fakeAuth{trust.Access{Paired: true, Text: trust.Allow}}}
 	rr := snippetRequest(t, srv, "{\"text\":\"bad\\u0007bell\"}")
 	if rr.Code != http.StatusBadRequest {
 		t.Fatalf("code = %d, want 400", rr.Code)
@@ -83,7 +83,7 @@ func TestSnippetRejectsControlCharacters(t *testing.T) {
 // it with textContent.
 func TestSnippetMarkupStoredAsText(t *testing.T) {
 	m := inbox.New(t.TempDir(), nil)
-	srv := &Server{inbox: m, auth: fakeAuth{trust.Access{Paired: true, Push: true}}}
+	srv := &Server{inbox: m, auth: fakeAuth{trust.Access{Paired: true, Text: trust.Allow}}}
 	rr := snippetRequest(t, srv, `{"text":"<script>alert(1)</script>"}`)
 	if rr.Code != http.StatusOK {
 		t.Fatalf("code = %d, want 200", rr.Code)

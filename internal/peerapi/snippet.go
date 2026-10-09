@@ -5,14 +5,13 @@ import (
 	"net/http"
 
 	"lanyard/internal/inbox"
-	"lanyard/internal/xferlog"
 )
 
 // handleSnippet receives a short text message from a peer. It is authorized by
-// the same check as a push (a paired peer with push permission, or a live
-// Connect session) and lands in the receiver's Inbox as a text item.
+// the text permission (a paired peer whose text state is Allow or Ask, or a
+// live Connect session) and lands in the receiver's Inbox as a text item.
 func (s *Server) handleSnippet(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.pushAccess(w, r, xferlog.StepSnippet); !ok {
+	if _, ok := s.textAccess(w, r); !ok {
 		return
 	}
 	if s.inbox == nil {

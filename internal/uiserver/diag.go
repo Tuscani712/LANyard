@@ -3,12 +3,14 @@ package uiserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"lanyard/internal/config"
 	"lanyard/internal/diag"
 	"lanyard/internal/discovery"
 	"lanyard/internal/inbox"
@@ -147,16 +149,40 @@ func (s *Server) handleDiagnostics(w http.ResponseWriter, r *http.Request) {
 			report += "\n" + log
 		}
 	}
+	beaconPort := config.DefaultBeaconPort
+	if s.d.Cfg != nil {
+		beaconPort = s.d.Cfg.Get().EffectiveBeaconPort()
+	}
 	writeJSON(w, map[string]any{
 		"checks": checks, "report": report, "log": log, "transfer_log": entries,
-		"peer_port":       self.PeerPort,
-		"firewall_banner": firewallBannerNeeded(self, checks),
+		"peer_port":                 self.PeerPort,
+		"peer_port_fallback":        self.PeerPortFallback,
+		"peer_port_fallback_notice": self.PeerPortFallbackNotice,
+		"beacon_port":               beaconPort,
+		"firewall_commands":         FirewallCommands(self.PeerPort, beaconPort),
+		"firewall_banner":           firewallBannerNeeded(self, checks),
 	})
+}
+
+// FirewallCommands builds the copy-paste firewall rule for the ports LANyard
+// actually uses: the peer TCP port it bound (or its configured/default value),
+// the configured beacon UDP port, and the fixed mDNS port. Generating it from
+// the live values is what keeps the banner, its Copy button and the README in
+// step when a port changes.
+func FirewallCommands(peerPort, beaconPort int) string {
+	if peerPort <= 0 {
+		peerPort = config.DefaultPeerPort
+	}
+	if beaconPort <= 0 {
+		beaconPort = config.DefaultBeaconPort
+	}
+	return fmt.Sprintf("sudo ufw allow %d/tcp && sudo ufw allow %d/udp && sudo ufw allow %d/udp",
+		peerPort, beaconPort, config.MDNSPort)
 }
 
 // defaultPeerPort is the port the peer service prefers. A firewall rule opened
 // for it does not cover the random fallback port.
-const defaultPeerPort = 47800
+const defaultPeerPort = config.DefaultPeerPort
 
 // firewallBannerNeeded reports whether the UI should show the actionable
 // "other devices can't reach this computer" banner: the peer service bound a

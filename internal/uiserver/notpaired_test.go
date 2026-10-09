@@ -9,17 +9,23 @@ import (
 	"lanyard/internal/peerapi"
 )
 
-// A 403 from a peer is a pairing/permission refusal. It must surface as the
-// "not paired" wording, never as "could not reach device", which is reserved
-// for transport failures.
+// A permission 403 from a peer gets its own wording, never the destructive
+// "not paired" line (which is reserved for a genuine unpairing) and never
+// "could not reach device", which is reserved for transport failures.
 func TestPeerErrorMessageNotPaired(t *testing.T) {
 	forbidden := &peerapi.StatusError{Code: http.StatusForbidden, Status: "403 Forbidden", Msg: "not permitted"}
 
-	if got := peerErrorMessage(forbidden); got != peerapi.NotPairedMessage {
-		t.Errorf("peerErrorMessage(403) = %q, want %q", got, peerapi.NotPairedMessage)
+	if got := peerErrorMessage(forbidden); got != peerapi.NotPermittedMessage {
+		t.Errorf("peerErrorMessage(403) = %q, want %q", got, peerapi.NotPermittedMessage)
 	}
-	if got := peerUIMessage(forbidden); got != peerapi.NotPairedMessage {
-		t.Errorf("peerUIMessage(403) = %q, want %q", got, peerapi.NotPairedMessage)
+	if got := peerUIMessage(forbidden); got != peerapi.NotPermittedMessage {
+		t.Errorf("peerUIMessage(403) = %q, want %q", got, peerapi.NotPermittedMessage)
+	}
+
+	// The genuine unpairing reason still reads as "Not paired".
+	unpaired := &peerapi.StatusError{Code: http.StatusForbidden, Status: "403 Forbidden", Msg: "not paired"}
+	if got := peerErrorMessage(unpaired); got != peerapi.NotPairedMessage {
+		t.Errorf("peerErrorMessage(not paired) = %q, want %q", got, peerapi.NotPairedMessage)
 	}
 
 	// A peer that explains itself keeps its own message.
@@ -38,15 +44,18 @@ func TestPeerErrorMessageNotPaired(t *testing.T) {
 	}
 }
 
-// The pairing flow shows the same distinction: 403 is friendly (not paired),
-// while a dial error is not.
+// The pairing flow shows the same distinction: a permission 403 keeps its own
+// wording while a dial error is not friendly.
 func TestPairingStartMessageForbidden(t *testing.T) {
 	msg, friendly := pairingStartMessage(&peerapi.StatusError{Code: http.StatusForbidden, Status: "403 Forbidden", Msg: "push not permitted"})
 	if !friendly {
 		t.Errorf("403 should be the friendly case, got friendly=%v", friendly)
 	}
-	if !strings.Contains(msg, "Not paired") {
-		t.Errorf("403 pairing message = %q", msg)
+	if msg != peerapi.PushDeniedMessage {
+		t.Errorf("403 pairing message = %q, want %q", msg, peerapi.PushDeniedMessage)
+	}
+	if strings.Contains(msg, "Not paired") {
+		t.Errorf("a permission refusal must not read as not paired: %q", msg)
 	}
 	if strings.Contains(msg, "could not reach") {
 		t.Errorf("403 must not be reported as unreachable: %q", msg)

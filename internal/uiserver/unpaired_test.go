@@ -72,7 +72,9 @@ func TestPeerRefusedPairingIgnoresPermissionDenials(t *testing.T) {
 	for _, msg := range []string{
 		"pull not permitted",
 		"push not permitted",
+		"text not permitted",
 		"not permitted",
+		"denied by the user",
 		"forbidden",
 		"",
 		"<html>go away</html>",

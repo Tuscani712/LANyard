@@ -33,7 +33,7 @@ type Authorizer interface {
 type allowAll struct{}
 
 func (allowAll) Access(string) trust.Access {
-	return trust.Access{Paired: true, Browse: true, Push: true}
+	return trust.Access{Paired: true, Browse: trust.Allow, Push: trust.Allow, Text: trust.Allow}
 }
 
 // AllowAll bypasses the trust store. It is used only by package tests; the
@@ -80,6 +80,31 @@ type Server struct {
 	port      int
 	requested int  // the port Listen was asked for
 	fellBack  bool // Listen could not bind requested and used a random port
+	// fallbackNotice is the person-facing line explaining a temporary port,
+	// e.g. "Using temporary port 51234 because 47800 is in use by other".
+	fallbackNotice string
+}
+
+// portRetryWindow is how long Listen keeps trying the configured port before it
+// gives up and binds a temporary one. It is a var so tests can shorten it.
+// portRetryInterval is the pause between attempts.
+var (
+	portRetryWindow   = 5 * time.Second
+	portRetryInterval = 250 * time.Millisecond
+)
+
+// portHolderFn names the process listening on a TCP port, or "" if unknown.
+// A var so tests are deterministic.
+var portHolderFn = portHolder
+
+// TemporaryPortMessage is the line shown in the banner and Settings when the
+// configured peer port was busy and a temporary one was bound for this run.
+func TemporaryPortMessage(bound, requested int, holder string) string {
+	msg := fmt.Sprintf("Using temporary port %d because %d is in use", bound, requested)
+	if holder != "" {
+		msg += " by " + holder
+	}
+	return msg
 }
 
 func NewServer(id *identity.Identity, hello func() discovery.Hello, sh *shares.Manager, tr *trust.Store, auth Authorizer, log *slog.Logger) *Server {
@@ -128,22 +153,39 @@ func (s *Server) tlsConfig() *tls.Config {
 	}
 }
 
-// Listen binds the preferred port, falling back to any free port.
+// Listen binds the preferred port, waiting briefly for it to free up. If it is
+// still busy it falls back to an ephemeral port for this run only; the caller
+// must not persist that port. RequestedPort keeps reporting the configured port
+// so the next start tries it again.
 func (s *Server) Listen(preferred int) (net.Listener, error) {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", preferred))
 	fellBack := false
+	notice := ""
 	if err != nil {
-		s.log.Info("preferred port unavailable, choosing a random one", "port", preferred, "err", err)
+		// Give a previous instance a moment to release the port before falling
+		// back; a busy port is usually a restart overlap, not a conflict.
+		deadline := time.Now().Add(portRetryWindow)
+		for time.Now().Before(deadline) {
+			time.Sleep(portRetryInterval)
+			if ln, err = net.Listen("tcp", fmt.Sprintf(":%d", preferred)); err == nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		s.log.Info("preferred port unavailable, choosing a temporary one", "port", preferred, "err", err)
 		ln, err = net.Listen("tcp", ":0")
 		if err != nil {
 			return nil, err
 		}
 		fellBack = true
+		notice = TemporaryPortMessage(ln.Addr().(*net.TCPAddr).Port, preferred, portHolderFn(preferred))
 	}
 	s.mu.Lock()
 	s.port = ln.Addr().(*net.TCPAddr).Port
 	s.requested = preferred
 	s.fellBack = fellBack
+	s.fallbackNotice = notice
 	s.mu.Unlock()
 	return ln, nil
 }
@@ -168,6 +210,14 @@ func (s *Server) PortFellBack() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.fellBack
+}
+
+// FallbackNotice is the person-facing explanation of a temporary-port fallback,
+// or "" when the configured port was used.
+func (s *Server) FallbackNotice() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.fallbackNotice
 }
 
 func (s *Server) Serve(ln net.Listener) error {

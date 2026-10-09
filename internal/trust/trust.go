@@ -48,12 +48,161 @@ const (
 	PairInviteTTL = 2 * time.Minute
 )
 
-// Permissions are what one side allows the other to do (per direction).
+// Permission is one action's permission, per direction. It is tri-state:
+//
+//	Allow  yes, do it silently
+//	Ask    yes, but prompt the person first
+//	Never  no (the only state that produces a hard 403)
+//
+// The zero value ("") is treated as Never at authorization time, but never
+// reaches a fresh pairing: new grants default to Ask (see the pairing UI), and
+// legacy entries are migrated on load (see Load).
+type Permission string
+
+const (
+	Allow Permission = "allow"
+	Ask   Permission = "ask"
+	Never Permission = "never"
+)
+
+// Allows reports the "do it silently" state.
+func (p Permission) Allows() bool { return p == Allow }
+
+// Asks reports the "prompt the person" state.
+func (p Permission) Asks() bool { return p == Ask }
+
+// Denies reports a hard refusal. The unset zero value counts as a refusal.
+func (p Permission) Denies() bool { return p != Allow && p != Ask }
+
+// Valid reports whether p is one of the three defined states.
+func (p Permission) Valid() bool { return p == Allow || p == Ask || p == Never }
+
+// Permissions are what one side allows the other to do (per direction). Each
+// action is tri-state (Allow/Ask/Never); a missing mode is treated as Never.
+//
+// Wire encoding (backward compatible): the JSON carries the legacy boolean
+// fields (true iff Allow) *and* the tri-state mode fields plus a
+// `"perms":"tristate"` marker. An old peer reads the booleans and never sees a
+// mode it does not understand; a new peer sees the marker and trusts the modes,
+// which is how Ask is negotiated without breaking old builds.
 type Permissions struct {
-	Browse       bool  `json:"browse"`
-	Push         bool  `json:"push"`
-	PushMaxBytes int64 `json:"push_max_bytes,omitempty"`
-	AskOver      int64 `json:"ask_over,omitempty"`
+	Browse       Permission `json:"browse"`
+	Push         Permission `json:"push"`
+	Text         Permission `json:"text"`
+	PushMaxBytes int64      `json:"push_max_bytes,omitempty"`
+	AskOver      int64      `json:"ask_over,omitempty"`
+
+	// triState is set when the JSON being decoded carried the tristate marker.
+	// Entries without it are legacy and are migrated on load.
+	triState bool
+}
+
+// permissionsWire is the on-the-wire/persisted JSON shape. It always emits the
+// legacy booleans so an old peer can read a grant, plus the tri-state modes.
+type permissionsWire struct {
+	Browse       bool       `json:"browse"`
+	Push         bool       `json:"push"`
+	Text         bool       `json:"text"`
+	BrowseMode   Permission `json:"browse_mode,omitempty"`
+	PushMode     Permission `json:"push_mode,omitempty"`
+	TextMode     Permission `json:"text_mode,omitempty"`
+	Perms        string     `json:"perms,omitempty"`
+	PushMaxBytes int64      `json:"push_max_bytes,omitempty"`
+	AskOver      int64      `json:"ask_over,omitempty"`
+}
+
+const triStateMarker = "tristate"
+
+// MarshalJSON emits both the legacy booleans (allow else deny) and the
+// tri-state modes, tagged with the marker so a new peer knows the modes are
+// authoritative.
+func (p Permissions) MarshalJSON() ([]byte, error) {
+	return json.Marshal(permissionsWire{
+		Browse: p.Browse.Allows(), Push: p.Push.Allows(), Text: p.Text.Allows(),
+		BrowseMode: p.Browse, PushMode: p.Push, TextMode: p.Text,
+		Perms: triStateMarker, PushMaxBytes: p.PushMaxBytes, AskOver: p.AskOver,
+	})
+}
+
+// UnmarshalJSON accepts every historical encoding: a bool (old peer) plus the
+// optional tri-state modes. When the tristate marker is present a valid mode
+// wins; otherwise a bool maps true->Allow and false->Never (an old peer that
+// denies cannot ask).
+func (p *Permissions) UnmarshalJSON(b []byte) error {
+	var w struct {
+		Browse       *json.RawMessage `json:"browse"`
+		Push         *json.RawMessage `json:"push"`
+		Text         *json.RawMessage `json:"text"`
+		BrowseMode   string           `json:"browse_mode"`
+		PushMode     string           `json:"push_mode"`
+		TextMode     string           `json:"text_mode"`
+		Perms        string           `json:"perms"`
+		PushMaxBytes int64            `json:"push_max_bytes"`
+		AskOver      int64            `json:"ask_over"`
+	}
+	if err := json.Unmarshal(b, &w); err != nil {
+		return err
+	}
+	tri := w.Perms == triStateMarker
+	*p = Permissions{
+		Browse:       decodePermission(w.Browse, w.BrowseMode, tri),
+		Push:         decodePermission(w.Push, w.PushMode, tri),
+		Text:         decodePermission(w.Text, w.TextMode, tri),
+		PushMaxBytes: w.PushMaxBytes, AskOver: w.AskOver,
+		triState: tri,
+	}
+	return nil
+}
+
+// decodePermission resolves one field: a valid mode when the tristate marker
+// was present, else the legacy boolean. An absent field yields "" (Never).
+func decodePermission(raw *json.RawMessage, mode string, tri bool) Permission {
+	if tri {
+		if m := Permission(mode); m.Valid() {
+			return m
+		}
+	}
+	if raw == nil {
+		return ""
+	}
+	var b bool
+	if err := json.Unmarshal(*raw, &b); err == nil {
+		if b {
+			return Allow
+		}
+		return Never
+	}
+	var s string
+	if err := json.Unmarshal(*raw, &s); err == nil {
+		if m := Permission(s); m.Valid() {
+			return m
+		}
+	}
+	return ""
+}
+
+// migrateLegacy upgrades a pre-tri-state grant: the old boolean had no Ask
+// state, so anything that was not an explicit Allow becomes the new default,
+// Ask. Text predates its own permission, so an entry with no text field
+// inherits the legacy push grant instead: an allowed push meant allowed text
+// (Allow), a denied push becomes the new default Ask. It is never silently
+// always-Ask.
+func migrateLegacy(p Permissions) Permissions {
+	legacyPush := p.Push
+	if p.Browse != Allow {
+		p.Browse = Ask
+	}
+	if p.Push != Allow {
+		p.Push = Ask
+	}
+	if p.Text != Allow {
+		if legacyPush == Allow {
+			p.Text = Allow
+		} else {
+			p.Text = Ask
+		}
+	}
+	return p
 }
 
 // Entry is one paired device. Permissions describe what that peer may do to us.
@@ -65,6 +214,11 @@ type Entry struct {
 	Fingerprint string      `json:"cert_fingerprint"`
 	Mode        string      `json:"mode"`
 	Permissions Permissions `json:"permissions"`
+	// Alias is a purely local display name the person sets for this peer. It is
+	// persisted with the entry but is NEVER sent to the peer (nor announced);
+	// Name stays the peer's broadcast name. Clearing it reverts to Name, and an
+	// unpair (or a fresh re-pair) drops it.
+	Alias string `json:"alias,omitempty"`
 	// PeerPermissions is what the peer granted this device (the opposite
 	// direction from Permissions): it is what we may do on the peer, e.g.
 	// browse its shares or push files to it. It is recorded at pairing time
@@ -76,12 +230,15 @@ type Entry struct {
 	CreatedAt       time.Time   `json:"created_at"`
 }
 
-// Access is the authorization decision for a peer certificate.
+// Access is the authorization decision for a peer certificate. Each action
+// carries its tri-state Permission; callers distinguish Allow (silent) from Ask
+// (prompt) and Never (refuse).
 type Access struct {
 	Paired       bool
 	DeviceID     string
-	Browse       bool
-	Push         bool
+	Browse       Permission
+	Push         Permission
+	Text         Permission
 	MaxPushBytes int64
 	AskOver      int64 // paired peers: ask a person before accepting pushes larger than this (0 = never)
 	SessionID    string
@@ -306,7 +463,9 @@ func (s *Store) SetOnIncoming(fn func(*Session)) {
 	s.mu.Unlock()
 }
 
-// Load restores paired entries from config.
+// Load restores paired entries from config. Entries saved before tri-state
+// permissions are migrated: the legacy boolean had no Ask state, so every
+// non-Allow permission becomes the new default Ask.
 func (s *Store) Load() error {
 	raw := s.cfg.Get().Trust
 	if len(raw) == 0 {
@@ -316,12 +475,34 @@ func (s *Store) Load() error {
 	if err := json.Unmarshal(raw, &entries); err != nil {
 		return fmt.Errorf("trust: %w", err)
 	}
+	migrated := false
 	s.mu.Lock()
 	for _, e := range entries {
+		if !e.Permissions.triState {
+			e.Permissions = migrateLegacy(e.Permissions)
+			e.Permissions.triState = true
+			migrated = true
+		}
+		if !e.PeerPermissions.triState && peerGrantSet(e.PeerPermissions) {
+			e.PeerPermissions = migrateLegacy(e.PeerPermissions)
+			e.PeerPermissions.triState = true
+			migrated = true
+		}
 		s.paired[e.Fingerprint] = e
 	}
 	s.mu.Unlock()
+	if migrated {
+		// Write the migrated store straight back so the upgrade happens once.
+		s.persist()
+	}
 	return nil
+}
+
+// peerGrantSet reports whether a peer grant was recorded at all. An older
+// pairing did not record one, leaving the zero value; migrating that to Ask
+// would invent a grant the peer never made.
+func peerGrantSet(p Permissions) bool {
+	return p.Browse != "" || p.Push != "" || p.Text != "" || p.PushMaxBytes != 0 || p.AskOver != 0
 }
 
 func (s *Store) persist() {
@@ -362,6 +543,39 @@ func (s *Store) Entry(fp string) (Entry, bool) {
 		return Entry{}, false
 	}
 	return *e, true
+}
+
+// DisplayName is the local alias when one is set, otherwise the peer's
+// broadcast name. Callers use it for every person-facing surface (lists,
+// transfers, notifications, logs); the broadcast name itself is never changed
+// by setting an alias.
+func (e Entry) DisplayName() string {
+	if a := strings.TrimSpace(e.Alias); a != "" {
+		return a
+	}
+	return e.Name
+}
+
+// SetAlias sets or clears the local alias for a paired device. It is local
+// only: the alias is never sent to the peer. An empty alias clears it, so the
+// display reverts to the broadcast name. It reports whether the device was
+// paired. Clearing and setting are no-ops when the value is unchanged.
+func (s *Store) SetAlias(fp, alias string) bool {
+	alias = strings.TrimSpace(alias)
+	s.mu.Lock()
+	e, ok := s.paired[fp]
+	if !ok {
+		s.mu.Unlock()
+		return false
+	}
+	changed := e.Alias != alias
+	e.Alias = alias
+	s.mu.Unlock()
+	if changed {
+		s.persist()
+		s.onChange()
+	}
+	return true
 }
 
 // SetPeerAddr remembers the last address a paired device answered at, so the
@@ -597,7 +811,7 @@ func (s *Store) Access(fp string) Access {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if e, ok := s.paired[fp]; ok {
-		return Access{Paired: true, DeviceID: e.DeviceID, Browse: e.Permissions.Browse, Push: e.Permissions.Push, MaxPushBytes: e.Permissions.PushMaxBytes, AskOver: e.Permissions.AskOver}
+		return Access{Paired: true, DeviceID: e.DeviceID, Browse: e.Permissions.Browse, Push: e.Permissions.Push, Text: e.Permissions.Text, MaxPushBytes: e.Permissions.PushMaxBytes, AskOver: e.Permissions.AskOver}
 	}
 	if sess := s.activeLocked(fp); sess != nil {
 		sess.UpdatedAt = time.Now()
@@ -605,7 +819,7 @@ func (s *Store) Access(fp string) Access {
 		for _, id := range sess.Offers {
 			offered[id] = true
 		}
-		return Access{Browse: true, SessionID: sess.ID, Offered: offered}
+		return Access{Browse: Allow, Push: Allow, Text: Allow, SessionID: sess.ID, Offered: offered}
 	}
 	return Access{}
 }
@@ -928,13 +1142,18 @@ func (s *Store) SetStatus(id, status, errMsg string) bool {
 
 // permString renders granted permissions compactly for the log.
 func permString(p Permissions) string {
-	parts := make([]string, 0, 2)
-	if p.Browse {
-		parts = append(parts, "browse")
+	parts := make([]string, 0, 3)
+	add := func(name string, v Permission) {
+		switch v {
+		case Allow:
+			parts = append(parts, name)
+		case Ask:
+			parts = append(parts, name+"?")
+		}
 	}
-	if p.Push {
-		parts = append(parts, "push")
-	}
+	add("browse", p.Browse)
+	add("push", p.Push)
+	add("text", p.Text)
 	if len(parts) == 0 {
 		return "none"
 	}

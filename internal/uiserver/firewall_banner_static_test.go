@@ -21,7 +21,8 @@ func stripLineComments(s string) string {
 // The firewall banner must be dismissible for this session only. Its dismissal
 // state lives in a plain JS variable and the banner block must never touch
 // localStorage/sessionStorage, so the warning reappears on the next launch.
-// The Copy button must carry the ufw commands.
+// The Copy button must carry commands generated from the configured ports, not
+// a hard-coded default.
 func TestAppJSFirewallBannerInMemoryDismissAndCopyCommands(t *testing.T) {
 	src, err := os.ReadFile("web/app.js")
 	if err != nil {
@@ -47,9 +48,11 @@ func TestAppJSFirewallBannerInMemoryDismissAndCopyCommands(t *testing.T) {
 	for _, want := range []string{
 		"let firewallBannerDismissed = false;",
 		"firewallBannerDismissed = true;",
-		"sudo ufw allow 47800/tcp",
-		"sudo ufw allow 47801/udp",
+		"function firewallCommands(peerPort, beaconPort)",
+		"sudo ufw allow ${peer}/tcp",
+		"sudo ufw allow ${beacon}/udp",
 		"sudo ufw allow 5353/udp",
+		"firewallCopyCommands = firewallCommands(port, beaconPort);",
 		"loadFirewallBanner();",
 	} {
 		if !strings.Contains(js, want) {

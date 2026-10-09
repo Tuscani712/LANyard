@@ -243,7 +243,7 @@ func TestRecordReceiveCancelledAddsCancelledHistory(t *testing.T) {
 func pairSenderForPush(r *pushRig) {
 	r.trR.Pair(trust.Entry{
 		DeviceID: r.sendID.DeviceID, Name: "Sender PC", Fingerprint: r.sendID.DeviceID,
-		Mode: trust.ModePair, Permissions: trust.Permissions{Push: true},
+		Mode: trust.ModePair, Permissions: trust.Permissions{Push: trust.Allow},
 	})
 }
 

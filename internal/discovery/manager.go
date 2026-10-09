@@ -9,6 +9,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/libp2p/zeroconf/v2"
+
+	"lanyard/internal/config"
 	"lanyard/internal/identity"
 	"lanyard/internal/xferlog"
 )
@@ -45,6 +48,14 @@ type Manager struct {
 	probeTimeout time.Duration
 	evictAfter   int
 
+	// beaconPort is the UDP port the fallback beacon broadcasts on. It is
+	// configurable (Settings › Network & Discovery › Advanced) and every device
+	// on the network must use the same value for fallback discovery to work.
+	beaconPort int
+	// beaconProbe, when the beacon is running, sends an immediate probe so
+	// peers re-query us after our advertised port changes. Nil before Start.
+	beaconProbe func()
+
 	pairedMu     sync.Mutex
 	pairedProbed map[string]time.Time
 	pairedEvery  time.Duration
@@ -75,6 +86,7 @@ func New(self Announcement, selfFullID string, probe Prober, log *slog.Logger) *
 		self: self, selfID: selfFullID, probe: probe, reg: newRegistry(), log: log,
 		probeTimeout: defaultProbeTimeout,
 		evictAfter:   defaultEvictAfter,
+		beaconPort:   config.DefaultBeaconPort,
 		pairedProbed: map[string]time.Time{},
 		pairedEvery:  defaultPairedProbeEvery,
 		now:          time.Now,
@@ -139,10 +151,74 @@ func (m *Manager) selfAnn() Announcement {
 func (m *Manager) SetIdentity(name, label string) {
 	m.selfMu.Lock()
 	m.self.Name, m.self.DeviceLabel = name, label
+	mdns := m.mdns
 	m.selfMu.Unlock()
-	if m.mdns != nil && m.mdns.server != nil {
-		m.mdns.server.SetText(m.txtRecords())
+	if mdns != nil {
+		mdns.setText(m.txtRecords())
 	}
+}
+
+// SetBeaconPort overrides the UDP port the fallback beacon uses. Ports outside
+// 1024-65535 are ignored. It only takes effect for a beacon started afterwards;
+// the manager is normally constructed with the configured port before Start.
+func (m *Manager) SetBeaconPort(port int) {
+	if port < 1024 || port > 65535 {
+		return
+	}
+	m.selfMu.Lock()
+	m.beaconPort = port
+	m.selfMu.Unlock()
+}
+
+// BeaconPort returns the UDP port the fallback beacon uses.
+func (m *Manager) BeaconPort() int {
+	m.selfMu.RLock()
+	defer m.selfMu.RUnlock()
+	return m.beaconPort
+}
+
+// SetPort updates the peer TCP port we advertise and re-announces it: mDNS is
+// re-registered with the new SRV port and a beacon probe is sent so peers
+// re-query us immediately. It is how a changed peer port takes effect without
+// restarting discovery. A port outside 1024-65535 is ignored.
+func (m *Manager) SetPort(port int) {
+	if port < 1024 || port > 65535 {
+		return
+	}
+	m.selfMu.Lock()
+	changed := m.self.Port != port
+	m.self.Port = port
+	mdns := m.mdns
+	m.selfMu.Unlock()
+	if !changed || mdns == nil {
+		return
+	}
+	m.reannounceMDNS(mdns)
+	m.sendBeaconProbe()
+}
+
+// sendBeaconProbe asks listeners to answer immediately, if the beacon runs.
+func (m *Manager) sendBeaconProbe() {
+	m.selfMu.RLock()
+	fn := m.beaconProbe
+	m.selfMu.RUnlock()
+	if fn != nil {
+		fn()
+	}
+}
+
+// reannounceMDNS replaces the running mDNS registration with one advertising
+// the current port and text (zeroconf fixes the port at Register time).
+func (m *Manager) reannounceMDNS(node *mdnsNode) {
+	if s := node.getServer(); s != nil {
+		s.Shutdown()
+	}
+	srv, err := zeroconf.Register(m.self.ShortID, mdnsService, mdnsDomain, m.selfAnn().Port, m.txtRecords(), nil)
+	if err != nil {
+		m.log.Warn("mDNS re-announce unavailable", "err", err)
+		return
+	}
+	node.setServer(srv)
 }
 
 func (m *Manager) Peers() []Peer                        { return m.reg.list() }
@@ -158,8 +234,11 @@ func (m *Manager) Start(ctx context.Context) {
 }
 
 func (m *Manager) Stop() {
-	if m.mdns != nil {
-		m.mdns.stop()
+	m.selfMu.RLock()
+	mdns := m.mdns
+	m.selfMu.RUnlock()
+	if mdns != nil {
+		mdns.stop()
 	}
 	m.wg.Wait()
 }

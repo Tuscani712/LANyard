@@ -226,6 +226,43 @@ function fmtSpeed(mbps) {
   return fmtRate(mbps * 1e6, settings.speed_unit === "mbps");
 }
 // ---- end speed formatting ----
+// ---- device action gating (extracted verbatim by device_actions_static_test.go) ----
+// deviceActions decides the device page's controls: their canonical order,
+// section, label, enabled state and the reason shown when disabled. It is pure
+// (no DOM) so the decision can be pinned by a static test, and it is the single
+// source of truth the page renders from. opts:
+// { paired, session, online, allowsPush, allowsBrowse, allowsText, mounts }.
+function deviceActions(opts) {
+  opts = opts || {};
+  const offlineReason = "This device is offline.";
+  const pushReason = "This device did not allow you to send files to it.";
+  const browseReason = "This device did not allow you to browse its shares.";
+  const textReason = "This device did not allow you to send text to it.";
+  const sendReason = !opts.online ? offlineReason : (opts.allowsPush === false ? pushReason : "");
+  const browse = !opts.online ? offlineReason : (opts.allowsBrowse === false ? browseReason : "");
+  const text = !opts.online ? offlineReason : (opts.allowsText === false ? textReason : "");
+  const send = (key, label, reason) => ({ key, label, section: "Send", enabled: !reason, reason });
+  const actions = [];
+  if (opts.paired || opts.session) {
+    actions.push(send("send-files", "Send files\u2026", sendReason));
+    actions.push(send("send-folder", "Send folder\u2026", sendReason));
+    actions.push(send("send-text", "Send text", text));
+    actions.push({ key: "browse-shares", label: "Browse their shares", section: "Send", enabled: !browse, reason: browse });
+  }
+  const manage = [];
+  if (opts.session) manage.push({ key: "disconnect", label: "Disconnect", section: "Manage", enabled: true, reason: "" });
+  if (opts.paired) {
+    if (opts.mounts !== false) manage.push({ key: "mount", label: "Mount as drive", section: "Manage", enabled: true, reason: "" });
+    manage.push({ key: "rename", label: "Rename\u2026", section: "Manage", enabled: true, reason: "" });
+    manage.push({ key: "unpair", label: "Unpair this device", section: "Manage", enabled: true, reason: "" });
+  } else if (!opts.session) {
+    const r = opts.online ? "" : offlineReason;
+    manage.push({ key: "connect", label: "Connect", section: "Manage", enabled: !!opts.online, reason: r });
+    manage.push({ key: "pair", label: "Pair", section: "Manage", enabled: !!opts.online, reason: r });
+  }
+  return actions.concat(manage);
+}
+// ---- end device action gating ----
 function fmtETA(sec) {
   if (!sec || sec <= 0) return "--";
   const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = Math.floor(sec % 60);
@@ -346,6 +383,9 @@ function smallDeviceIcon(os, size) {
 
 // ---------- state ----------
 let settings = { speed_unit: "mbs", sound_on_complete: false, notifications: true, theme: "dark", default_download_folder: "" };
+// mountsSupported mirrors /api/self; false hides the desktop-only "Mount as
+// drive" control on platforms where serving a device as a drive is unavailable.
+let mountsSupported = true;
 // Online means the device answered a recent check (discovery probes every few
 // seconds). A paired device that stops answering stays listed as Offline.
 const seenAt = (() => { try { return JSON.parse(localStorage.getItem("lanyard.seen") || "{}"); } catch (e) { return {}; } })();
@@ -360,6 +400,7 @@ function knownDevices() {
     const fp = e.cert_fingerprint || e.device_id;
     if (!out.some((d) => d.device_id === fp)) out.push({ device_id: fp, name: e.name, os: "", online: false });
   }
+  for (const d of out) d.name = displayName(d.device_id, d.name);
   return out;
 }
 let peers = [], trustList = [], sessions = [], sharesList = [], transfersList = [], approvalsList = [], mountsList = [];
@@ -384,12 +425,67 @@ function pairedEntry(fp) { return trustList.find((e) => e.cert_fingerprint === f
 // server's trust.Access rule). A Pair-mode session that is merely "accepted" is
 // still a handshake in progress and must never read as "Connected".
 function activeSession(fp) { return sessions.find((s) => s.peer_fp === fp && s.mode === "connect" && (s.status === "active" || s.status === "accepted")) || null; }
-// What a paired peer allows us to do on it (its narrowed grant). Absent for
-// older pairings, where we keep the previous behaviour and allow the action.
-function peerAllowsPush(entry) { const pg = entry && entry.peer_permissions; return !pg || pg.push !== false; }
+// permMode resolves one action's tri-state ("allow"|"ask"|"never") from a
+// permission object. The server publishes the mode string; a legacy boolean
+// (true=allow, false=never) is the fallback, and an absent field returns null so
+// callers keep the previous permissive behaviour for an older pairing.
+function permMode(p, key) {
+  if (!p) return null;
+  const m = p[key + "_mode"];
+  if (m === "allow" || m === "ask" || m === "never") return m;
+  if (p[key] === true) return "allow";
+  if (p[key] === false) return "never";
+  return null;
+}
+// A peer may reach us for an action unless it is explicitly Never (Ask is
+// reachable, it just prompts its person first).
+function permReachable(m) { return m === null || m === "allow" || m === "ask"; }
+function peerAllowsPush(entry) { return permReachable(permMode(entry && entry.peer_permissions, "push")); }
+function peerAllowsBrowse(entry) { return permReachable(permMode(entry && entry.peer_permissions, "browse")); }
+function peerAllowsText(entry) { return permReachable(permMode(entry && entry.peer_permissions, "text")); }
+// permPhrase renders a tri-state for display.
+function permPhrase(m) {
+  return m === "ask" ? "ask first" : m === "never" ? "no" : m === "allow" ? "yes" : "yes";
+}
+// The name a person sees for a device: the local alias when one is set,
+// otherwise the caller's fallback (the broadcast name), otherwise a pretty
+// fingerprint. peer.name itself is never mutated: the broadcast name stays the
+// network identity even when an alias is shown.
+function displayName(fp, fallback) {
+  const e = fp ? pairedEntry(fp) : null;
+  if (e && e.alias) return e.alias;
+  return fallback || (fp ? prettyId(fp) : "");
+}
+// What a paired device may do to us ("they may"), from our own grant.
+function permissionsText(p) {
+  p = p || {};
+  const bits = [
+    "browse: " + permPhrase(permMode(p, "browse")),
+    "send files: " + permPhrase(permMode(p, "push")),
+    "send text: " + permPhrase(permMode(p, "text")),
+  ];
+  if (p.ask_over) bits.push(`ask over ${Math.round(p.ask_over / 1048576)} MB`);
+  if (p.push_max_bytes) bits.push(`up to ${Math.round(p.push_max_bytes / 1048576)} MB`);
+  return bits.join(" \u00b7 ");
+}
+// The address we last knew for a device: the live discovery address when it is
+// online, otherwise the last address the trust store remembered.
+function deviceAddress(fp) {
+  const p = peers.find((x) => x.device_id === fp);
+  if (p && p.addrs && p.addrs.length) return p.addrs[0] + (p.port ? ":" + p.port : "");
+  const e = pairedEntry(fp);
+  if (e && e.addrs && e.addrs.length) return e.addrs[0] + (e.port ? ":" + e.port : "");
+  return "";
+}
+// What the peer allows us to do on it ("they allow me"), read-only, from the
+// grant it recorded at pairing time.
 function peerGrantText(p) {
   p = p || {};
-  const bits = [p.browse ? "browse" : "no browse", p.push ? "push" : "no push"];
+  const bits = [
+    "browse: " + permPhrase(permMode(p, "browse")),
+    "send files: " + permPhrase(permMode(p, "push")),
+    "send text: " + permPhrase(permMode(p, "text")),
+  ];
   if (p.ask_over) bits.push(`asks over ${Math.round(p.ask_over / 1048576)} MB`);
   if (p.push_max_bytes) bits.push(`up to ${Math.round(p.push_max_bytes / 1048576)} MB`);
   return bits.join(" \u00b7 ");
@@ -807,67 +903,90 @@ function renderFolder(body, p) {
 }
 
 // -- device detail --
+// Sections, in order: header, Send, Their shares, Permissions, Manage.
 function renderDevice(body, p) {
   const peer = peers.find((x) => x.device_id === p.device) || { name: p.name, os: "", device_id: p.device };
   const paired = pairedEntry(p.device);
   const session = activeSession(p.device);
   const online = isOnline(p.device);
+  const shown = displayName(p.device, peer.name || p.name || "(unnamed)");
+  const browseAsk = permMode(paired && paired.peer_permissions, "browse") === "ask";
+
+  // --- header: alias, broadcast name secondary, status/last-seen, address, ID ---
   const head = el("div", "row device-head");
   const main = el("div", "grow");
-  main.appendChild(el("div", "name", peer.name || "(unnamed)"));
+  main.appendChild(el("div", "name", shown));
+  if (paired && peer.name && peer.name !== shown) main.appendChild(el("div", "meta", "Device name: " + peer.name));
   const bits = [online ? "Online" : "Offline \u2014 " + lastSeenText(p.device), devKindName(devKind(peer.os)), paired ? "Paired" : session ? "Connected" : "Not paired"];
   if (peer.os) bits.push(peer.os);
   main.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
+  const addr = deviceAddress(p.device);
+  if (addr) main.appendChild(el("div", "meta", "Address: " + addr));
   main.appendChild(el("div", "meta", "ID " + prettyId(p.device)));
-  if (paired && paired.peer_permissions) main.appendChild(el("div", "meta", "They allow you to: " + peerGrantText(paired.peer_permissions)));
   head.appendChild(main);
-  const actions = el("div", "actions");
-  if (paired) {
-    const canPush = peerAllowsPush(paired);
-    const pf = btn("Push files\u2026", () => pushTo(p.device, peer.name));
-    const pd = btn("Push folder\u2026", () => pushTo(p.device, peer.name, true), "ghost");
-    if (!canPush) {
-      pf.disabled = pd.disabled = true;
-      pf.title = pd.title = "This device did not allow you to push to it.";
-    }
-    actions.appendChild(pf);
-    actions.appendChild(pd);
-    actions.appendChild(btn("Mount as drive", () => mountDevice(p.device, peer.name), "ghost"));
-    actions.appendChild(btn("Unpair this device", () => unpair(p.device, paired), "ghost"));
-  } else if (session) {
-    actions.appendChild(btn("Push files\u2026", () => pushTo(p.device, peer.name)));
-    actions.appendChild(btn("Push folder\u2026", () => pushTo(p.device, peer.name, true), "ghost"));
-    actions.appendChild(disconnectBtn(() => sessionAction(session.id, "close")));
-  } else {
-    actions.appendChild(btn("Connect", () => startPair(p.device, peer.name, "connect")));
-    actions.appendChild(btn("Pair", () => startPair(p.device, peer.name, "pair")));
-  }
-  head.appendChild(actions);
   body.appendChild(head);
 
+  const defs = deviceActions({
+    paired: !!paired, session: !!session, online,
+    allowsPush: peerAllowsPush(paired), allowsBrowse: peerAllowsBrowse(paired),
+    allowsText: peerAllowsText(paired), mounts: mountsSupported,
+  });
+  const handlers = {
+    "send-files": () => pushTo(p.device, shown),
+    "send-folder": () => pushTo(p.device, shown, true),
+    "send-text": () => { const t = document.getElementById("device-text"); if (t) t.focus(); },
+    "browse-shares": () => { const s = document.getElementById("device-shares"); if (s) s.scrollIntoView({ behavior: "smooth", block: "start" }); },
+    "mount": () => mountDevice(p.device, shown),
+    "rename": () => renameDevice(p.device, shown),
+    "unpair": () => unpair(p.device, paired),
+    "disconnect": () => sessionAction(session.id, "close"),
+    "connect": () => startPair(p.device, shown, "connect"),
+    "pair": () => startPair(p.device, shown, "pair"),
+  };
+  const section = (title, acts) => {
+    body.appendChild(el("div", "section-title", title));
+    const ab = el("div", "actions");
+    for (const a of acts) {
+      const b = btn(a.label, handlers[a.key] || (() => {}));
+      if (!a.enabled) { b.disabled = true; b.title = a.reason; }
+      ab.appendChild(b);
+    }
+    body.appendChild(ab);
+  };
+
+  // --- Send ---
+  const sendActs = defs.filter((a) => a.section === "Send");
+  if (sendActs.length) section("Send", sendActs);
   if (paired || session) {
-    body.appendChild(el("div", "section-title", "Send text"));
     const box = el("div", "form-row");
     const ta = document.createElement("textarea");
+    ta.id = "device-text";
     ta.rows = 3; ta.maxLength = 65536;
     ta.placeholder = "Type a short message or paste a link\u2026";
     ta.style.flex = "1 1 240px"; ta.style.minWidth = "0";
-    const send = btn("Send text", async () => {
+    const send = btn("Send", async () => {
       const text = ta.value;
       if (!text.trim()) { toast("Type something to send.", "err"); return; }
+      if (permMode(paired && paired.peer_permissions, "text") === "ask") toast("Waiting for approval on " + shown + "\u2026", "info");
       const r = await fetch("/api/snippet", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ device: p.device, text }) });
       if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
       ta.value = "";
-      toast("Text sent to " + (peer.name || "the device") + ".", "ok");
+      toast("Text sent to " + shown + ".", "ok");
     });
-    if (!online) send.title = "This device may be offline; the send will report if it cannot be reached.";
+    if (!online || !peerAllowsText(paired)) {
+      send.disabled = true;
+      send.title = !online ? "This device is offline." : "This device did not allow you to send text to it.";
+    }
     box.appendChild(ta); box.appendChild(send);
     body.appendChild(box);
   }
 
-  body.appendChild(el("div", "section-title", "Shared with you"));
+  // --- Their shares ---
+  const sharesTitle = el("div", "section-title", "Their shares");
+  sharesTitle.id = "device-shares";
+  body.appendChild(sharesTitle);
   const listBox = el("div", "stack");
-  listBox.appendChild(el("div", "empty", online ? "Loading shares\u2026" : "Checking this device\u2026"));
+  listBox.appendChild(el("div", "empty", browseAsk ? "Waiting for approval on " + shown + "\u2026" : online ? "Loading shares\u2026" : "Checking this device\u2026"));
   body.appendChild(listBox);
 
   fetch(`/api/remote/shares?device=${encodeURIComponent(p.device)}`)
@@ -887,9 +1006,9 @@ function renderDevice(body, p) {
         m.appendChild(el("div", "meta", mb.join(" \u00b7 ")));
         row.appendChild(m);
         const acts = el("div", "actions");
-        if (s.kind === "folder") acts.appendChild(btn("Open", () => navigate({ kind: "remote", device: p.device, name: peer.name, share: s.share_id, shareLabel: s.label, path: "" })));
-        acts.appendChild(btn("Download", () => downloadDialog(p.device, peer.name, s.share_id, s.label, [""]), "ghost"));
-        acts.appendChild(btn("Download to\u2026", () => downloadDialog(p.device, peer.name, s.share_id, s.label, [""], true), "ghost"));
+        if (s.kind === "folder") acts.appendChild(btn("Open", () => navigate({ kind: "remote", device: p.device, name: shown, share: s.share_id, shareLabel: s.label, path: "" })));
+        acts.appendChild(btn("Download", () => downloadDialog(p.device, shown, s.share_id, s.label, [""]), "ghost"));
+        acts.appendChild(btn("Download to\u2026", () => downloadDialog(p.device, shown, s.share_id, s.label, [""], true), "ghost"));
         row.appendChild(acts);
         listBox.appendChild(row);
       }
@@ -897,13 +1016,33 @@ function renderDevice(body, p) {
     .catch((err) => {
       clear(listBox);
       const box = el("div", "empty", peerErrorText(err, "Could not reach this device: "));
-      // A 403 means the other device dropped the pairing; the message already
-      // says "Not paired with this device", so offer to pair again right here.
+      // A 403 means the peer refused (a permission denial or a dropped
+      // pairing); the message says which, so offer to pair again right here.
       if (err && err.status === 403) {
-        box.appendChild(el("div", "actions")).appendChild(btn(paired ? "Pair again" : "Pair", () => startPair(p.device, peer.name, "pair")));
+        box.appendChild(el("div", "actions")).appendChild(btn(paired ? "Pair again" : "Pair", () => startPair(p.device, shown, "pair")));
       }
       listBox.appendChild(box);
     });
+
+  // --- Permissions: "They can" editable, "They allow me" read-only ---
+  if (paired) {
+    body.appendChild(el("div", "section-title", "Permissions"));
+    const pb = el("div", "stack");
+    const theyCan = el("div", "grow");
+    theyCan.appendChild(el("div", "name", "They can"));
+    theyCan.appendChild(el("div", "meta", permissionsText(paired.permissions)));
+    pb.appendChild(theyCan);
+    pb.appendChild(trustPermEditor(paired, () => { if (S.view === "devices") renderExplorer(); }));
+    const theyAllow = el("div", "grow");
+    theyAllow.appendChild(el("div", "name", "They allow me"));
+    theyAllow.appendChild(el("div", "meta", peerGrantText(paired.peer_permissions)));
+    pb.appendChild(theyAllow);
+    body.appendChild(pb);
+  }
+
+  // --- Manage ---
+  const manageActs = defs.filter((a) => a.section === "Manage");
+  if (manageActs.length) section("Manage", manageActs);
 }
 
 // -- everything other devices share with this one --
@@ -918,7 +1057,7 @@ function renderShared(body) {
   }
   for (const peer of list) {
     const sec = el("div", "stack");
-    sec.appendChild(el("div", "meta", peer.name || "(unnamed)"));
+    sec.appendChild(el("div", "meta", displayName(peer.device_id, peer.name || "(unnamed)")));
     const rows = el("div", "stack"); rows.appendChild(el("div", "empty", "Loading\u2026"));
     sec.appendChild(rows); box.appendChild(sec);
     fetch(`/api/remote/shares?device=${encodeURIComponent(peer.device_id)}`)
@@ -1013,12 +1152,12 @@ function shareTargets() {
   const out = [];
   for (const s of sessions) {
     if (s.status === "active" || s.status === "accepted") {
-      if (!out.find((x) => x.id === s.peer_fp)) out.push({ id: s.peer_fp, name: s.peer_name || prettyId(s.peer_fp), kind: "connected" });
+      if (!out.find((x) => x.id === s.peer_fp)) out.push({ id: s.peer_fp, name: displayName(s.peer_fp, s.peer_name || prettyId(s.peer_fp)), kind: "connected" });
     }
   }
   for (const e of trustList) {
     if (!out.find((x) => x.id === (e.cert_fingerprint || e.device_id))) {
-      out.push({ id: e.cert_fingerprint || e.device_id, name: e.name || prettyId(e.cert_fingerprint), kind: "paired" });
+      out.push({ id: e.cert_fingerprint || e.device_id, name: displayName(e.cert_fingerprint || e.device_id, e.name || prettyId(e.cert_fingerprint)), kind: "paired" });
     }
   }
   return out;
@@ -1067,14 +1206,15 @@ function folderMenu(path, name) {
 function peerMenu(p) {
   const paired = pairedEntry(p.device_id);
   const session = activeSession(p.device_id);
-  const items = [{ label: "Open", icon: "monitor", onClick: () => navigate({ kind: "device", device: p.device_id, name: p.name }) }];
+  const name = displayName(p.device_id, p.name);
+  const items = [{ label: "Open", icon: "monitor", onClick: () => navigate({ kind: "device", device: p.device_id, name }) }];
   if (paired || session) {
-    items.push({ label: "Push files\u2026", icon: "push", onClick: () => pushTo(p.device_id, p.name) });
+    items.push({ label: "Send files\u2026", icon: "push", onClick: () => pushTo(p.device_id, name) });
     if (paired) items.push({ label: "Unpair", icon: "x", onClick: () => unpair(p.device_id, paired) });
     else items.push({ label: "Disconnect session", icon: "x", onClick: () => sessionAction(session.id, "close") });
   } else {
-    items.push({ label: "Connect", icon: "link", onClick: () => startPair(p.device_id, p.name, "connect") });
-    items.push({ label: "Pair", icon: "link", onClick: () => startPair(p.device_id, p.name, "pair") });
+    items.push({ label: "Connect", icon: "link", onClick: () => startPair(p.device_id, name, "connect") });
+    items.push({ label: "Pair", icon: "link", onClick: () => startPair(p.device_id, name, "pair") });
   }
   return items;
 }
@@ -1124,21 +1264,21 @@ function renderPairedPage(force) {
     const p = e.permissions || {};
     const row = el("div", "row");
     const m = el("div", "grow");
-    m.appendChild(el("div", "name", e.name || e.device_id || "device"));
-    const bits = [p.browse ? "can browse" : "no browse", p.push ? "can push" : "no push"];
-    if (p.ask_over) bits.push(`asks over ${Math.round(p.ask_over / 1048576)} MB`);
-    if (p.push_max_bytes) bits.push(`max ${Math.round(p.push_max_bytes / 1048576)} MB`);
-    m.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
-    if (e.peer_permissions) m.appendChild(el("div", "meta", "They allow you to: " + peerGrantText(e.peer_permissions)));
-    m.appendChild(el("div", "meta", "ID " + prettyId(e.cert_fingerprint || e.device_id)));
     const fpE = e.cert_fingerprint || e.device_id, onE = isOnline(fpE);
+    const nameE = displayName(fpE, e.name || e.device_id || "device");
+    m.appendChild(el("div", "name", nameE));
+    if (e.alias && e.name && e.name !== nameE) m.appendChild(el("div", "meta", "Device name: " + e.name));
+    m.appendChild(el("div", "meta", permissionsText(p)));
+    if (e.peer_permissions && Object.keys(e.peer_permissions).length) m.appendChild(el("div", "meta", "They allow me: " + peerGrantText(e.peer_permissions)));
+    m.appendChild(el("div", "meta", "ID " + prettyId(fpE)));
     const stE = el("div", "status" + (onE ? "" : " off")); stE.appendChild(el("span", "dot" + (onE ? "" : " off")));
     stE.appendChild(el("span", null, onE ? "Online" : "Offline \u2014 " + lastSeenText(fpE)));
     m.appendChild(stE);
     row.appendChild(m);
     const acts = el("div", "actions");
-    const pushBtn = btn("Push files\u2026", () => pushTo(fpE, e.name), "ghost");
-    if (!peerAllowsPush(e)) { pushBtn.disabled = true; pushBtn.title = "This device did not allow you to push to it."; }
+    const pushBtn = btn("Send files\u2026", () => pushTo(fpE, nameE), "ghost");
+    if (!onE) { pushBtn.disabled = true; pushBtn.title = "This device is offline."; }
+    else if (!peerAllowsPush(e)) { pushBtn.disabled = true; pushBtn.title = "This device did not allow you to push to it."; }
     acts.appendChild(pushBtn);
     acts.appendChild(btn("Unpair", () => unpair(e.cert_fingerprint || e.device_id, e), "ghost"));
     row.appendChild(acts);
@@ -1303,7 +1443,7 @@ function renderTransfersPage(force) {
     row.appendChild(meta);
     if (t.note && t.state !== "Done") row.appendChild(el("div", "meta", t.note));
     if (t.error) row.appendChild(el("div", "msg err", t.error));
-    if (t.peer_name) row.appendChild(el("div", "meta", (t.direction === "download" ? "from " : "to ") + t.peer_name));
+    if (t.peer_name) row.appendChild(el("div", "meta", (t.direction === "download" ? "from " : "to ") + displayName(t.peer_id, t.peer_name)));
 
     const acts = el("div", "actions");
     if (t.state === "Paused" || t.state === "Failed" || t.state === "Waiting for peer") {
@@ -1351,7 +1491,7 @@ function renderTransfersPage(force) {
       const meta = el("div", "meta");
       meta.textContent = `${fmtBytes(t.total)} \u00b7 ${n} file${n === 1 ? "" : "s"}` +
         (t.avg_speed_mbps > 0 ? ` \u00b7 ${fmtSpeed(t.avg_speed_mbps)} avg` : "") +
-        (t.peer_name ? ` \u00b7 ${t.direction === "push" ? "to " : "from "}${t.peer_name}` : "") +
+        (t.peer_name ? ` \u00b7 ${t.direction === "push" ? "to " : "from "}${displayName(t.peer_id, t.peer_name)}` : "") +
         (t.finished_at ? ` \u00b7 ${fmtWhen(t.finished_at)}` : "");
       row.appendChild(meta);
       if (t.note) row.appendChild(el("div", "meta", t.note));
@@ -1438,12 +1578,12 @@ function renderSettingsTabs(s) {
 }
 // settingsFooter adds a per-tab message node (id "set-msg-<tab>") that a save
 // writes to *after* re-rendering, so "Saved." lands in a node that is live.
-function settingsFooter(pane, tab, extras) {
+function settingsFooter(pane, tab, extras, label) {
   const msg = el("div", "msg err", "");
   msg.hidden = true; msg.id = "set-msg-" + tab;
   pane.appendChild(msg);
   const acts = el("div", "actions");
-  acts.appendChild(btn("Save", saveSettings));
+  acts.appendChild(btn(label || "Save", saveSettings));
   for (const b of (extras || [])) acts.appendChild(b);
   pane.appendChild(acts);
 }
@@ -1494,9 +1634,16 @@ function renderSettingsReceiving(pane, s) {
 }
 function renderSettingsNetwork(pane, s) {
   const port = numberInput(s.peer_port || 47800, "set-port");
+  port.min = "1024"; port.max = "65535";
   pane.appendChild(el("p", "muted", "How this device is found and reached on the local network."));
-  pane.appendChild(settingsField("Peer port (restart to apply)", port));
-  settingsFooter(pane, "network");
+  pane.appendChild(settingsField("Peer port", port));
+  if (s.peer_port_fallback_notice) pane.appendChild(el("p", "msg err", s.peer_port_fallback_notice));
+  pane.appendChild(el("div", "section-title", "Advanced"));
+  const beacon = numberInput(s.beacon_port || 47801, "set-beacon");
+  beacon.min = "1024"; beacon.max = "65535";
+  pane.appendChild(settingsField("Beacon port (UDP)", beacon));
+  pane.appendChild(el("p", "muted", "Fallback discovery when multicast is blocked. Every device must use the same beacon port, or fallback discovery stops working between them. Takes effect on the next start."));
+  settingsFooter(pane, "network", null, "Apply");
 }
 function renderSettingsNotifications(pane, s) {
   const sound = checkInput(s.sound_on_complete, "set-sound");
@@ -1514,31 +1661,15 @@ function renderSettingsPairing(pane, s) {
       const p = e.permissions || {};
       const row = el("div", "row");
       const m = el("div", "grow");
-      m.appendChild(el("div", "name", e.name || e.device_id || "device"));
-      const bits = [p.browse ? "can browse" : "no browse", p.push ? "can push" : "no push"];
-      if (p.ask_over) bits.push(`asks over ${Math.round(p.ask_over / 1048576)} MB`);
-      if (p.push_max_bytes) bits.push(`max ${Math.round(p.push_max_bytes / 1048576)} MB`);
-      m.appendChild(el("div", "meta", bits.join(" \u00b7 ")));
-      if (e.peer_permissions) m.appendChild(el("div", "meta", "They allow you to: " + peerGrantText(e.peer_permissions)));
+      m.appendChild(el("div", "name", displayName(e.cert_fingerprint || e.device_id, e.name || e.device_id || "device")));
+      m.appendChild(el("div", "meta", permissionsText(p)));
+      if (e.peer_permissions && Object.keys(e.peer_permissions).length) {
+        m.appendChild(el("div", "meta", "They allow me: " + peerGrantText(e.peer_permissions)));
+      }
       row.appendChild(m);
       const acts2 = el("div", "actions");
-      const browse = checkRow("Let them browse and pull my shares", !!p.browse);
-      const push = checkRow("Let them push files to my Inbox", !!p.push);
-      const ask = numberRow("Ask for files larger than (MB, 0 = never)", Math.round((p.ask_over || 0) / 1048576));
-      const max = numberRow("Maximum push size (MB, 0 = no limit)", Math.round((p.push_max_bytes || 0) / 1048576));
       const editor = el("div", "row col"); editor.hidden = true;
-      editor.appendChild(browse); editor.appendChild(push); editor.appendChild(ask); editor.appendChild(max);
-      editor.appendChild(btn("Save permissions", async () => {
-        const b = {
-          browse: browse.querySelector("input").checked,
-          push: push.querySelector("input").checked,
-          ask_over: (parseInt(ask.querySelector("input").value || "0", 10) || 0) * 1048576,
-          push_max_bytes: (parseInt(max.querySelector("input").value || "0", 10) || 0) * 1048576,
-        };
-        const rr = await fetch(`/api/trust/${encodeURIComponent(e.cert_fingerprint)}/permissions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
-        if (!rr.ok) { toast((await rr.text()).trim(), "err"); return; }
-        openSettings();
-      }));
+      editor.appendChild(trustPermEditor(e, openSettings));
       acts2.appendChild(btn("Edit", () => { editor.hidden = !editor.hidden; }, "ghost"));
       acts2.appendChild(btn("Unpair", () => unpair(e.cert_fingerprint, e), "ghost"));
       row.appendChild(acts2);
@@ -1591,6 +1722,48 @@ function checkInput(checked, id) { const i = el("input"); i.type = "checkbox"; i
 function checkRow(label, checked) { const w = el("label", "toggle"); w.appendChild(checkInput(checked)); w.appendChild(el("span", null, label)); return w; }
 function numberRow(label, value) { const w = el("label", "toggle"); w.appendChild(el("span", null, label)); const i = el("input"); i.type = "number"; i.min = "0"; i.value = value; w.appendChild(i); return w; }
 
+// permSelect is a tri-state control for one action: Allow / Ask / Never.
+function permSelect(value) {
+  const sel = document.createElement("select");
+  for (const [v, t] of [["allow", "Allow without asking"], ["ask", "Ask each time"], ["never", "Never"]]) {
+    const o = document.createElement("option"); o.value = v; o.textContent = t;
+    if ((value || "ask") === v) o.selected = true;
+    sel.appendChild(o);
+  }
+  return sel;
+}
+
+// trustPermEditor is the editable "They can:" block for a paired device: a
+// tri-state control per action plus the size limits, saving to the same
+// /permissions endpoint the Settings tab uses. Shared by the device page and
+// Settings so both edit the one trust store.
+function trustPermEditor(e, onSaved) {
+  const fp = e.cert_fingerprint || e.device_id;
+  const p = e.permissions || {};
+  const wrap = el("div", "row col");
+  const browse = permSelect(permMode(p, "browse") || "ask");
+  const push = permSelect(permMode(p, "push") || "ask");
+  const text = permSelect(permMode(p, "text") || "ask");
+  wrap.appendChild(settingsField("Browse / pull my shares", browse));
+  wrap.appendChild(settingsField("Send files to my Inbox", push));
+  wrap.appendChild(settingsField("Send messages to me", text));
+  const ask = numberRow("Ask for files larger than (MB, 0 = never)", Math.round((p.ask_over || 0) / 1048576));
+  const max = numberRow("Maximum push size (MB, 0 = no limit)", Math.round((p.push_max_bytes || 0) / 1048576));
+  wrap.appendChild(ask); wrap.appendChild(max);
+  wrap.appendChild(btn("Save permissions", async () => {
+    const b = {
+      browse: browse.value, push: push.value, text: text.value,
+      ask_over: (parseInt(ask.querySelector("input").value || "0", 10) || 0) * 1048576,
+      push_max_bytes: (parseInt(max.querySelector("input").value || "0", 10) || 0) * 1048576,
+    };
+    const r = await fetch(`/api/trust/${encodeURIComponent(fp)}/permissions`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
+    if (!r.ok) { toast((await r.text()).trim(), "err"); return; }
+    toast("Permissions updated.", "ok");
+    if (onSaved) onSaved();
+  }));
+  return wrap;
+}
+
 async function checkForUpdates() {
   const res = $("set-upd-result");
   if (!res) return;
@@ -1632,6 +1805,7 @@ async function saveSettings() {
     inbox_folder: gv("set-inbox", settings.inbox_folder || ""),
     bandwidth_limit_mbps: gn("set-bw", settings.bandwidth_limit_mbps),
     peer_port: gn("set-port", settings.peer_port || 47800),
+    beacon_port: gn("set-beacon", settings.beacon_port || 47801),
     update_url: gv("set-update-url", settings.update_url || ""),
     auto_update: gc("set-auto-update", settings.auto_update),
   };
@@ -1660,7 +1834,10 @@ async function cancelAllShares() {
 }
 
 // ---------- pairing / sessions ----------
-let pairView = null, pairPerms = { browse: true, push: false }, pairKeep = false, qrTimer = null;
+// pairPerms is tri-state. The pairing checkboxes are Allow when ticked and Ask
+// when unticked (the new default); "Never" is only settable afterwards from the
+// device page or Settings.
+let pairView = null, pairPerms = { browse: "ask", push: "ask", text: "ask" }, pairKeep = false, qrTimer = null;
 const sessionMemo = {};        // id -> last status seen (drives transition toasts)
 const autoOpened = new Set();  // incoming ids we auto-surfaced once
 const dismissed = new Set();   // ids the user closed/rejected (do not auto-reopen)
@@ -1668,7 +1845,7 @@ const dismissed = new Set();   // ids the user closed/rejected (do not auto-reop
 function whoOf(s) { return s.peer_name || prettyId(s.peer_fp) || s.peer_device || "device"; }
 
 function startPair(deviceId, name, mode) {
-  pairPerms = { browse: true, push: false }; pairKeep = false;
+  pairPerms = { browse: "ask", push: "ask", text: "ask" }; pairKeep = false;
   if (mode === "pair") { pairView = { setup: true, mode, peer_fp: deviceId, peer_name: name }; $("pair").hidden = false; renderPair(); return; }
   sendPairRequest(deviceId, name, mode);
 }
@@ -1701,8 +1878,9 @@ function renderPair(force) {
   $("pair-title").textContent = (v.mode === "pair" ? "Pair with " : "Connect to ") + who;
   if (v.setup) {
     body.appendChild(el("p", "muted", "Choose what " + who + " may do on this device."));
-    body.appendChild(permToggle("browse", "Let them browse and pull my shares", pairPerms.browse));
-    body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push));
+    body.appendChild(permToggle("browse", "Let them browse and pull my shares", pairPerms.browse === "allow"));
+    body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push === "allow"));
+    body.appendChild(permToggle("text", "Let them send messages to me", pairPerms.text === "allow"));
     if (v.error) body.appendChild(el("div", "msg err", v.error));
     body.appendChild(el("div", "actions", "")).appendChild(btn("Send request", () => sendPairRequest(v.peer_fp, who, v.mode)));
     return true;
@@ -1727,7 +1905,11 @@ function renderPair(force) {
     status.textContent = v.via_qr
       ? who + " wants to pair via QR code. Their fingerprint was pinned when they scanned your code."
       : who + " wants to " + action + ". Confirm the code matches before accepting.";
-    if (v.mode === "pair") { body.appendChild(permToggle("browse", "Let them browse and pull my shares", pairPerms.browse)); body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push)); }
+    if (v.mode === "pair") {
+      body.appendChild(permToggle("browse", "Let them browse and pull my shares", pairPerms.browse === "allow"));
+      body.appendChild(permToggle("push", "Let them push files to my Inbox", pairPerms.push === "allow"));
+      body.appendChild(permToggle("text", "Let them send messages to me", pairPerms.text === "allow"));
+    }
     actions.appendChild(btn("Accept", () => acceptSession(v.id)));
     actions.appendChild(btn("Reject", () => sessionAction(v.id, "reject"), "ghost"));
   } else if (v.incoming && v.status === "accepted") {
@@ -1864,7 +2046,7 @@ function parsePairLink(uri) {
 async function pairWithLink(uri) {
   const p = parsePairLink(uri);
   if (!p || !p.fp || !p.n || !p.addrs.length) { toast("That is not a valid pairing link.", "err"); return; }
-  pairPerms = { browse: true, push: false }; pairKeep = false;
+  pairPerms = { browse: "ask", push: "ask", text: "ask" }; pairKeep = false;
   let ok = false, lastErr = "", lastStatus = 0;
   for (const a of p.addrs) {
     const r = await fetch("/api/peers/add", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ address: a, fingerprint: p.fp }) });
@@ -1881,11 +2063,19 @@ async function pairWithLink(uri) {
   pollSessions();
 }
 
+// permToggle is a pairing checkbox: ticked means Allow, unticked means Ask (the
+// new default). Never is not offered here; it is set later from the device page
+// or Settings.
 function permToggle(key, label, checked) {
   const w = el("label", "toggle");
   const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = !!checked;
-  cb.addEventListener("change", () => { pairPerms[key] = cb.checked; });
-  w.appendChild(cb); w.appendChild(el("span", null, label)); return w;
+  const hint = el("span", "muted", " " + (cb.checked ? "(allow)" : "(ask)"));
+  cb.addEventListener("change", () => {
+    pairPerms[key] = cb.checked ? "allow" : "ask";
+    hint.textContent = " " + (cb.checked ? "(allow)" : "(ask)");
+  });
+  w.appendChild(cb); w.appendChild(el("span", null, label)); w.appendChild(hint);
+  return w;
 }
 function offersUI(v) {
   const box = el("div", "offers");
@@ -2024,7 +2214,7 @@ async function unpair(fp, entry) {
   // fingerprint, so prefer it. This keeps every caller on the same idempotent
   // /api/trust/{fp}/unpair path (handleUnpair + pending-unpair retry).
   const key = (entry && entry.cert_fingerprint) || fp;
-  const name = (entry && entry.name) || prettyId(key);
+  const name = (entry && (entry.alias || entry.name)) || prettyId(key);
   if (!confirm(`Unpair ${name}? Active connections from this device will be rejected immediately.`)) return;
   const online = isOnline(key);
   const r = await fetch(`/api/trust/${encodeURIComponent(key)}/unpair`, { method: "POST" });
@@ -2038,6 +2228,20 @@ async function unpair(fp, entry) {
   }
   if (r.status === 404) { toast(`${name} was already unpaired.`, "info"); return; }
   toast((await r.text()).trim() || `Could not unpair ${name}.`, "err");
+}
+// renameDevice sets or clears a local alias for a paired device. The alias is
+// stored locally only and is never sent to the peer; an empty value reverts to
+// the broadcast name.
+async function renameDevice(fp, current) {
+  const entry = pairedEntry(fp);
+  const key = (entry && entry.cert_fingerprint) || fp;
+  const suggested = (entry && entry.alias) || "";
+  const input = prompt("Local name for this device (leave empty to use its broadcast name):", suggested);
+  if (input === null) return;
+  const r = await fetch(`/api/trust/${encodeURIComponent(key)}/alias`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ alias: input.trim() }) });
+  if (!r.ok) { toast((await r.text()).trim() || "Could not rename this device.", "err"); return; }
+  const alias = input.trim();
+  toast(alias ? `Renamed ${current || "this device"} to ${alias}.` : `Using the broadcast name for ${current || "this device"}.`, "ok");
 }
 async function pushTo(deviceId, name, folder) {
   const paths = await pickPaths(folder ? "folder" : "files", `Choose ${folder ? "a folder" : "files"} to send to ${name || "the device"}`, "");
@@ -2075,6 +2279,21 @@ function playBeep() {
 
 // ---------- approvals ----------
 let approvalsOpen = false;
+// A permission Ask can be for files, a message, or a browse session. Give each
+// its own person-facing wording; only the file asks carry a size.
+function approvalTitle(a) {
+  const who = a.peer_name || "A device";
+  if (a.reason === "browse") return who + " wants to browse your shares";
+  if (a.reason === "text") return who + " wants to send you a message";
+  return who + " wants to send you " + (a.count === 1 ? "1 file" : `${a.count} files`);
+}
+function approvalDetail(a) {
+  if (a.reason === "browse") return "Until you allow, they cannot list or download your shares.";
+  if (a.reason === "text") return "A short message will land in your Inbox.";
+  if (a.reason === "connect") return "Connected device for one transfer. Files go to your Inbox.";
+  if (a.reason === "large") return "Larger than your automatic limit. Files go to your Inbox.";
+  return "Files go to your Inbox.";
+}
 function renderApprovals(list) {
   approvalsList = list;
   const box = $("approvals"), modal = $("approvals-modal");
@@ -2082,8 +2301,8 @@ function renderApprovals(list) {
   const live = new Set();
   for (const a of list) {
     const key = "appr:" + a.id; live.add(key);
-    const files = a.count === 1 ? "1 file" : `${a.count} files`;
-    stickyToast(key, `${a.peer_name || "A device"} wants to send you ${files}`, `${fmtBytes(a.total)} \u00b7 click to review`, () => { approvalsOpen = true; renderApprovals(approvalsList); });
+    const detail = (a.reason === "browse" || a.reason === "text") ? "click to review" : `${fmtBytes(a.total)} \u00b7 click to review`;
+    stickyToast(key, approvalTitle(a), detail, () => { approvalsOpen = true; renderApprovals(approvalsList); });
   }
   pruneSticky("appr:", live);
   if (!list.length) approvalsOpen = false;
@@ -2091,14 +2310,13 @@ function renderApprovals(list) {
   if (!approvalsOpen) return;
   if (deferRebuild("approvals-modal", { open: approvalsOpen, list: list }, modal)) return;
   clear(modal);
-  const head = el("div", "modal-head"); head.appendChild(el("h2", null, "Incoming files"));
+  const head = el("div", "modal-head"); head.appendChild(el("h2", null, "Incoming requests"));
   head.appendChild(btn("Decide later", () => { approvalsOpen = false; renderApprovals(approvalsList); }, "ghost"));
   modal.appendChild(head);
   for (const a of list) {
     const card = el("div", "row col");
-    const files = a.count === 1 ? "1 file" : `${a.count} files`;
-    card.appendChild(el("div", "name", `${a.peer_name || "A device"} wants to send you ${files} (${fmtBytes(a.total)})`));
-    card.appendChild(el("div", "meta", a.reason === "connect" ? "Connected device for one transfer. Files go to your Inbox." : "Larger than your automatic limit. Files go to your Inbox."));
+    card.appendChild(el("div", "name", approvalTitle(a) + (a.reason === "browse" || a.reason === "text" ? "" : ` (${fmtBytes(a.total)})`)));
+    card.appendChild(el("div", "meta", approvalDetail(a)));
     const lst = el("div", "stack");
     (a.files || []).slice(0, 10).forEach((f) => lst.appendChild(el("div", "meta", f.path + "  \u00b7  " + fmtBytes(f.size))));
     card.appendChild(lst);
@@ -2253,16 +2471,29 @@ function closeDiag() { $("diag").hidden = true; }
 // other than the default, or when the firewall check says inbound (LAN)
 // connections are blocked. Dismissal is in-memory only (never localStorage or
 // sessionStorage), so the warning returns on the next launch instead of being
-// silenced forever.
+// silenced forever. The commands are generated from the ports actually in use,
+// so they match Settings and the README after a port change.
 let firewallBannerDismissed = false;
-const FIREWALL_COPY_COMMANDS = "sudo ufw allow 47800/tcp && sudo ufw allow 47801/udp && sudo ufw allow 5353/udp";
+let firewallCopyCommands = "";
 
-function showFirewallBanner(port) {
+// firewallCommands builds the copy-paste rule for the configured peer TCP port,
+// the beacon UDP port and the fixed mDNS port.
+// ---- firewall commands (extracted verbatim by firewall_banner_test.go) ----
+function firewallCommands(peerPort, beaconPort) {
+  const peer = peerPort || 47800;
+  const beacon = beaconPort || 47801;
+  return `sudo ufw allow ${peer}/tcp && sudo ufw allow ${beacon}/udp && sudo ufw allow 5353/udp`;
+}
+// ---- end firewall commands ----
+
+function showFirewallBanner(port, beaconPort, notice) {
   if (firewallBannerDismissed) return;
   const box = $("firewall-banner");
   if (!box) return;
+  firewallCopyCommands = firewallCommands(port, beaconPort);
+  const prefix = notice ? notice + " " : "";
   $("firewall-banner-text").textContent =
-    `Other devices can't reach this computer. Your firewall is blocking TCP ${port || 47800}. Run: ${FIREWALL_COPY_COMMANDS}`;
+    prefix + `Other devices can't reach this computer. Your firewall is blocking TCP ${port || 47800}. Run: ${firewallCopyCommands}`;
   box.hidden = false;
 }
 function dismissFirewallBanner() {
@@ -2278,7 +2509,7 @@ async function loadFirewallBanner() {
     const r = await fetch("/api/diagnostics");
     if (!r.ok) return;
     const j = await r.json();
-    if (j.firewall_banner) showFirewallBanner(j.peer_port);
+    if (j.firewall_banner || j.peer_port_fallback) showFirewallBanner(j.peer_port, j.beacon_port, j.peer_port_fallback_notice);
   } catch (e) { }
 }
 
@@ -2298,6 +2529,7 @@ async function loadSelf() {
   const s = await r.json();
   $("self-name").textContent = s.name || "This device";
   $("self-name").title = `This device \u00b7 ${s.os} \u00b7 port ${s.peer_port} \u00b7 ID ${s.device_id_pretty}`;
+  mountsSupported = s.mounts_supported !== false;
 }
 async function loadRoots() {
   try { const r = await fetch("/api/fs/roots"); if (r.ok) { S.ex.roots = await r.json(); renderExSide(); } } catch (e) { }
@@ -2348,7 +2580,7 @@ $("diag-close").addEventListener("click", closeDiag);
 $("diag").addEventListener("click", (e) => { if (e.target === $("diag")) closeDiag(); });
 $("diag-copy").addEventListener("click", () => copyText(diagReport || ""));
 $("diag-copy-log").addEventListener("click", () => copyText(diagLog || ""));
-$("firewall-banner-copy").addEventListener("click", () => copyText(FIREWALL_COPY_COMMANDS));
+$("firewall-banner-copy").addEventListener("click", () => copyText(firewallCopyCommands));
 $("firewall-banner-dismiss").addEventListener("click", dismissFirewallBanner);
 
 async function submitShare(confirmFlag) {

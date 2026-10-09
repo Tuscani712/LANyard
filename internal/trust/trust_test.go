@@ -21,14 +21,14 @@ func TestPairFlow(t *testing.T) {
 	st := newStore(t)
 
 	// Responder side: receive, then accept with the permissions we grant.
-	in, err := st.CreateIncoming(ModePair, "peer-fp", "Bob", "bob-dev", "nonceA", Permissions{Browse: true})
+	in, err := st.CreateIncoming(ModePair, "peer-fp", "Bob", "bob-dev", "nonceA", Permissions{Browse: Allow})
 	if err != nil {
 		t.Fatalf("CreateIncoming: %v", err)
 	}
 	if v, _ := st.View(in.ID); v.SAS == "" {
 		t.Error("incoming session should have a SAS once the peer nonce is known")
 	}
-	if _, err := st.Accept(in.ID, Permissions{Browse: true, Push: true}); err != nil {
+	if _, err := st.Accept(in.ID, Permissions{Browse: Allow, Push: Allow}); err != nil {
 		t.Fatalf("Accept: %v", err)
 	}
 	// Accepting must not pair yet: the entry appears only when the initiator
@@ -40,23 +40,23 @@ func TestPairFlow(t *testing.T) {
 		t.Fatalf("ActivateRemote: %v", err)
 	}
 	e, ok := st.Entry("peer-fp")
-	if !ok || !e.Permissions.Push {
+	if !ok || !e.Permissions.Push.Allows() {
 		t.Fatalf("confirmation should store a paired entry with push, got %+v ok=%v", e, ok)
 	}
 
 	// Initiator side: create, learn the remote id/nonce, confirm.
-	out := st.CreateOutgoing(ModePair, "peer-fp2", "Carol", "carol-dev", Permissions{Browse: true})
+	out := st.CreateOutgoing(ModePair, "peer-fp2", "Carol", "carol-dev", Permissions{Browse: Allow})
 	st.SetRemote(out.ID, "remote-1", "nonceB")
 	st.SetStatus(out.ID, StatusAccepted, "")
 	if _, err := st.Confirm(out.ID); err != nil {
 		t.Fatalf("Confirm: %v", err)
 	}
-	if e, ok := st.Entry("peer-fp2"); !ok || !e.Permissions.Browse {
+	if e, ok := st.Entry("peer-fp2"); !ok || !e.Permissions.Browse.Allows() {
 		t.Fatalf("confirm should store the initiator's entry, got %+v ok=%v", e, ok)
 	}
 
 	// Authorization reflects permissions.
-	if a := st.Access("peer-fp"); !a.Paired || !a.Browse || !a.Push {
+	if a := st.Access("peer-fp"); !a.Paired || !a.Browse.Allows() || !a.Push.Allows() {
 		t.Errorf("access = %+v", a)
 	}
 
@@ -78,11 +78,11 @@ func TestReplayedConfirmIsNoOp(t *testing.T) {
 	st.SetXferLog(rec)
 
 	// Responder side.
-	in, err := st.CreateIncoming(ModePair, "peer-fp", "Bob", "bob-dev", "nonceA", Permissions{Browse: true, Push: true})
+	in, err := st.CreateIncoming(ModePair, "peer-fp", "Bob", "bob-dev", "nonceA", Permissions{Browse: Allow, Push: Allow})
 	if err != nil {
 		t.Fatalf("CreateIncoming: %v", err)
 	}
-	if _, err := st.Accept(in.ID, Permissions{Browse: true, Push: true}); err != nil {
+	if _, err := st.Accept(in.ID, Permissions{Browse: Allow, Push: Allow}); err != nil {
 		t.Fatalf("Accept: %v", err)
 	}
 	if _, err := st.ActivateRemote(in.ID); err != nil {
@@ -91,12 +91,12 @@ func TestReplayedConfirmIsNoOp(t *testing.T) {
 	if _, err := st.ActivateRemote(in.ID); err != nil {
 		t.Fatalf("replayed ActivateRemote must be a no-op success: %v", err)
 	}
-	if e, ok := st.Entry("peer-fp"); !ok || !e.Permissions.Push {
+	if e, ok := st.Entry("peer-fp"); !ok || !e.Permissions.Push.Allows() {
 		t.Fatalf("entry = %+v ok=%v, want push still granted", e, ok)
 	}
 
 	// Initiator side.
-	out := st.CreateOutgoing(ModePair, "peer-fp2", "Carol", "carol-dev", Permissions{Browse: true})
+	out := st.CreateOutgoing(ModePair, "peer-fp2", "Carol", "carol-dev", Permissions{Browse: Allow})
 	st.SetRemote(out.ID, "remote-1", "nonceB")
 	st.SetStatus(out.ID, StatusAccepted, "")
 	if _, err := st.Confirm(out.ID); err != nil {
@@ -105,7 +105,7 @@ func TestReplayedConfirmIsNoOp(t *testing.T) {
 	if _, err := st.Confirm(out.ID); err != nil {
 		t.Fatalf("replayed Confirm must be a no-op success: %v", err)
 	}
-	if e, ok := st.Entry("peer-fp2"); !ok || !e.Permissions.Browse {
+	if e, ok := st.Entry("peer-fp2"); !ok || !e.Permissions.Browse.Allows() {
 		t.Fatalf("entry = %+v ok=%v, want browse still granted", e, ok)
 	}
 
@@ -158,15 +158,15 @@ func TestPendingCap(t *testing.T) {
 
 func TestUpdatePermissions(t *testing.T) {
 	st := newStore(t)
-	st.Pair(Entry{DeviceID: "d", Name: "N", Fingerprint: "fp", Mode: ModePair, Permissions: Permissions{Browse: true}})
-	if a := st.Access("fp"); !a.Browse || a.Push {
+	st.Pair(Entry{DeviceID: "d", Name: "N", Fingerprint: "fp", Mode: ModePair, Permissions: Permissions{Browse: Allow}})
+	if a := st.Access("fp"); !a.Browse.Allows() || a.Push.Allows() {
 		t.Fatalf("initial access = %+v", a)
 	}
-	if !st.UpdatePermissions("fp", Permissions{Browse: false, Push: true, AskOver: 42}) {
+	if !st.UpdatePermissions("fp", Permissions{Browse: Never, Push: Allow, AskOver: 42}) {
 		t.Fatal("UpdatePermissions returned false for a paired device")
 	}
 	a := st.Access("fp")
-	if a.Browse || !a.Push || a.MaxPushBytes != 0 {
+	if a.Browse.Allows() || !a.Push.Allows() || a.MaxPushBytes != 0 {
 		t.Fatalf("access after update = %+v", a)
 	}
 	if e, _ := st.Entry("fp"); e.Permissions.AskOver != 42 {

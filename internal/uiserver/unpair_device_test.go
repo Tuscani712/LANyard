@@ -155,7 +155,7 @@ func TestAppJSDevicePaneHasUnpairThisDevice(t *testing.T) {
 	}
 	js := string(src)
 	checks := []struct{ name, sub string }{
-		{"device pane action label", `btn("Unpair this device", () => unpair(p.device, paired), "ghost")`},
+		{"device pane action label", `"unpair": () => unpair(p.device, paired),`},
 		{"unpair confirms first", "if (!confirm(`Unpair ${name}? Active connections from this device will be rejected immediately.`)) return;"},
 		{"unpair keys on the fingerprint", `(entry && entry.cert_fingerprint) || fp`},
 		{"unpair posts the shared endpoint", "`/api/trust/${encodeURIComponent(key)}/unpair`"},

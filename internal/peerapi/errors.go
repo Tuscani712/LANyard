@@ -7,11 +7,20 @@ import (
 	"strings"
 )
 
-// NotPairedMessage is what the desktop shows when a peer refuses an action
-// with 403 and no more specific reason is available. A 403 is a pairing or
-// permission refusal, not an unreachable device, so it must never be presented
-// as "could not reach device".
+// NotPairedMessage is what the desktop shows when a peer has genuinely dropped
+// the pairing. Only the exact "not paired" reason maps here: a permission
+// refusal must never be presented as an unpairing (see permissionMessages).
 const NotPairedMessage = "Not paired with this device."
+
+// Permission-refusal wording. Each exact 403 reason the peer sends gets its own
+// human line, so "push not permitted" never masquerades as "Not paired".
+const (
+	PushDeniedMessage   = "This device did not allow you to send files to it."
+	BrowseDeniedMessage = "This device did not allow you to browse its shares."
+	TextDeniedMessage   = "This device did not allow you to send text to it."
+	NotPermittedMessage = "This device does not allow that action."
+	UserDeniedMessage   = "The other device declined the request."
+)
 
 // TooLargeMessage is what the desktop shows when a peer answers 413. The peer's
 // own body (a raw limit number) is not useful to a person, so the sender maps
@@ -21,20 +30,20 @@ const TooLargeMessage = "The other device can't accept a list this large; send f
 // notPairedMsg is the exact peer body that means "I no longer have you in my
 // trust store". It is the only message that may trigger automatic local
 // unpairing; see IsNotPaired. Permission refusals deliberately use other
-// wording (see the 403 messages in session.go, push.go and shares.go) so they
-// can never be mistaken for this.
+// wording (see permissionMessages) so they can never be mistaken for this.
 const notPairedMsg = "not paired"
 
-// genericForbidden lists server messages that only mean "you may not do this",
-// which the UI replaces with NotPairedMessage. A peer that sends its own
-// explanation (for example "The other device declined the transfer.") keeps it.
-// This set drives display wording only; it must never drive the destructive
-// unpair decision (see IsNotPaired).
-var genericForbidden = map[string]bool{
-	"not permitted":      true,
-	"push not permitted": true,
-	"not paired":         true,
-	"forbidden":          true,
+// permissionMessages maps the exact 403 reasons a peer sends to the line a
+// person should see. Every entry is a refusal, never an unpairing; only
+// "not paired" (handled separately) may remove a local pairing.
+var permissionMessages = map[string]string{
+	"push not permitted": PushDeniedMessage,
+	"pull not permitted": BrowseDeniedMessage,
+	"text not permitted": TextDeniedMessage,
+	"not permitted":      NotPermittedMessage,
+	"denied by the user": UserDeniedMessage,
+	"not paired":         NotPairedMessage,
+	"forbidden":          NotPermittedMessage,
 }
 
 // reason extracts the human reason from a peer error body. The phone (and any
@@ -86,10 +95,14 @@ func UserMessage(err error) string {
 	if errors.As(err, &se) {
 		if se.Code == http.StatusForbidden {
 			msg := reason(se.Msg)
-			if msg != "" && !genericForbidden[msg] {
+			if m, ok := permissionMessages[strings.ToLower(msg)]; ok {
+				return m
+			}
+			if msg != "" {
 				return msg
 			}
-			return NotPairedMessage
+			// A bare 403 with no reason: still a refusal, never an unpairing.
+			return NotPermittedMessage
 		}
 		if se.Code == http.StatusRequestEntityTooLarge {
 			return TooLargeMessage

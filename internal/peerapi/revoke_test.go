@@ -23,7 +23,7 @@ func TestTrustRevokeIsIdempotentAndCleansUp(t *testing.T) {
 		t.Fatalf("config.Open: %v", err)
 	}
 	tr := trust.New(cfg, "self-fp", nil)
-	tr.Pair(trust.Entry{DeviceID: "phone", Name: "Phone", Fingerprint: "peer-fp", Permissions: trust.Permissions{Browse: true}})
+	tr.Pair(trust.Entry{DeviceID: "phone", Name: "Phone", Fingerprint: "peer-fp", Permissions: trust.Permissions{Browse: trust.Allow}})
 
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))

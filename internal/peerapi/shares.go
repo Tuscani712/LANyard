@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"lanyard/internal/approval"
 	"lanyard/internal/identity"
 	"lanyard/internal/shares"
 	"lanyard/internal/trust"
@@ -72,7 +73,10 @@ func (s *Server) xferPull(level xferlog.Level, outcome, fp, target, class, reaso
 
 // accessFor authorizes a data endpoint from the caller's certificate and
 // returns its access decision. A peer may list/read a share only if it is
-// paired with pull permission or holds a live Connect session.
+// paired with a browse permission that is not Never or holds a live Connect
+// session. A paired peer whose browse state is Ask is prompted once per browse
+// session (the first request blocks on a person; later requests in the same
+// session are remembered).
 func (s *Server) accessFor(w http.ResponseWriter, r *http.Request) (trust.Access, bool) {
 	fp := PeerID(r.Context())
 	if s.shares == nil {
@@ -87,15 +91,48 @@ func (s *Server) accessFor(w http.ResponseWriter, r *http.Request) (trust.Access
 	session := a.SessionID != ""
 	if !a.Paired && !session {
 		http.Error(w, "not permitted", http.StatusForbidden)
-		s.xferPull(xferlog.LevelWarn, "deny", fp, r.RemoteAddr, "", "not paired", 0, 0, 0, 0, errors.New("not paired with this device"))
+		s.xferPull(xferlog.LevelWarn, "deny", fp, r.RemoteAddr, "", "not paired", 0, 0, 0, 0, errors.New("not paired"))
 		return a, false
 	}
-	if a.Paired && !a.Browse {
+	if a.Paired && a.Browse.Denies() {
 		http.Error(w, "pull not permitted", http.StatusForbidden)
-		s.xferPull(xferlog.LevelWarn, "deny", fp, r.RemoteAddr, "", "browse not permitted", 0, 0, 0, 0, errors.New("pull not permitted"))
+		s.xferPull(xferlog.LevelWarn, "deny", fp, r.RemoteAddr, "", "pull not permitted", 0, 0, 0, 0, errors.New("pull not permitted"))
+		return a, false
+	}
+	if a.Paired && a.Browse.Asks() && !s.approveBrowse(w, r, a) {
 		return a, false
 	}
 	return a, true
+}
+
+// approveBrowse asks the person on this device, once per browse session, whether
+// a peer may browse the shares. The acceptance is remembered by the approval
+// manager under a per-peer browse key, so later requests in the same session do
+// not prompt again; an unanswered prompt (timeout) denies the request.
+func (s *Server) approveBrowse(w http.ResponseWriter, r *http.Request, a trust.Access) bool {
+	fp := PeerID(r.Context())
+	if s.approvals == nil {
+		http.Error(w, permissionReasonUserDenied, http.StatusForbidden)
+		s.xferPull(xferlog.LevelWarn, "deny", fp, r.RemoteAddr, "", permissionReasonUserDenied, 0, 0, 0, 0, errors.New(permissionReasonUserDenied))
+		return false
+	}
+	ok, err := s.approvals.Ask(r.Context(), approval.Request{
+		PeerFP: fp, PeerName: cleanLabel(s.peerName(fp, a)), Reason: "browse",
+	}, "browse:"+fp)
+	switch {
+	case err == nil && ok:
+		return true
+	case errors.Is(err, approval.ErrTooMany):
+		http.Error(w, "Too many requests are waiting on the other device.", http.StatusTooManyRequests)
+	case errors.Is(err, approval.ErrTimeout):
+		http.Error(w, "The other device did not answer in time.", http.StatusForbidden)
+	case err != nil:
+		// The peer hung up while waiting; nothing to answer.
+	default:
+		http.Error(w, permissionReasonUserDenied, http.StatusForbidden)
+	}
+	s.xferPull(xferlog.LevelWarn, "deny", fp, r.RemoteAddr, "", "browse "+permissionReasonUserDenied, 0, 0, 0, 0, errors.New(permissionReasonUserDenied))
+	return false
 }
 
 // visibleShare returns a share the peer is allowed to see. A share the peer

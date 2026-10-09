@@ -46,9 +46,20 @@ type SelfInfo struct {
 	PeerPort       int    `json:"peer_port"`
 	// PeerPortRequested is the port we tried to bind; PeerPortFallback is true
 	// when it was busy and the service moved to PeerPort instead.
-	PeerPortRequested int    `json:"peer_port_requested,omitempty"`
-	PeerPortFallback  bool   `json:"peer_port_fallback,omitempty"`
-	Version           string `json:"version"`
+	PeerPortRequested int  `json:"peer_port_requested,omitempty"`
+	PeerPortFallback  bool `json:"peer_port_fallback,omitempty"`
+	// PeerPortFallbackNotice is the person-facing line shown in the banner and
+	// Settings when a temporary peer port was bound, e.g. "Using temporary
+	// port 51234 because 47800 is in use by other".
+	PeerPortFallbackNotice string `json:"peer_port_fallback_notice,omitempty"`
+	// BeaconPort is the configured fallback discovery UDP port, used with
+	// PeerPort and the fixed mDNS port to generate the firewall commands.
+	BeaconPort int    `json:"beacon_port"`
+	Version    string `json:"version"`
+	// MountsSupported reports whether serving a paired device as a drive is
+	// available on this platform/app; the device page only offers "Mount as
+	// drive" when it is true (desktop-only).
+	MountsSupported bool `json:"mounts_supported"`
 }
 
 // Notice is a user-facing notification pushed to every open UI as an SSE
@@ -248,6 +259,7 @@ func (s *Server) Serve(ln net.Listener) error {
 	mux.HandleFunc("GET /api/trust", s.auth(s.handleTrust))
 	mux.HandleFunc("POST /api/trust/{fp}/unpair", s.auth(s.handleUnpair))
 	mux.HandleFunc("POST /api/trust/{fp}/permissions", s.auth(s.handleTrustPermissions))
+	mux.HandleFunc("POST /api/trust/{fp}/alias", s.auth(s.handleTrustAlias))
 	mux.HandleFunc("GET /api/sessions", s.auth(s.handleSessions))
 	mux.HandleFunc("GET /api/pair/payload", s.auth(s.handlePairPayload))
 	mux.HandleFunc("POST /api/sessions/request", s.auth(s.handleSessionStart))
@@ -417,7 +429,7 @@ func (s *Server) peerRefusedPairing(fp string, err error) bool {
 	if s.d.Log != nil {
 		s.d.Log.Info("peer refused a request as not paired; removed the local pairing", "fp", fp, "name", e.Name)
 	}
-	s.NotifyUser(Notice{Kind: "peer-unpaired", Peer: firstNonEmpty(e.Name, fp)})
+	s.NotifyUser(Notice{Kind: "peer-unpaired", Peer: firstNonEmpty(e.DisplayName(), fp)})
 	return true
 }
 

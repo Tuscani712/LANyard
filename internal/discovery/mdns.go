@@ -4,6 +4,7 @@ import (
 	"context"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/libp2p/zeroconf/v2"
@@ -17,16 +18,36 @@ const (
 )
 
 type mdnsNode struct {
+	mu     sync.Mutex
 	server *zeroconf.Server
 	cancel context.CancelFunc
+}
+
+func (n *mdnsNode) getServer() *zeroconf.Server {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.server
+}
+
+func (n *mdnsNode) setServer(s *zeroconf.Server) {
+	n.mu.Lock()
+	n.server = s
+	n.mu.Unlock()
+}
+
+// setText updates the TXT records of the running registration, if any.
+func (n *mdnsNode) setText(t []string) {
+	if s := n.getServer(); s != nil {
+		s.SetText(t)
+	}
 }
 
 func (n *mdnsNode) stop() {
 	if n.cancel != nil {
 		n.cancel()
 	}
-	if n.server != nil {
-		n.server.Shutdown() // sends TTL-0 goodbye records
+	if s := n.getServer(); s != nil {
+		s.Shutdown() // sends TTL-0 goodbye records
 	}
 }
 
@@ -60,14 +81,16 @@ func (m *Manager) txtRecords() []string {
 func (m *Manager) startMDNS(ctx context.Context) {
 	txt := m.txtRecords()
 	node := &mdnsNode{}
+	m.selfMu.Lock()
 	m.mdns = node
+	m.selfMu.Unlock()
 
 	srv, err := zeroconf.Register(m.self.ShortID, mdnsService, mdnsDomain, m.self.Port, txt, nil)
 	if err != nil {
 		m.log.Warn("mDNS announce unavailable; relying on beacon/manual", "err", err)
 		m.xfer(xferlog.Entry{Outcome: "browse", Level: xferlog.LevelWarn, Reason: "mDNS announce unavailable", Error: err.Error()})
 	} else {
-		node.server = srv
+		node.setServer(srv)
 		m.xfer(xferlog.Entry{Outcome: "announce", Level: xferlog.LevelInfo, Reason: "mDNS announce started"})
 	}
 

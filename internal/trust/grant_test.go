@@ -20,9 +20,9 @@ func newGrantStore(t *testing.T) *Store {
 // phone is unchanged, but "what we may do on the phone" must not show push.
 func TestConfirmRecordsPeerNarrowedGrant(t *testing.T) {
 	st := newGrantStore(t)
-	out := st.CreateOutgoing(ModePair, "phone-fp", "Phone", "phone-dev", Permissions{Browse: true, Push: true})
+	out := st.CreateOutgoing(ModePair, "phone-fp", "Phone", "phone-dev", Permissions{Browse: Allow, Push: Allow})
 	// The phone accepts and returns browse only.
-	st.SetPeerGranted(out.ID, Permissions{Browse: true, Push: false})
+	st.SetPeerGranted(out.ID, Permissions{Browse: Allow, Push: Never})
 	st.SetStatus(out.ID, StatusAccepted, "")
 
 	if _, err := st.Confirm(out.ID); err != nil {
@@ -32,13 +32,13 @@ func TestConfirmRecordsPeerNarrowedGrant(t *testing.T) {
 	if !ok {
 		t.Fatal("no trust entry after Confirm")
 	}
-	if !e.Permissions.Push {
+	if !e.Permissions.Push.Allows() {
 		t.Errorf("local grant lost push: %+v", e.Permissions)
 	}
-	if e.PeerPermissions.Push {
+	if !e.PeerPermissions.Push.Denies() {
 		t.Errorf("narrowed phone grant still shows push as allowed: %+v", e.PeerPermissions)
 	}
-	if !e.PeerPermissions.Browse {
+	if !e.PeerPermissions.Browse.Allows() {
 		t.Errorf("peer grant lost browse: %+v", e.PeerPermissions)
 	}
 }
@@ -46,11 +46,11 @@ func TestConfirmRecordsPeerNarrowedGrant(t *testing.T) {
 // The responder records what the initiator granted it (the other direction).
 func TestActivateRemoteRecordsPeerGrant(t *testing.T) {
 	st := newGrantStore(t)
-	in, err := st.CreateIncoming(ModePair, "desk-fp", "Desk", "desk-dev", "nonceA", Permissions{Browse: true, Push: false})
+	in, err := st.CreateIncoming(ModePair, "desk-fp", "Desk", "desk-dev", "nonceA", Permissions{Browse: Allow, Push: Never})
 	if err != nil {
 		t.Fatalf("CreateIncoming: %v", err)
 	}
-	if _, err := st.Accept(in.ID, Permissions{Browse: true, Push: true}); err != nil {
+	if _, err := st.Accept(in.ID, Permissions{Browse: Allow, Push: Allow}); err != nil {
 		t.Fatalf("Accept: %v", err)
 	}
 	if _, err := st.ActivateRemote(in.ID); err != nil {
@@ -60,10 +60,10 @@ func TestActivateRemoteRecordsPeerGrant(t *testing.T) {
 	if !ok {
 		t.Fatal("no trust entry after ActivateRemote")
 	}
-	if e.PeerPermissions.Push {
+	if !e.PeerPermissions.Push.Denies() {
 		t.Errorf("responder peer grant should reflect the initiator denying push: %+v", e.PeerPermissions)
 	}
-	if !e.PeerPermissions.Browse {
+	if !e.PeerPermissions.Browse.Allows() {
 		t.Errorf("responder peer grant lost browse: %+v", e.PeerPermissions)
 	}
 }
@@ -71,13 +71,13 @@ func TestActivateRemoteRecordsPeerGrant(t *testing.T) {
 // The UI view carries the peer's granted set while a session is live.
 func TestViewExposesPeerGrant(t *testing.T) {
 	st := newGrantStore(t)
-	out := st.CreateOutgoing(ModeConnect, "phone-fp", "Phone", "phone-dev", Permissions{Browse: true})
-	st.SetPeerGranted(out.ID, Permissions{Browse: true})
+	out := st.CreateOutgoing(ModeConnect, "phone-fp", "Phone", "phone-dev", Permissions{Browse: Allow})
+	st.SetPeerGranted(out.ID, Permissions{Browse: Allow})
 	v, ok := st.View(out.ID)
 	if !ok {
 		t.Fatal("no view")
 	}
-	if !v.PeerGranted.Browse {
+	if !v.PeerGranted.Browse.Allows() {
 		t.Errorf("view missing peer grant: %+v", v.PeerGranted)
 	}
 }

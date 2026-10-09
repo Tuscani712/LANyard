@@ -13,18 +13,18 @@ func TestPairingLifecycleLogged(t *testing.T) {
 	rec := xferlog.New(200)
 	st.SetXferLog(rec)
 
-	in, err := st.CreateIncoming(ModePair, "peer-fp", "Bob", "bob-dev", "nonceA", Permissions{Browse: true})
+	in, err := st.CreateIncoming(ModePair, "peer-fp", "Bob", "bob-dev", "nonceA", Permissions{Browse: Allow})
 	if err != nil {
 		t.Fatalf("CreateIncoming: %v", err)
 	}
-	if _, err := st.Accept(in.ID, Permissions{Browse: true, Push: true}); err != nil {
+	if _, err := st.Accept(in.ID, Permissions{Browse: Allow, Push: Allow}); err != nil {
 		t.Fatalf("Accept: %v", err)
 	}
 	if _, err := st.ActivateRemote(in.ID); err != nil {
 		t.Fatalf("ActivateRemote: %v", err)
 	}
 
-	out := st.CreateOutgoing(ModeConnect, "carol-fp", "Carol", "carol-dev", Permissions{Browse: true})
+	out := st.CreateOutgoing(ModeConnect, "carol-fp", "Carol", "carol-dev", Permissions{Browse: Allow})
 	st.SetStatus(out.ID, StatusRejected, "user declined")
 	st.Close(out.ID)
 

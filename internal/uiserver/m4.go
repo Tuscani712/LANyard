@@ -267,23 +267,42 @@ func (s *Server) handleTrustPermissions(w http.ResponseWriter, r *http.Request) 
 		http.Error(w, "trust unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	var perms trust.Permissions
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&perms); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if perms.PushMaxBytes < 0 || perms.AskOver < 0 {
+		http.Error(w, "sizes must not be negative", http.StatusBadRequest)
+		return
+	}
+	fp := r.PathValue("fp")
+	if !s.d.Trust.UpdatePermissions(fp, perms) {
+		http.Error(w, "not paired", http.StatusNotFound)
+		return
+	}
+	e, _ := s.d.Trust.Entry(fp)
+	s.Notify()
+	writeJSON(w, e)
+}
+
+// handleTrustAlias sets or clears a paired device's local alias. The alias is
+// stored locally and is never sent to the peer: it only changes the name this
+// device shows. An empty alias clears it, reverting to the broadcast name.
+func (s *Server) handleTrustAlias(w http.ResponseWriter, r *http.Request) {
+	if s.d.Trust == nil {
+		http.Error(w, "trust unavailable", http.StatusServiceUnavailable)
+		return
+	}
 	var req struct {
-		Browse       bool  `json:"browse"`
-		Push         bool  `json:"push"`
-		PushMaxBytes int64 `json:"push_max_bytes"`
-		AskOver      int64 `json:"ask_over"`
+		Alias string `json:"alias"`
 	}
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if req.PushMaxBytes < 0 || req.AskOver < 0 {
-		http.Error(w, "sizes must not be negative", http.StatusBadRequest)
-		return
-	}
 	fp := r.PathValue("fp")
-	perms := trust.Permissions{Browse: req.Browse, Push: req.Push, PushMaxBytes: req.PushMaxBytes, AskOver: req.AskOver}
-	if !s.d.Trust.UpdatePermissions(fp, perms) {
+	if !s.d.Trust.SetAlias(fp, cleanText(req.Alias, 64)) {
 		http.Error(w, "not paired", http.StatusNotFound)
 		return
 	}

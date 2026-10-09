@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -100,7 +101,7 @@ func (m *Manager) runPush(job *Job) {
 	job.ctx, job.cancel = context.WithCancel(context.Background())
 	job.running = true
 	job.State = StateConnecting
-	job.Note = "Waiting for the other device to accept…"
+	job.Note = "Waiting for approval on " + peerDisplay(job) + "\u2026"
 	job.lastAt = time.Now()
 	job.lastBytes = job.Done
 	ctx := job.ctx
@@ -133,9 +134,21 @@ func (m *Manager) runPush(job *Job) {
 				job.Note = ""
 			case cancelled:
 				job.State = StatePaused
+			case receiverCancelled(err):
+				// The phone/other receiver stopped the push: the wire answers
+				// the in-flight file PUT with 410 Gone. That is the mirror of a
+				// sender cancel, so the row ends Cancelled with the same reason
+				// the receiver records -- never a generic Failed.
+				job.State = StateCancelled
+				job.Note = ReceiverCancelledReason
+				job.Error = ""
+				job.cancelled = true
+				if job.FinishedAt.IsZero() {
+					job.FinishedAt = time.Now()
+				}
 			}
 			job.mu.Unlock()
-			if !cancelled {
+			if !cancelled && !receiverCancelled(err) {
 				m.pushFail(job, err)
 			}
 			m.persist()
@@ -435,6 +448,28 @@ func (c *pushCountingReader) Read(p []byte) (int, error) {
 		c.m.notifyProgress()
 	}
 	return n, err
+}
+
+// ReceiverCancelledReason is the sender-side note when the other device's
+// receiving person stops a push it is still receiving: the mirror of the
+// receiver's "Cancelled by the sender" mapping.
+const ReceiverCancelledReason = "Cancelled by the receiver"
+
+// peerDisplay names the peer for a person-facing note, falling back when the
+// push has no remembered name.
+func peerDisplay(job *Job) string {
+	if job != nil && job.PeerName != "" {
+		return job.PeerName
+	}
+	return "the other device"
+}
+
+// receiverCancelled reports whether err is the receiver's 410 Gone: the
+// receiving person stopped the push, so the sender must end the row Cancelled
+// (with ReceiverCancelledReason) instead of a generic Failed.
+func receiverCancelled(err error) bool {
+	var se *peerapi.StatusError
+	return errors.As(err, &se) && se.Code == http.StatusGone
 }
 
 func (m *Manager) pushFail(job *Job, err error) {
