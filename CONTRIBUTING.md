@@ -1,7 +1,5 @@
 # Contributing
 
-**Draft — needs legal review.**
-
 Contributions to LANyard are welcome as patches, pull requests or any other
 change. By submitting a contribution, you agree that:
 
